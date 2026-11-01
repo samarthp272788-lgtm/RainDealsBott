@@ -1,9 +1,21 @@
 # config.py
 
+import hashlib
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+# Set BOT_ENV_FILE=.env.staging to load an isolated local environment.
+load_dotenv(dotenv_path=os.getenv("BOT_ENV_FILE", ".env"))
+
+# Shared password used by Telegram and web maintenance controls.
+# Configure MAINTENANCE_PASSWORD in the environment on both services.
+_legacy_maintenance_password_hash = "7aa5d3f5bbd51bdb5b8796decd7535ecf2a0b4944885c7dd81a543bcd7885585"
+MAINTENANCE_PASSWORD = os.getenv("MAINTENANCE_PASSWORD", "")
+MAINTENANCE_PASSWORD_HASH = os.getenv("MAINTENANCE_PASSWORD_HASH", "").strip() or (
+    hashlib.sha256(MAINTENANCE_PASSWORD.encode("utf-8")).hexdigest()
+    if MAINTENANCE_PASSWORD
+    else _legacy_maintenance_password_hash
+)
 
 
 # ==========================================================
@@ -12,12 +24,14 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-# Optional separate bot used only to deliver manually fulfilled reseller orders.
-# If a public API order includes delivery_telegram_id, it sends to that user.
-# If no ID is given, it sends the delivery copy only to the admin who fulfills
-# the order, so the admin can forward it without exposing the main bot.
-# Customers must start this bot before Telegram permits it to DM them.
-DELIVERY_BOT_TOKEN = os.getenv("DELIVERY_BOT_TOKEN", "")
+# Manual reseller deliveries are sent by the Cloudflare delivery-bot webhook.
+# The delivery bot token is configured only as a Cloudflare Worker secret.
+DELIVERY_BRIDGE_URL = os.getenv("DELIVERY_BRIDGE_URL", "").strip().rstrip("/")
+DELIVERY_BRIDGE_SECRET = os.getenv("DELIVERY_BRIDGE_SECRET", "").strip()
+
+# Public username used to build manager login links. The bot token is stored
+# only as the ADMIN_VERIFY_BOT_TOKEN secret on the Cloudflare API Worker.
+ADMIN_VERIFY_BOT_USERNAME = os.getenv("ADMIN_VERIFY_BOT_USERNAME", "").lstrip("@").strip()
 
 ADMIN_IDS = [
     1316577060,
@@ -91,6 +105,10 @@ API_KEY_ENCRYPTION_KEY = os.getenv("API_KEY_ENCRYPTION_KEY", "")
 # https://my-reseller-api.wasmer.app.  Do not put the Vercel/Render bot URL
 # here, because it is an internal bridge only.
 API_BASE_URL = os.getenv("API_BASE_URL", "").rstrip("/")
+MANAGER_WEB_URL = os.getenv(
+    "MANAGER_WEB_URL",
+    "https://raindeals-manager.samarthp2727-rd.workers.dev",
+).rstrip("/")
 API_RATE_LIMIT_PER_SECOND = max(1, int(os.getenv("API_RATE_LIMIT_PER_SECOND", "3")))
 # Limits are applied per active customer API key. They can be tightened at
 # deployment time without a code change if a customer abuses their key.

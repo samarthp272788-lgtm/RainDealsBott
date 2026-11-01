@@ -71,6 +71,13 @@ def get_admin_panel():
             ],
             [
                 InlineKeyboardButton(
+                    text="🌐 Manager Web",
+                    callback_data="manager_web_access",
+                    style="primary"
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="⬅ Back",
                     callback_data="admin_back"
                 )

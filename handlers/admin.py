@@ -4,7 +4,9 @@ import hashlib
 import hmac
 import json
 import logging
-from datetime import datetime
+import secrets
+import uuid
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from html import escape as html_escape
 
@@ -20,10 +22,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramBadRequest
 
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, select
 
 from database import SessionLocal
-from config import ADMIN_IDS
+from config import ADMIN_IDS, MAINTENANCE_PASSWORD_HASH, MANAGER_WEB_URL
 
 from models.user import User
 from models.product import Product
@@ -33,6 +35,7 @@ from models.ticket import Ticket
 from models.provider import Provider
 from models.custom_rate import CustomRate
 from models.rate_control import ProductRateControl, RateControlAssignment
+from models.manager_auth import ManagerLoginChallenge
 
 from keyboards.admin_menu import get_admin_panel
 from keyboards.menu import get_admin_main_menu
@@ -44,6 +47,36 @@ from handlers.products import invalidate_catalog_custom_prices_cache
 
 logger = logging.getLogger(__name__)
 router = Router()
+
+
+def _create_manager_web_link(telegram_id: int) -> str:
+    """Create a short-lived, single-use manager login token for this admin."""
+    token = secrets.token_urlsafe(32)
+    now = datetime.utcnow()
+    db = SessionLocal()
+    try:
+        db.query(ManagerLoginChallenge).filter(
+            ManagerLoginChallenge.expires_at < now,
+            ManagerLoginChallenge.consumed_at.is_(None),
+        ).delete(synchronize_session=False)
+        db.add(
+            ManagerLoginChallenge(
+                id=str(uuid.uuid4()),
+                token_hash=hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                created_at=now,
+                expires_at=now + timedelta(minutes=2),
+                approved_at=now,
+                approved_by=telegram_id,
+                consumed_at=None,
+            )
+        )
+        db.commit()
+        return token
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 class AdminUserBalanceState(StatesGroup):
@@ -74,8 +107,6 @@ class ProviderEditState(StatesGroup):
 class MaintenanceModeState(StatesGroup):
     waiting_password = State()
 
-
-MAINTENANCE_PASSWORD_HASH = "7aa5d3f5bbd51bdb5b8796decd7535ecf2a0b4944885c7dd81a543bcd7885585"
 
 
 ACTIVITY_PER_PAGE = 8
@@ -225,20 +256,23 @@ async def maintenance_mode_confirm(callback: CallbackQuery):
 # ╚══════════════════════════════════════════════════════════════╝
 
 def _build_admin_dashboard(db, admin_name: str, admin_id: int) -> str:
-    """Build the compact admin welcome screen."""
-    users = db.query(User).count()
-    products = db.query(Product).count()
-    orders = db.query(Order).count()
+    """Build the compact admin welcome screen with one database round trip."""
+    counts = db.execute(select(
+        select(func.count()).select_from(User).scalar_subquery(),
+        select(func.count()).select_from(Product).scalar_subquery(),
+        select(func.count()).select_from(Order).scalar_subquery(),
+    )).one()
+    users, products, orders = (int(value or 0) for value in counts)
     safe_admin_name = html_escape(admin_name or "Admin", quote=False)
-
-    return (
-        "<blockquote>👑 <b>Rain Deals Admin Panel</b></blockquote>\n"
-        f"Welcome, <b>{safe_admin_name}</b>!\n"
-        "Manage your store, products, orders, and customers from here.\n\n"
-        f"📦 Products: <b>{products}</b>  ·  🛍 Orders: <b>{orders}</b>  ·  👥 Users: <b>{users}</b>\n\n"
-        "👇 <b>Choose an option below to get started.</b>"
-    )
-
+    return "\n".join((
+        "<blockquote>👑 <b>Rain Deals Admin Panel</b></blockquote>",
+        f"Welcome, <b>{safe_admin_name}</b>!",
+        "Manage your store, products, orders, and customers from here.",
+        "",
+        f"📦 Products: <b>{products}</b>  ·  🛍 Orders: <b>{orders}</b>  ·  👥 Users: <b>{users}</b>",
+        "",
+        "👇 <b>Choose an option below to get started.</b>",
+    ))
 
 def _load_admin_dashboard(admin_name: str, admin_id: int) -> str:
     """Run the synchronous dashboard queries outside aiogram's event loop."""
@@ -250,32 +284,34 @@ def _load_admin_dashboard(admin_name: str, admin_id: int) -> str:
 
 
 def _load_admin_stats() -> tuple[int, int, int, int, int, object]:
-    """Fetch dashboard statistics in a worker thread, never on the event loop."""
+    """Fetch dashboard statistics with one DB round trip, off the event loop."""
     db = SessionLocal()
     try:
-        return (
-            db.query(User).count(),
-            db.query(Product).count(),
-            db.query(Order).count(),
-            db.query(Deposit).count(),
-            db.query(Ticket).count(),
-            db.query(func.coalesce(func.sum(Order.amount), 0)).scalar(),
-        )
+        row = db.execute(select(
+            select(func.count()).select_from(User).scalar_subquery(),
+            select(func.count()).select_from(Product).scalar_subquery(),
+            select(func.count()).select_from(Order).scalar_subquery(),
+            select(func.count()).select_from(Deposit).scalar_subquery(),
+            select(func.count()).select_from(Ticket).scalar_subquery(),
+            select(func.coalesce(func.sum(Order.amount), 0)).scalar_subquery(),
+        )).one()
+        return tuple(row)
     finally:
         db.close()
 
-
 def _load_admin_product_rows() -> list[tuple[int, bool, str, str, int]]:
-    """Return only display values so the product list query stays off-loop."""
+    """Fetch only the five columns rendered in the product list."""
     db = SessionLocal()
     try:
+        rows = db.query(
+            Product.id, Product.is_active, Product.icon, Product.name, Product.stock
+        ).order_by(Product.id.desc()).all()
         return [
-            (product.id, bool(product.is_active), product.icon or "📦", product.name, product.stock or 0)
-            for product in db.query(Product).order_by(Product.id.desc()).all()
+            (int(product_id), bool(active), icon or "📦", name, int(stock or 0))
+            for product_id, active, icon, name, stock in rows
         ]
     finally:
         db.close()
-
 
 def _load_user_dashboard_text(telegram_id: int) -> str | None:
     db = SessionLocal()
@@ -348,12 +384,17 @@ def _build_user_dashboard(user) -> str:
 # =====================================================
 
 @router.message(Command("admin"))
-async def admin_cmd(message: Message):
+async def admin_cmd(message: Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         return
+    await state.clear()
+    dashboard = await asyncio.to_thread(
+        _load_admin_dashboard, message.from_user.full_name, message.from_user.id
+    )
     await message.answer(
-        "👑 Tap the crown button on your dashboard above to open the Admin Panel.\n\n"
-        "(Send /start if you don't see your dashboard.)"
+        dashboard,
+        reply_markup=_get_admin_panel_with_providers(),
+        parse_mode="HTML",
     )
 
 
@@ -367,6 +408,8 @@ async def admin_panel(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Access denied.", show_alert=True)
         return
 
+    # Clear Telegram's button spinner before the remote dashboard count query.
+    await callback.answer()
     await state.clear()
     text = await asyncio.to_thread(
         _load_admin_dashboard, callback.from_user.full_name, callback.from_user.id
@@ -378,7 +421,47 @@ async def admin_panel(callback: CallbackQuery, state: FSMContext):
         parse_mode="HTML"
     )
 
+
+@router.callback_query(F.data == "manager_web_access")
+async def manager_web_access(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    if not callback.message or callback.message.chat.type != "private":
+        await callback.answer(
+            "Open the Admin Panel in a private chat to create the Manager Web link.",
+            show_alert=True,
+        )
+        return
+
     await callback.answer()
+    try:
+        token = await asyncio.to_thread(
+            _create_manager_web_link,
+            callback.from_user.id,
+        )
+    except Exception:
+        logger.exception("Could not create one-time Manager Web login link")
+        await callback.message.answer(
+            "⚠️ Could not create a Manager Web link. Check the database connection and try again."
+        )
+        return
+
+    login_url = f"{MANAGER_WEB_URL}/login/bot#{token}"
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🌐 Open Manager Web", url=login_url)]
+        ]
+    )
+    await callback.message.answer(
+        "🔐 <b>Private Manager Web link</b>\n\n"
+        "This link is unique, expires in 2 minutes, and works once. Opening it signs you in without another Telegram verification prompt. "
+        "It starts a 60-minute manager session. Keep the link private; anyone who gets it can use it before it expires.",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
+
 
 
 # ============================================================
@@ -1356,6 +1439,7 @@ async def view_user(callback: CallbackQuery):
 
 @router.callback_query(F.data == "admin_products")
 async def admin_products(callback: CallbackQuery):
+    await callback.answer()
     products = await asyncio.to_thread(_load_admin_product_rows)
     keyboard = [
         [InlineKeyboardButton(text="➕ New Product", callback_data="create_product")]
@@ -1375,7 +1459,6 @@ async def admin_products(callback: CallbackQuery):
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
     )
-    await callback.answer()
 
 
 # =====================================================
@@ -1384,6 +1467,7 @@ async def admin_products(callback: CallbackQuery):
 
 @router.callback_query(F.data == "admin_stats")
 async def admin_stats(callback: CallbackQuery):
+    await callback.answer()
     users, products, orders, deposits, tickets, revenue = await asyncio.to_thread(
         _load_admin_stats
     )
@@ -1411,7 +1495,6 @@ async def admin_stats(callback: CallbackQuery):
             ]
         )
     )
-    await callback.answer()
 
 
 # =====================================================
