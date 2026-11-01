@@ -440,7 +440,11 @@ DEFAULT_CATEGORY_CONFIG = {"icon": "📦", "label": "General", "style": "primary
 def _get_category_config(category: str | None) -> dict:
     if not category:
         return DEFAULT_CATEGORY_CONFIG
-    return CATEGORY_CONFIG.get(category.strip().lower(), DEFAULT_CATEGORY_CONFIG)
+    category_name = category.strip()
+    config = CATEGORY_CONFIG.get(category_name.lower())
+    if config:
+        return config
+    return {**DEFAULT_CATEGORY_CONFIG, "label": category_name}
 
 
 def _category_style(category: str | None) -> str:
@@ -1089,7 +1093,7 @@ async def products_menu(callback: CallbackQuery):
         catalog_started = time.perf_counter()
         products = await _fetch_active_products()
         catalog_ms = (time.perf_counter() - catalog_started) * 1000
-        await _show_products_catalog(callback, products)
+        await _show_product_categories(callback, products)
     finally:
         total_ms = (time.perf_counter() - started) * 1000
         logger.info(
@@ -1100,11 +1104,15 @@ async def products_menu(callback: CallbackQuery):
         )
 
 
-async def _show_products_catalog(callback: CallbackQuery, products: list):
+def _category_key(product) -> str:
+    return (getattr(product, "category", None) or "General").strip().casefold() or "general"
+
+
+async def _show_product_categories(callback: CallbackQuery, products: list):
     if not products:
         await show(
             callback,
-            "📦 <b>PRODUCTS</b>\n\n📭 <b>No paid products available right now.</b>",
+            "📦 <b>PRODUCT CATEGORIES</b>\n\n📭 <b>No paid products available right now.</b>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="⬅ Go Back", callback_data="main_menu", style="primary")
@@ -1112,11 +1120,105 @@ async def _show_products_catalog(callback: CallbackQuery, products: list):
         )
         return
 
-    visible_products = products
+    groups: dict[str, list] = {}
+    for product in products:
+        groups.setdefault(_category_key(product), []).append(product)
 
-    # Never hold up the customer catalog for a reseller API call. Local
-    # products render immediately from the database cache; reseller stock is
-    # refreshed in the background and keeps its last known value meanwhile.
+    rows = []
+    pending_row = []
+    sorted_groups = sorted(
+        groups.items(),
+        key=lambda item: _get_category_config(item[1][0].category)["label"].casefold(),
+    )
+    for _, category_products in sorted_groups:
+        first_product = category_products[0]
+        config = _get_category_config(first_product.category)
+        category_name = (getattr(first_product, "category", None) or "").strip().lower()
+        is_custom_category = category_name not in CATEGORY_CONFIG
+        icon = first_product.icon if is_custom_category and first_product.icon else config["icon"]
+        label = config["label"]
+        if len(label) > 40:
+            label = label[:37].rstrip() + "…"
+        pending_row.append(InlineKeyboardButton(
+            text=f"{icon} {label} ({len(category_products)})",
+            callback_data=f"products_cat_{first_product.id}",
+            style=config["style"],
+        ))
+        if len(pending_row) == 3:
+            rows.append(pending_row)
+            pending_row = []
+    if pending_row:
+        rows.append(pending_row)
+    rows.extend([
+        [InlineKeyboardButton(text=f"🛍 All Products ({len(products)})", callback_data="products_all", style="primary")],
+        [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")],
+    ])
+    await show(
+        callback,
+        "🛍 <b>SHOP BY CATEGORY</b>\n\nChoose a category to browse, or open the full catalog.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(F.data == "products_all")
+async def products_all(callback: CallbackQuery):
+    await callback.answer()
+    await _show_products_catalog(callback, await _fetch_active_products(), show_all=True)
+
+
+@router.callback_query(F.data.startswith("products_cat_"))
+async def products_category(callback: CallbackQuery):
+    await callback.answer()
+    try:
+        representative_id = int(callback.data.removeprefix("products_cat_"))
+    except (TypeError, ValueError):
+        await _show_product_categories(callback, await _fetch_active_products())
+        return
+    products = await _fetch_active_products()
+    representative = next((p for p in products if int(p.id) == representative_id), None)
+    if representative is None:
+        await _show_product_categories(callback, products)
+        return
+    await _show_products_catalog(callback, products, category=_category_key(representative))
+
+
+async def _show_products_catalog(
+    callback: CallbackQuery,
+    products: list,
+    category: str | None = None,
+    show_all: bool = False,
+):
+    if not products:
+        await show(
+            callback,
+            "📦 <b>PRODUCTS</b>\n\n📭 <b>No paid products available right now.</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="⬅ Categories", callback_data="products_menu", style="primary"),
+                InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary"),
+            ]]),
+        )
+        return
+
+    visible_products = products if show_all else [p for p in products if _category_key(p) == category]
+    category_label = (
+        "All Products" if show_all else
+        _get_category_config(visible_products[0].category)["label"] if visible_products else "Products"
+    )
+    if not visible_products:
+        await show(
+            callback,
+            f"📦 <b>{_esc(category_label)}</b>\n\n📭 No products are available in this category right now.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="⬅ Categories", callback_data="products_menu", style="primary"),
+                InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary"),
+            ]]),
+        )
+        return
+
+    # Keep reseller refresh in the background so category screens remain fast.
     if any((getattr(product, "source", "own") or "own") == "reseller" for product in visible_products):
         asyncio.create_task(_refresh_reseller_stock_cache_if_needed())
 
@@ -1124,34 +1226,31 @@ async def _show_products_catalog(callback: CallbackQuery, products: list):
     custom_prices = await asyncio.to_thread(
         _get_catalog_custom_prices, callback.from_user.id, [product.id for product in visible_products]
     )
-
-    text = "<b>Available products</b>\nPlease select a product to proceed"
-
+    text = f"🛍 <b>{_esc(category_label)}</b>\nPlease select a product to proceed"
     keyboard = []
-
     for p in visible_products:
         cat_config = _get_category_config(p.category)
         stock = _real_stock(p)
         custom_price = custom_prices.get(p.id)
         price = custom_price if custom_price is not None else _money(p.price)
         stock_badge = "🔴 OOS" if stock <= 0 else (
-            f"🟢 In Stock" if stock >= 999999 else (f"🟡 {stock}" if stock <= 3 else f"🟢 {stock}"))
+            "🟢 In Stock" if stock >= 999999 else (f"🟡 {stock}" if stock <= 3 else f"🟢 {stock}"))
         custom_badge = " 🏷" if custom_price is not None else ""
         bulk_badge = " 📦" if p.bulk_pricing and custom_price is None else ""
+        keyboard.append([InlineKeyboardButton(
+            text=f"#{p.id} {p.icon or cat_config['icon']} {p.name} — ${price:.2f}{custom_badge}{bulk_badge} | {stock_badge}",
+            callback_data=f"product_{p.id}",
+            style=cat_config["style"],
+        )])
 
+    if show_all:
+        keyboard.append([InlineKeyboardButton(text="⬅ Categories", callback_data="products_menu", style="primary")])
+    else:
         keyboard.append([
-            InlineKeyboardButton(
-                text=f"#{p.id} {p.icon or cat_config['icon']} {p.name} — ${price:.2f}{custom_badge}{bulk_badge} | {stock_badge}",
-                callback_data=f"product_{p.id}",
-                style=cat_config["style"],
-            )
+            InlineKeyboardButton(text="⬅ Categories", callback_data="products_menu", style="primary"),
+            InlineKeyboardButton(text="🛍 All Products", callback_data="products_all", style="primary"),
         ])
-
-    navigation = [InlineKeyboardButton(
-        text="⬅ Go Back", callback_data="main_menu", style="primary"
-    )]
-    keyboard.append(navigation)
-
+    keyboard.append([InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")])
     await show(callback, text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
 
 

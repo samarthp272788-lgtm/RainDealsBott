@@ -1018,11 +1018,11 @@ async def product_icon(message: Message, state: FSMContext):
         f"✅ <b>Icon:</b> {icon}\n\n"
         f"{_divider('─')}\n\n"
         f"✏️ <b>Step 3/10: Category</b>\n\n"
-        f"Send a category name.\n\n"
+        f"Send a category name. You can use an existing category or create a new one.\n\n"
         f"<b>Available categories:</b>\n"
         f"• premium\n• budget\n• vpn\n• email\n"
         f"• streaming\n• gaming\n• software\n• education\n\n"
-        f"<i>Example: streaming</i>",
+        f"<i>Examples: ChatGPT, CAPCUT, Gemini, Canva, VPN</i>",
         parse_mode="HTML"
     )
 
@@ -1036,7 +1036,10 @@ async def product_category(message: Message, state: FSMContext):
     if not message.text:
         return
 
-    category = message.text.strip().lower()
+    category = message.text.strip()
+    if len(category) > 255:
+        await answer_card(message, "❌ <b>Category name is too long.</b> Use 255 characters or fewer.", parse_mode="HTML")
+        return
     await state.update_data(category=category)
     await state.set_state(AddProduct.price)
 

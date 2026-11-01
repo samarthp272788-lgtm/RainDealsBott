@@ -31,6 +31,7 @@ class EditProduct(StatesGroup):
     edit_field = State()
     new_value = State()
     name = State()
+    category = State()
 
 
 class AddStock(StatesGroup):

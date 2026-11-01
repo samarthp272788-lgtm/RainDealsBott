@@ -245,7 +245,7 @@ def _get_category_label(product) -> str:
         "software": "Software",
         "education": "Education",
     }
-    return cats.get((product.category or "").strip().lower(), "General")
+    return cats.get((product.category or "").strip().lower(), (product.category or "General").strip() or "General")
 
 
 def _build_stockctl_sync_text(product) -> str:
@@ -515,6 +515,12 @@ ${float(product.price or 0):.2f}
                 InlineKeyboardButton(
                     text="✏️ Edit Product Name",
                     callback_data=f"edit_name_{product.id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🏷 Edit Category",
+                    callback_data=f"edit_category_{product.id}"
                 )
             ],
             [
@@ -1254,6 +1260,92 @@ async def save_product_name(message: Message, state: FSMContext):
         await answer_card(message, panel_text, reply_markup=markup, parse_mode="HTML")
     else:
         await answer_card(message, "✅ Product name updated.")
+
+
+@router.callback_query(F.data.startswith("edit_category_"))
+async def edit_product_category_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    try:
+        pid = int(callback.data.removeprefix("edit_category_"))
+    except (TypeError, ValueError):
+        await callback.answer("Invalid product.", show_alert=True)
+        return
+    product = await asyncio.to_thread(_load_product, pid)
+    if not product:
+        await callback.answer("Product not found.", show_alert=True)
+        return
+    await state.update_data(edit_product_category_id=pid)
+    await state.set_state(EditProduct.category)
+    await answer_card(
+        callback,
+        f"Current category: <b>{safe(product.category or 'General')}</b>\n\n"
+        "Send the category name (up to 255 characters). You can type a new category, "
+        "or send <code>General</code> to place it in General.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Cancel", callback_data="cancel_edit_category")
+        ]]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "cancel_edit_category")
+async def cancel_product_category_edit(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    data = await state.get_data()
+    pid = data.get("edit_product_category_id")
+    await state.clear()
+    if pid:
+        await _refresh_manage_panel(callback, int(pid))
+    else:
+        await callback.answer("Category edit cancelled.")
+
+
+@router.message(EditProduct.category)
+async def save_product_category(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    category = (message.text or "").strip()
+    if not category:
+        await answer_card(message, "❌ Category cannot be empty. Send a category name or tap Cancel.")
+        return
+    if len(category) > 255:
+        await answer_card(message, "❌ Category must be 255 characters or fewer.")
+        return
+    data = await state.get_data()
+    pid = data.get("edit_product_category_id")
+    if not pid:
+        await state.clear()
+        await answer_card(message, "❌ Product edit expired. Reopen the product manager and try again.")
+        return
+    db = SessionLocal()
+    try:
+        product = db.query(Product).filter(Product.id == int(pid)).first()
+        if not product:
+            await answer_card(message, "❌ Product not found.")
+            return
+        product.category = category
+        db.commit()
+        invalidate_products_cache()
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to update category for product %s", pid)
+        await answer_card(message, "❌ Could not update the product category. Please try again.")
+        return
+    finally:
+        db.close()
+        await state.clear()
+    product = await asyncio.to_thread(_load_product, int(pid))
+    if product:
+        panel_text, markup = _build_product_panel(product)
+        await answer_card(message, panel_text, reply_markup=markup, parse_mode="HTML")
+    else:
+        await answer_card(message, "✅ Product category updated.")
 
 @router.callback_query(F.data.startswith("edit_price_"))
 async def edit_price(callback: CallbackQuery):
