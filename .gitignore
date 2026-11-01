@@ -3,6 +3,7 @@
 !.env.example
 .idea/
 .vscode/
+.wrangler/
 __pycache__/
 *.py[cod]
 *.pyo

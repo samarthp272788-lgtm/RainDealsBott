@@ -25,6 +25,7 @@ impossible (card too old / deleted / never existed yet), so nothing
 ever silently fails to respond.
 """
 
+import asyncio
 import logging
 from collections import OrderedDict
 from html.parser import HTMLParser
@@ -50,6 +51,7 @@ _CARD_MESSAGE_ID_KEY = "_card_message_id"
 # menus and text prompts from stacking bubbles during the process lifetime.
 _CARD_LOCATIONS: OrderedDict[tuple[int, int], tuple[int, int]] = OrderedDict()
 _CARD_CACHE_LIMIT = 10_000
+_CARD_DELETE_TASKS: dict[tuple[int, int], asyncio.Task] = {}
 
 
 def _remember_card(user_id: int, chat_id: int, message_id: int) -> None:
@@ -62,6 +64,41 @@ def _remember_card(user_id: int, chat_id: int, message_id: int) -> None:
 
 def _forget_card(user_id: int, chat_id: int) -> None:
     _CARD_LOCATIONS.pop((int(user_id), int(chat_id)), None)
+
+
+def _cancel_scheduled_card_delete(chat_id: int, message_id: int) -> None:
+    key = (int(chat_id), int(message_id))
+    task = _CARD_DELETE_TASKS.pop(key, None)
+    if task and not task.done():
+        task.cancel()
+
+
+def schedule_delete_card(message: Message, *, owner_id: int, delay_seconds: int = 900):
+    """Delete a temporary card later, unless the conversation updates it first."""
+    chat_id = int(message.chat.id)
+    message_id = int(message.message_id)
+    owner_id = int(owner_id)
+    key = (chat_id, message_id)
+    _cancel_scheduled_card_delete(chat_id, message_id)
+
+    async def _delete_later():
+        try:
+            await asyncio.sleep(max(1, int(delay_seconds)))
+            await message.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            if _CARD_LOCATIONS.get((owner_id, chat_id)) == (chat_id, message_id):
+                _forget_card(owner_id, chat_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.info("Temporary Telegram card cleanup failed (%s)", type(exc).__name__)
+        finally:
+            current = _CARD_DELETE_TASKS.get(key)
+            if current is asyncio.current_task():
+                _CARD_DELETE_TASKS.pop(key, None)
+
+    task = asyncio.create_task(_delete_later())
+    _CARD_DELETE_TASKS[key] = task
+    return task
 
 
 class _HTMLTruncator(HTMLParser):
@@ -212,6 +249,7 @@ async def show(
             msg = await callback.message.answer(text, **kwargs)
 
     _remember_card(callback.from_user.id, msg.chat.id, msg.message_id)
+    _cancel_scheduled_card_delete(msg.chat.id, msg.message_id)
     if state is not None:
         await state.update_data(
             **{_CARD_CHAT_ID_KEY: msg.chat.id, _CARD_MESSAGE_ID_KEY: msg.message_id}
@@ -273,6 +311,7 @@ async def update_card(
             )
         except TelegramBadRequest as exc:
             if "message is not modified" in str(exc).lower():
+                _cancel_scheduled_card_delete(chat_id, message_id)
                 return None
             if "message is too long" in str(exc).lower():
                 logger.warning("update_card(): message too long (%d chars), truncating", len(text))
@@ -288,6 +327,7 @@ async def update_card(
                 logger.info("update_card(): edit failed (%s), sending a new card", exc)
                 msg = None
         if msg is not None:
+            _cancel_scheduled_card_delete(msg.chat.id, msg.message_id)
             if state is not None:
                 await state.update_data(
                     **{_CARD_CHAT_ID_KEY: msg.chat.id, _CARD_MESSAGE_ID_KEY: msg.message_id}

@@ -1,5 +1,5 @@
 
-from utils.ui import answer_card
+from utils.ui import answer_card, schedule_delete_card
 # handlers/admin.py — FIXED ADMIN PANEL WITH DASHBOARD, BROADCAST & FULL PROVIDER MANAGEMENT
 import asyncio
 import hashlib
@@ -538,11 +538,13 @@ async def manager_web_password(message: Message, state: FSMContext):
         )
     except Exception:
         logger.exception("Could not create one-time Manager Web login link")
-        await answer_card(
+        error_card = await answer_card(
             message,
             "⚠️ Could not create a Manager Web link. Check the database connection and try again.",
             state=state,
         )
+        if error_card is not None:
+            schedule_delete_card(error_card, owner_id=message.from_user.id, delay_seconds=900)
         await state.clear()
         return
 
