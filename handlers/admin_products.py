@@ -118,26 +118,20 @@ def _add_product_category_keyboard(options: list[dict[str, str | int]], page: in
             nav.append(InlineKeyboardButton(text="Next ➡", callback_data=f"add_product_category_page_{page + 1}"))
         rows.append(nav)
 
-    rows.extend([
-        [InlineKeyboardButton(text="➕ New Category", callback_data="add_product_category_new")],
-        [InlineKeyboardButton(text="⏭ Skip Category (General)", callback_data="add_product_category_skip")],
-    ])
+    rows.append([InlineKeyboardButton(text="⬅ Back to product type", callback_data="create_product")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _show_add_product_category_picker(target, state: FSMContext, page: int = 0):
     data = await state.get_data()
     options = data.get("product_category_options", [])
-    current = data.get("icon", "📦")
-    if options:
-        details = "Tap a saved category, create a new one, or skip to General."
-    else:
-        details = "There are no saved categories yet. Create one or skip to General."
+    details = "Choose the catalog this product should be added to."
+    if not options:
+        details = "No existing catalogs were found. Go back and choose New Catalog or Single Product."
     return await answer_card(
         target,
-        f"✅ <b>Icon:</b> {_esc(current)}\n\n"
         f"{_divider('─')}\n\n"
-        "✏️ <b>Step 3/10: Category</b>\n\n"
+        "🏷 <b>Step 1/10: Existing Catalog</b>\n\n"
         f"{details}",
         parse_mode="HTML",
         reply_markup=_add_product_category_keyboard(options, page),
@@ -145,17 +139,23 @@ async def _show_add_product_category_picker(target, state: FSMContext, page: int
     )
 
 
-async def _continue_add_product_after_category(target, state: FSMContext, category: str):
-    await state.update_data(category=category, category_input=False)
-    await state.set_state(AddProduct.price)
+async def _continue_add_product_after_category(target, state: FSMContext, category: str | None):
+    await state.update_data(
+        source="own",
+        category=category,
+        category_input=False,
+        reseller_service_id=None,
+        reseller_cost=None,
+        reseller_name=None,
+    )
+    await state.set_state(AddProduct.name)
     return await answer_card(
         target,
-        f"✅ <b>Category:</b> {_esc(category)}\n\n"
+        f"✅ <b>Catalog:</b> {_esc(category or 'Single product (no catalog)')}\n\n"
         f"{_divider('─')}\n\n"
-        "✏️ <b>Step 4/10: Price</b>\n\n"
-        "Send the base price per unit (USD).\n\n"
-        "<i>Example: 9.99</i>\n\n"
-        "💡 <i>You'll be able to add bulk/tiered pricing in a later step!</i>",
+        "✏️ <b>Step 2/10: Product Name</b>\n\n"
+        "Send the product name.\n\n"
+        "<i>Example: Gemini Advanced 1 Month</i>",
         parse_mode="HTML",
         state=state,
     )
@@ -496,7 +496,7 @@ def _get_reseller_credentials(reseller_id: str | None = None) -> dict:
 # ╚══════════════════════════════════════════════════════════════╝
 
 async def _show_product_source_selection(target: Message | CallbackQuery, state: FSMContext):
-    """Render the initial product source selection screen."""
+    """Ask how the product should be cataloged before collecting details."""
     await state.clear()
     await state.set_state(AddProduct.source)
 
@@ -504,8 +504,20 @@ async def _show_product_source_selection(target: Message | CallbackQuery, state:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🏠 Own Product",
-                    callback_data="addproduct:own",
+                    text="🏷 Add to Existing Catalog",
+                    callback_data="addproduct:existing_catalog",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="➕ Create New Catalog",
+                    callback_data="addproduct:new_catalog",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📦 Add Single Product (No Catalog)",
+                    callback_data="addproduct:single_product",
                 )
             ],
             [
@@ -527,18 +539,16 @@ async def _show_product_source_selection(target: Message | CallbackQuery, state:
         "╔══════════════════════════════╗\n"
         "║  📦 CREATE NEW PRODUCT        ║\n"
         "╚══════════════════════════════╝\n\n"
-        "Choose where this product will come from.\n\n"
-        "🏠 <b>Own Product</b>\n"
-        "Create a product using your own stock/accounts.\n\n"
-        "🔗 <b>Import from Reseller</b>\n"
-        "Connect this product to a configured provider "
-        "and purchase stock through their API.\n\n"
-        "👇 <b>Select product source:</b>"
+        "Choose how to organize this product before entering its details.\n\n"
+        "🏷 <b>Existing Catalog</b> — add it under a category already in your shop.\n"
+        "➕ <b>New Catalog</b> — create a category, then add the product.\n"
+        "📦 <b>Single Product</b> — add it without a category.\n"
+        "🔗 <b>Import from Reseller</b> — fetch a provider product.\n\n"
+        "👇 <b>Choose the first step:</b>"
     )
 
     if isinstance(target, CallbackQuery):
         await answer_card(target, text, parse_mode="HTML", reply_markup=keyboard)
-        await answer_card(target, )
     else:
         await answer_card(target, text, parse_mode="HTML", reply_markup=keyboard)
 
@@ -560,32 +570,58 @@ async def cb_add_product(callback: CallbackQuery, state: FSMContext):
     await _show_product_source_selection(callback, state)
 
 
-@router.callback_query(F.data.in_({"addproduct:own", "add_product_own"}))
-async def add_product_own(callback: CallbackQuery, state: FSMContext):
-    """Start the normal own-product creation flow."""
+@router.callback_query(F.data == "addproduct:existing_catalog")
+async def add_product_existing_catalog(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("❌ Admin only.", show_alert=True)
         return
-
-    await state.update_data(
-        source="own",
-        reseller_service_id=None,
-        reseller_cost=None,
-        reseller_name=None,
-    )
-    await state.set_state(AddProduct.name)
-
-    await answer_card(callback,
-        "╔══════════════════════════════╗\n"
-        "║  🏠 OWN PRODUCT              ║\n"
-        "╚══════════════════════════════╝\n\n"
-        "✏️ <b>Step 1/10: Product Name</b>\n\n"
-        f"{_divider('─')}\n\n"
-        "Send the product name.\n\n"
-        "<i>Example: Gemini Advanced 1 Month</i>",
-        parse_mode="HTML"
-    )
+    options = await asyncio.to_thread(_load_product_category_options)
+    await state.clear()
+    await state.update_data(product_category_options=options, category_input=False)
+    await state.set_state(AddProduct.category)
     await callback.answer()
+    await _show_add_product_category_picker(callback, state)
+
+
+@router.callback_query(F.data == "addproduct:new_catalog")
+async def add_product_new_catalog(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Admin only.", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(source="own", category_input=True)
+    await state.set_state(AddProduct.category)
+    await callback.answer()
+    await answer_card(
+        callback,
+        "➕ <b>Create New Catalog</b>\n\n"
+        "✏️ <b>Step 1/10: New Catalog</b>\n\n"
+        "Send the new category name (up to 255 characters).\n"
+        "Example: <code>Gemini AI Pro</code>",
+        parse_mode="HTML",
+        state=state,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="⬅ Back", callback_data="create_product")
+        ]]),
+    )
+
+
+@router.callback_query(F.data == "addproduct:single_product")
+async def add_single_product(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Admin only.", show_alert=True)
+        return
+    await callback.answer()
+    await _continue_add_product_after_category(callback, state, None)
+
+
+@router.callback_query(F.data.in_({"addproduct:own", "add_product_own"}))
+async def add_product_own(callback: CallbackQuery, state: FSMContext):
+    """Keep old Own Product buttons compatible with the new first-step menu."""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Admin only.", show_alert=True)
+        return
+    await _show_product_source_selection(callback, state)
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -1074,7 +1110,7 @@ async def reseller_import_quantity(message: Message, state: FSMContext):
 
 @router.message(AddProduct.name)
 async def product_name(message: Message, state: FSMContext):
-    """Step 2/10: Ask for icon."""
+    """Step 2/10: Ask for the product name."""
     if message.from_user.id not in ADMIN_IDS:
         return
 
@@ -1093,7 +1129,7 @@ async def product_name(message: Message, state: FSMContext):
     await answer_card(message,
         f"✅ <b>Name:</b> {_esc(name)}\n\n"
         f"{_divider('─')}\n\n"
-        f"✏️ <b>Step 2/10: Icon</b>\n\n"
+        f"✏️ <b>Step 3/10: Icon</b>\n\n"
         f"Send an emoji for this product.\n\n"
         f"<i>Example: 🎬 or 📧 or 🔑 or 🤖</i>",
         parse_mode="HTML"
@@ -1102,7 +1138,7 @@ async def product_name(message: Message, state: FSMContext):
 
 @router.message(AddProduct.icon)
 async def product_icon(message: Message, state: FSMContext):
-    """Step 3/10: Select an existing category, create one, or skip."""
+    """Step 3/10: Ask for the product price after catalog mode was chosen."""
     if message.from_user.id not in ADMIN_IDS:
         return
 
@@ -1116,10 +1152,21 @@ async def product_icon(message: Message, state: FSMContext):
         return
 
     await state.update_data(icon=icon)
-    await state.set_state(AddProduct.category)
-    options = await asyncio.to_thread(_load_product_category_options)
-    await state.update_data(product_category_options=options, category_input=False)
-    await _show_add_product_category_picker(message, state)
+    await state.set_state(AddProduct.price)
+    data = await state.get_data()
+    category = data.get("category")
+    catalog_label = category if category else "Single product (no catalog)"
+    await answer_card(
+        message,
+        f"✅ <b>Icon:</b> {_esc(icon)}\n"
+        f"🏷 <b>Catalog:</b> {_esc(catalog_label)}\n\n"
+        f"{_divider('─')}\n\n"
+        "✏️ <b>Step 4/10: Price</b>\n\n"
+        "Send the base price per unit (USD).\n\n"
+        "<i>Example: 9.99</i>",
+        parse_mode="HTML",
+        state=state,
+    )
 
 
 @router.callback_query(F.data.startswith("add_product_category_page_"))
@@ -1165,57 +1212,9 @@ async def add_product_category_pick(callback: CallbackQuery, state: FSMContext):
     await _continue_add_product_after_category(callback, state, category)
 
 
-@router.callback_query(F.data == "add_product_category_new")
-async def add_product_category_new(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMIN_IDS:
-        await callback.answer("Access denied.", show_alert=True)
-        return
-    if await state.get_state() != AddProduct.category.state:
-        await callback.answer("This product setup has expired. Start again.", show_alert=True)
-        return
-    await state.update_data(category_input=True)
-    await callback.answer()
-    await answer_card(
-        callback,
-        "➕ <b>New product category</b>\n\n"
-        "Send the category name (up to 255 characters).\n"
-        "Example: <code>Gemini AI Pro</code>",
-        parse_mode="HTML",
-        state=state,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="⬅ Back to Categories", callback_data="add_product_category_back")
-        ]]),
-    )
-
-
-@router.callback_query(F.data == "add_product_category_back")
-async def add_product_category_back(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMIN_IDS:
-        await callback.answer("Access denied.", show_alert=True)
-        return
-    if await state.get_state() != AddProduct.category.state:
-        await callback.answer("This product setup has expired. Start again.", show_alert=True)
-        return
-    await state.update_data(category_input=False)
-    await callback.answer()
-    await _show_add_product_category_picker(callback, state)
-
-
-@router.callback_query(F.data == "add_product_category_skip")
-async def add_product_category_skip(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMIN_IDS:
-        await callback.answer("Access denied.", show_alert=True)
-        return
-    if await state.get_state() != AddProduct.category.state:
-        await callback.answer("This product setup has expired. Start again.", show_alert=True)
-        return
-    await callback.answer()
-    await _continue_add_product_after_category(callback, state, "General")
-
-
 @router.message(AddProduct.category)
 async def product_category(message: Message, state: FSMContext):
-    """Accept typed category text only after the admin chooses New Category."""
+    """Save the new catalog name before continuing to product details."""
     if message.from_user.id not in ADMIN_IDS:
         return
 
@@ -1230,17 +1229,12 @@ async def product_category(message: Message, state: FSMContext):
     if len(category) > 255:
         await answer_card(message, "❌ <b>Category name is too long.</b> Use 255 characters or fewer.", parse_mode="HTML")
         return
-    existing = next(
-        (str(item["name"]) for item in data.get("product_category_options", [])
-         if str(item["name"]).casefold() == category.casefold()),
-        None,
-    )
-    await _continue_add_product_after_category(message, state, existing or category)
+    await _continue_add_product_after_category(message, state, category)
 
 
 @router.message(AddProduct.price)
 async def product_price(message: Message, state: FSMContext):
-    """Step 5/10: Ask for description (or save/update directly if Reseller product)."""
+    """Step 4/10: Ask for description (or save/update directly if Reseller product)."""
     if message.from_user.id not in ADMIN_IDS:
         return
 

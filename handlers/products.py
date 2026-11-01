@@ -1104,8 +1104,11 @@ async def products_menu(callback: CallbackQuery):
         )
 
 
-def _category_key(product) -> str:
-    return (getattr(product, "category", None) or "General").strip().casefold() or "general"
+def _category_key(product) -> str | None:
+    value = getattr(product, "category", None)
+    if value is None or not str(value).strip():
+        return None
+    return str(value).strip().casefold()
 
 
 async def _show_product_categories(callback: CallbackQuery, products: list):
@@ -1121,8 +1124,13 @@ async def _show_product_categories(callback: CallbackQuery, products: list):
         return
 
     groups: dict[str, list] = {}
+    standalone = []
     for product in products:
-        groups.setdefault(_category_key(product), []).append(product)
+        key = _category_key(product)
+        if key is None:
+            standalone.append(product)
+        else:
+            groups.setdefault(key, []).append(product)
 
     rows = []
     pending_row = []
@@ -1149,6 +1157,24 @@ async def _show_product_categories(callback: CallbackQuery, products: list):
             pending_row = []
     if pending_row:
         rows.append(pending_row)
+    if standalone:
+        custom_prices = await asyncio.to_thread(
+            _get_catalog_custom_prices,
+            callback.from_user.id,
+            [product.id for product in standalone],
+        )
+        _fire_stock_scan(callback.bot, standalone)
+        for product in standalone:
+            price = custom_prices.get(product.id)
+            price = price if price is not None else _money(product.price)
+            stock = _real_stock(product)
+            stock_badge = "🔴 OOS" if stock <= 0 else ("🟢 In Stock" if stock >= 999999 else f"🟢 {stock}")
+            label = f"{product.icon or '📦'} {product.name} — ${price:.2f} | {stock_badge}"
+            rows.append([InlineKeyboardButton(
+                text=label[:64],
+                callback_data=f"product_{product.id}",
+                style="primary",
+            )])
     rows.extend([
         [InlineKeyboardButton(text=f"🛍 All Products ({len(products)})", callback_data="products_all", style="primary")],
         [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")],
