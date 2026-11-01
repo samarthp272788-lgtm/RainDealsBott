@@ -108,6 +108,10 @@ class MaintenanceModeState(StatesGroup):
     waiting_password = State()
 
 
+class ManagerWebState(StatesGroup):
+    waiting_password = State()
+
+
 
 ACTIVITY_PER_PAGE = 8
 
@@ -423,7 +427,7 @@ async def admin_panel(callback: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(F.data == "manager_web_access")
-async def manager_web_access(callback: CallbackQuery):
+async def manager_web_access(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("Access denied.", show_alert=True)
         return
@@ -433,16 +437,58 @@ async def manager_web_access(callback: CallbackQuery):
             show_alert=True,
         )
         return
-
+    await state.clear()
+    await state.set_state(ManagerWebState.waiting_password)
+    await callback.message.answer(
+        "🔐 <b>Manager Web access</b>\n\n"
+        "Enter your manager password in this private chat to generate a one-time login link. "
+        "Your password message will be deleted after it is received.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✖ Cancel", callback_data="manager_web_cancel")
+        ]]),
+    )
     await callback.answer()
+
+
+@router.callback_query(F.data == "manager_web_cancel")
+async def manager_web_cancel(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    await state.clear()
+    if callback.message:
+        await callback.message.answer("Manager Web link generation cancelled.")
+    await callback.answer()
+
+
+@router.message(ManagerWebState.waiting_password)
+async def manager_web_password(message: Message, state: FSMContext):
+    if not message.from_user or message.from_user.id not in ADMIN_IDS or message.chat.type != "private":
+        await state.clear()
+        return
+
+    password = (message.text or "").strip()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    submitted_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(submitted_hash, MAINTENANCE_PASSWORD_HASH):
+        await state.clear()
+        await message.answer("❌ Incorrect password. No Manager Web link was created.")
+        return
+
+    await state.clear()
     try:
         token = await asyncio.to_thread(
             _create_manager_web_link,
-            callback.from_user.id,
+            message.from_user.id,
         )
     except Exception:
         logger.exception("Could not create one-time Manager Web login link")
-        await callback.message.answer(
+        await message.answer(
             "⚠️ Could not create a Manager Web link. Check the database connection and try again."
         )
         return
@@ -453,7 +499,7 @@ async def manager_web_access(callback: CallbackQuery):
             [InlineKeyboardButton(text="🌐 Open Manager Web", url=login_url)]
         ]
     )
-    await callback.message.answer(
+    await message.answer(
         "🔐 <b>Private Manager Web link</b>\n\n"
         "This link is unique, expires in 2 minutes, and works once. Opening it signs you in without another Telegram verification prompt. "
         "It starts a 60-minute manager session. Keep the link private; anyone who gets it can use it before it expires.",
