@@ -1,8 +1,8 @@
 """Public FastAPI entry point.
 
 Runs:
-- Telegram bot polling
-- Delivery bot polling
+- Main Telegram bot polling (unless the main bot uses Cloudflare transport)
+- Cloudflare delivery-bot bridge caller
 - Deposit checker
 - Public reseller API
 
@@ -13,6 +13,7 @@ Start:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from contextlib import asynccontextmanager, suppress
@@ -24,7 +25,6 @@ from fastapi.responses import JSONResponse
 
 from api.reseller_v1 import router as reseller_router
 from bot_app import bot, dp
-from delivery_bot_app import delivery_bot, delivery_dp
 from services.deposit_checker import deposit_checker_loop
 from services.order_notifications import order_notification_loop
 from services.product_api_access import ensure_product_api_access_schema
@@ -32,6 +32,7 @@ from services.provider_schema import ensure_provider_schema
 from services.maintenance_mode import ensure_maintenance_schema, is_maintenance_enabled
 from services.order_rating_schema import ensure_order_rating_schema
 from services.upstream_callbacks import process_upstream_callback
+from services.cloudflare_bridge import dispatch_update, ensure_schema, verify_request
 from config import API_MAX_REQUEST_BYTES
 
 
@@ -54,6 +55,9 @@ logger = logging.getLogger("render_api")
 PORT = int(os.getenv("PORT", "10000"))
 
 INTERNAL_SECRET = os.getenv("INTERNAL_API_SECRET", "").strip()
+CLOUDFLARE_BRIDGE_SECRET = os.getenv("CLOUDFLARE_BRIDGE_SECRET", "").strip()
+TELEGRAM_TRANSPORT = os.getenv("TELEGRAM_TRANSPORT", "polling").strip().lower()
+MAX_BRIDGE_BODY_BYTES = 256_000
 
 if not INTERNAL_SECRET:
     logger.warning(
@@ -71,7 +75,6 @@ async def lifespan(app: FastAPI):
     deposit_task: asyncio.Task | None = None
     order_notification_task: asyncio.Task | None = None
     polling_task: asyncio.Task | None = None
-    delivery_polling_task: asyncio.Task | None = None
 
     try:
         await asyncio.to_thread(ensure_product_api_access_schema)
@@ -79,11 +82,20 @@ async def lifespan(app: FastAPI):
         await asyncio.to_thread(ensure_maintenance_schema)
         await asyncio.to_thread(ensure_order_rating_schema)
 
+        if TELEGRAM_TRANSPORT == "cloudflare":
+            if len(CLOUDFLARE_BRIDGE_SECRET) < 32:
+                raise RuntimeError(
+                    "CLOUDFLARE_BRIDGE_SECRET must contain at least 32 characters "
+                    "when TELEGRAM_TRANSPORT=cloudflare"
+                )
+            await asyncio.to_thread(ensure_schema)
+
         # ----------------------------------------------------
         # Telegram main bot
         # ----------------------------------------------------
 
-        await bot.delete_webhook(drop_pending_updates=True)
+        if TELEGRAM_TRANSPORT != "cloudflare":
+            await bot.delete_webhook(drop_pending_updates=True)
 
         me = await bot.get_me()
 
@@ -110,37 +122,19 @@ async def lifespan(app: FastAPI):
         # Main Telegram polling
         # ----------------------------------------------------
 
-        polling_task = asyncio.create_task(
-            dp.start_polling(
-                bot,
-                handle_signals=False,
-                close_bot_session=False,
-            ),
-            name="telegram-polling",
-        )
-
-        # ----------------------------------------------------
-        # Delivery bot
-        # ----------------------------------------------------
-
-        if delivery_bot and delivery_dp:
-
-            await delivery_bot.delete_webhook(
-                drop_pending_updates=False
-            )
-
-            delivery_polling_task = asyncio.create_task(
-                delivery_dp.start_polling(
-                    delivery_bot,
+        if TELEGRAM_TRANSPORT != "cloudflare":
+            polling_task = asyncio.create_task(
+                dp.start_polling(
+                    bot,
                     handle_signals=False,
                     close_bot_session=False,
                 ),
-                name="delivery-polling",
+                name="telegram-polling",
             )
+        else:
+            logger.info("Main bot polling disabled; waiting for signed Cloudflare queue updates")
 
-            logger.info(
-                "Separate manual Delivery Bot started"
-            )
+        logger.info("Manual delivery bot transport is hosted by the Cloudflare webhook Worker")
 
         logger.info(
             "FastAPI reseller API + Telegram services started"
@@ -153,7 +147,6 @@ async def lifespan(app: FastAPI):
         logger.info("Shutting down services...")
 
         tasks = (
-            delivery_polling_task,
             polling_task,
             deposit_task,
             order_notification_task,
@@ -171,9 +164,6 @@ async def lifespan(app: FastAPI):
         if bot.session:
             await bot.session.close()
 
-        if delivery_bot and delivery_bot.session:
-            await delivery_bot.session.close()
-
         logger.info("Shutdown complete")
 
 
@@ -189,6 +179,57 @@ app = FastAPI(
     openapi_url=None,
     lifespan=lifespan,
 )
+
+
+@app.post("/internal/cloudflare/telegram/update")
+async def cloudflare_telegram_update(request: Request):
+    if TELEGRAM_TRANSPORT != "cloudflare":
+        return JSONResponse({"error": "bridge_disabled"}, status_code=404)
+    if not CLOUDFLARE_BRIDGE_SECRET:
+        return JSONResponse({"error": "bridge_not_configured"}, status_code=503)
+
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_BRIDGE_BODY_BYTES:
+                return JSONResponse({"error": "payload_too_large"}, status_code=413)
+        except ValueError:
+            return JSONResponse({"error": "invalid_content_length"}, status_code=400)
+
+    raw_body = await request.body()
+    if len(raw_body) > MAX_BRIDGE_BODY_BYTES:
+        return JSONResponse({"error": "payload_too_large"}, status_code=413)
+
+    if not verify_request(
+        CLOUDFLARE_BRIDGE_SECRET,
+        request.headers.get("X-RainDeals-Timestamp", ""),
+        raw_body,
+        request.headers.get("X-RainDeals-Signature", ""),
+    ):
+        return JSONResponse({"error": "unauthorized"}, status_code=403)
+
+    try:
+        update_data = json.loads(raw_body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+    if not isinstance(update_data, dict) or type(update_data.get("update_id")) is not int:
+        return JSONResponse({"error": "invalid_telegram_update"}, status_code=400)
+
+    from aiogram.types import Update
+
+    try:
+        update = Update.model_validate(update_data, context={"bot": bot})
+        state = await dispatch_update(
+            update_data["update_id"],
+            lambda: dp.feed_update(bot, update),
+        )
+    except Exception:
+        logger.exception("Cloudflare bridge failed to dispatch update %s", update_data["update_id"])
+        return JSONResponse({"error": "dispatch_failed"}, status_code=503)
+
+    if state == "busy":
+        return JSONResponse({"error": "update_in_progress"}, status_code=503, headers={"Retry-After": "3"})
+    return JSONResponse({"ok": True, "state": state}, status_code=200)
 
 
 @app.post("/api/v1/upstream/callback")
