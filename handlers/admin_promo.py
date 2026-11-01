@@ -2,6 +2,8 @@
 handlers/admin_promo.py
 """
 
+from utils.ui import answer_card
+
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
@@ -75,17 +77,17 @@ async def promo_amount_received(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if text.lower() == "cancel":
         await state.clear()
-        await message.answer("❌ Cancelled.", reply_markup=get_promo_menu_keyboard())
+        await answer_card(message, "❌ Cancelled.", reply_markup=get_promo_menu_keyboard())
         return
     try:
         amount = float(text)
         if amount <= 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Invalid amount. Send a positive number:")
+        await answer_card(message, "❌ Invalid amount. Send a positive number:")
         return
     await state.update_data(amount=amount)
-    await message.answer(
+    await answer_card(message,
         f"🔢 <b>Max uses?</b>\n\nAmount: <b>{amount} USDT</b>\n<code>1</code> = single, <code>0</code> = unlimited",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅ Cancel", callback_data="admin_promo")]
@@ -102,17 +104,17 @@ async def promo_max_uses_received(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if text.lower() == "cancel":
         await state.clear()
-        await message.answer("❌ Cancelled.", reply_markup=get_promo_menu_keyboard())
+        await answer_card(message, "❌ Cancelled.", reply_markup=get_promo_menu_keyboard())
         return
     try:
         max_uses = int(text)
         if max_uses < 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Invalid. Send 0 or a positive number:")
+        await answer_card(message, "❌ Invalid. Send 0 or a positive number:")
         return
     data = await state.get_data()
-    await message.answer(
+    await answer_card(message,
         f"🏷 <b>Send custom code or</b> <code>auto</code>:\n\n"
         f"Amount: <b>{data['amount']} USDT</b>\nMax: <b>{'Unlimited' if max_uses == 0 else max_uses}</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -143,7 +145,7 @@ async def promo_code_received(message: Message, state: FSMContext):
     text = (message.text or "").strip().upper()
     if text.lower() == "cancel":
         await state.clear()
-        await message.answer("❌ Cancelled.", reply_markup=get_promo_menu_keyboard())
+        await answer_card(message, "❌ Cancelled.", reply_markup=get_promo_menu_keyboard())
         return
     data = await state.get_data()
     await _save_promocode(message, state, data, text)
@@ -154,19 +156,19 @@ async def _save_promocode(message: Message, state: FSMContext, data: dict, code:
     try:
         existing = db.query(PromoCode).filter(PromoCode.code == code).first()
         if existing:
-            await message.answer("❌ Code already exists. Try another:")
+            await answer_card(message, "❌ Code already exists. Try another:")
             return
         promo = PromoCode(code=code, amount=data["amount"], max_uses=data["max_uses"], created_by=message.from_user.id)
         db.add(promo)
         db.commit()
         max_text = "Unlimited" if data["max_uses"] == 0 else str(data["max_uses"])
-        await message.answer(
+        await answer_card(message,
             f"✅ <b>Promocode Created!</b>\n\n🏷 <code>{code}</code>\n💰 <b>{data['amount']} USDT</b>\n🔢 Max Uses: <b>{max_text}</b>",
             reply_markup=get_promo_menu_keyboard(), parse_mode="HTML"
         )
     except Exception as e:
         db.rollback()
-        await message.answer(f"❌ Error: {e}")
+        await answer_card(message, f"❌ Error: {e}")
     finally:
         db.close()
         await state.clear()

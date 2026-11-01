@@ -1,3 +1,5 @@
+
+from utils.ui import answer_card
 from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -28,7 +30,7 @@ async def add_product(
         AddProduct.name
     )
 
-    await message.answer(
+    await answer_card(message,
         "📌 Enter Product Name:"
     )
 
@@ -48,7 +50,7 @@ async def product_name(
         AddProduct.icon
     )
 
-    await message.answer(
+    await answer_card(message,
         """
 😀 Enter Product Icon
 
@@ -78,7 +80,7 @@ async def product_icon(
         AddProduct.description
     )
 
-    await message.answer(
+    await answer_card(message,
         "📝 Enter Description:"
     )
 
@@ -98,7 +100,7 @@ async def product_description(
         AddProduct.price
     )
 
-    await message.answer(
+    await answer_card(message,
         "💲 Enter Price:"
     )
 
@@ -118,7 +120,7 @@ async def product_price(
 
     except:
 
-        await message.answer(
+        await answer_card(message,
             "❌ Invalid price."
         )
 
@@ -132,7 +134,7 @@ async def product_price(
         AddProduct.category
     )
 
-    await message.answer(
+    await answer_card(message,
         "🏷 Enter Category:"
     )
 
@@ -152,7 +154,7 @@ async def product_category(
         AddProduct.accounts
     )
 
-    await message.answer(
+    await answer_card(message,
         """
 📦 Send accounts.
 
@@ -214,7 +216,7 @@ async def product_accounts(
 
     await state.clear()
 
-    await message.answer(
+    await answer_card(message,
         f"""
 ✅ Product Added
 

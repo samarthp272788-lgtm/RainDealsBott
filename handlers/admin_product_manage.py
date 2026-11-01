@@ -1,3 +1,5 @@
+
+from utils.ui import answer_card
 # handlers/admin_product_manage.py — FULLY WORKING ADMIN PRODUCT MANAGEMENT
 
 import json
@@ -613,7 +615,7 @@ ${float(product.price or 0):.2f}
 
 @router.message(Command("testadmin"))
 async def test_admin(message: Message):
-    await message.answer("✅ Admin router working")
+    await answer_card(message, "✅ Admin router working")
 
 
 @router.callback_query(F.data.startswith("manage_"))
@@ -654,7 +656,7 @@ async def create_product_link(callback: CallbackQuery):
 
     bot_info = await callback.bot.get_me()
     product_url = f"https://t.me/{bot_info.username}?start=product_{product_id}"
-    await callback.message.answer(
+    await answer_card(callback,
         f"🔗 <b>Direct link for {safe(product.name)}</b>\n\n"
         f"<code>{product_url}</code>\n\n"
         "Share this link. When opened, it will take users directly to this product.",
@@ -681,7 +683,7 @@ async def add_accounts(callback: CallbackQuery, state: FSMContext):
     await state.update_data(product_id=pid)
     await state.set_state(AddAccounts.accounts)
 
-    await callback.message.answer(
+    await answer_card(callback,
         "Send accounts.\n\n"
         "One account per line.\n\n"
         "Example:\n"
@@ -706,7 +708,7 @@ async def save_accounts(message: Message, state: FSMContext):
     try:
         product = db.query(Product).filter(Product.id == pid).first()
         if not product:
-            await message.answer("❌ Product not found.")
+            await answer_card(message, "❌ Product not found.")
             return
 
         old_accounts = product.file_content or ""
@@ -733,7 +735,7 @@ async def save_accounts(message: Message, state: FSMContext):
     except Exception:
         logger.exception("Failed to send stock notification after adding accounts")
 
-    await message.answer(
+    await answer_card(message,
         "✅ Accounts added.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
@@ -818,7 +820,7 @@ async def replace_accounts_start(callback: CallbackQuery, state: FSMContext):
     await state.update_data(product_id=pid, replace_mode=True)
     await state.set_state(EditAccounts.replace_accounts)
 
-    await callback.message.answer(
+    await answer_card(callback,
         "📝 Send the <b>new</b> account list.\n\n"
         "This will <b>replace</b> all existing accounts.\n"
         "One account per line.\n\n"
@@ -844,7 +846,7 @@ async def replace_accounts_save(message: Message, state: FSMContext):
     try:
         product = db.query(Product).filter(Product.id == pid).first()
         if not product:
-            await message.answer("❌ Product not found.")
+            await answer_card(message, "❌ Product not found.")
             return
 
         product.file_content = (message.text or "").strip()
@@ -864,7 +866,7 @@ async def replace_accounts_save(message: Message, state: FSMContext):
     except Exception:
         logger.exception("Failed to send stock notification after replacing accounts")
 
-    await message.answer(
+    await answer_card(message,
         "✅ Accounts replaced successfully.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
@@ -1074,7 +1076,7 @@ async def edit_bulk_pricing(callback: CallbackQuery, state: FSMContext):
         f"delete bulk pricing (flat pricing)"
     )
 
-    await callback.message.answer(text, parse_mode="HTML")
+    await answer_card(callback, text, parse_mode="HTML")
     await callback.answer()
 
 
@@ -1099,7 +1101,7 @@ async def save_bulk_pricing(message: Message, state: FSMContext):
             "All quantities will be charged at the base price."
         )
         await state.clear()
-        await message.answer(
+        await answer_card(message,
             confirm,
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(
@@ -1110,7 +1112,7 @@ async def save_bulk_pricing(message: Message, state: FSMContext):
         bulk_data = _parse_bulk_pricing(raw)
 
         if bulk_data is None:
-            await message.answer(
+            await answer_card(message,
                 "❌ <b>Invalid format!</b>\n\n"
                 f"{_divider('─')}\n\n"
                 "Please use:\n\n"
@@ -1136,7 +1138,7 @@ async def save_bulk_pricing(message: Message, state: FSMContext):
             "the best price for their quantity!"
         )
 
-        await message.answer(
+        await answer_card(message,
             confirm,
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(
@@ -1177,7 +1179,7 @@ async def edit_product_name_start(callback: CallbackQuery, state: FSMContext):
 
     await state.update_data(edit_product_name_id=pid)
     await state.set_state(EditProduct.name)
-    await callback.message.answer(
+    await answer_card(callback,
         f"Current name: <b>{safe(product.name)}</b>\n\n"
         "Send the new product name (1–255 characters).",
         parse_mode="HTML",
@@ -1197,14 +1199,14 @@ async def cancel_product_name_edit(callback: CallbackQuery, state: FSMContext):
     pid = data.get("edit_product_name_id")
     await state.clear()
     if pid:
-        await callback.message.answer(
+        await answer_card(callback,
             "Name edit cancelled.",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[[InlineKeyboardButton(text="📋 Back to Product", callback_data=f"manage_{pid}")]]
             ),
         )
     else:
-        await callback.message.answer("Name edit cancelled.")
+        await answer_card(callback, "Name edit cancelled.")
     await callback.answer()
 
 
@@ -1215,24 +1217,24 @@ async def save_product_name(message: Message, state: FSMContext):
         return
     name = (message.text or "").strip()
     if not name:
-        await message.answer("❌ Product name can't be empty. Send a name or tap Cancel.")
+        await answer_card(message, "❌ Product name can't be empty. Send a name or tap Cancel.")
         return
     if len(name) > 255:
-        await message.answer("❌ Product name must be 255 characters or fewer.")
+        await answer_card(message, "❌ Product name must be 255 characters or fewer.")
         return
 
     data = await state.get_data()
     pid = data.get("edit_product_name_id")
     if not pid:
         await state.clear()
-        await message.answer("❌ Product edit expired. Open the product manager and try again.")
+        await answer_card(message, "❌ Product edit expired. Open the product manager and try again.")
         return
 
     db = SessionLocal()
     try:
         product = db.query(Product).filter(Product.id == int(pid)).first()
         if not product:
-            await message.answer("❌ Product not found.")
+            await answer_card(message, "❌ Product not found.")
             return
         product.name = name
         db.commit()
@@ -1240,7 +1242,7 @@ async def save_product_name(message: Message, state: FSMContext):
     except Exception:
         db.rollback()
         logger.exception("Failed to update product name for product %s", pid)
-        await message.answer("❌ Could not update the product name. Please try again.")
+        await answer_card(message, "❌ Could not update the product name. Please try again.")
         return
     finally:
         db.close()
@@ -1249,9 +1251,9 @@ async def save_product_name(message: Message, state: FSMContext):
     product = await asyncio.to_thread(_load_product, int(pid))
     if product:
         panel_text, markup = _build_product_panel(product)
-        await message.answer(panel_text, reply_markup=markup, parse_mode="HTML")
+        await answer_card(message, panel_text, reply_markup=markup, parse_mode="HTML")
     else:
-        await message.answer("✅ Product name updated.")
+        await answer_card(message, "✅ Product name updated.")
 
 @router.callback_query(F.data.startswith("edit_price_"))
 async def edit_price(callback: CallbackQuery):
@@ -1259,7 +1261,7 @@ async def edit_price(callback: CallbackQuery):
         await callback.answer("Access denied.", show_alert=True)
         return
     pid = callback.data.split("_")[2]
-    await callback.message.answer(f"Send:\n<code>/setprice {pid} 9.99</code>", parse_mode="HTML")
+    await answer_card(callback, f"Send:\n<code>/setprice {pid} 9.99</code>", parse_mode="HTML")
     await callback.answer()
 
 
@@ -1269,7 +1271,7 @@ async def edit_stock(callback: CallbackQuery):
         await callback.answer("Access denied.", show_alert=True)
         return
     pid = callback.data.split("_")[2]
-    await callback.message.answer(f"Send:\n<code>/setstock {pid} 100</code>", parse_mode="HTML")
+    await answer_card(callback, f"Send:\n<code>/setstock {pid} 100</code>", parse_mode="HTML")
     await callback.answer()
 
 
@@ -1279,7 +1281,7 @@ async def edit_threshold(callback: CallbackQuery):
         await callback.answer("Access denied.", show_alert=True)
         return
     pid = callback.data.split("_")[2]
-    await callback.message.answer(
+    await answer_card(callback,
         f"Send:\n<code>/setthreshold {pid} 3</code>\n\n"
         "You'll get a Telegram alert whenever stock drops to or below this number.",
         parse_mode="HTML"
@@ -1293,7 +1295,7 @@ async def edit_desc(callback: CallbackQuery):
         await callback.answer("Access denied.", show_alert=True)
         return
     pid = callback.data.split("_")[1]
-    await callback.message.answer(f"Send:\n<code>/setdesc {pid} New Description</code>", parse_mode="HTML")
+    await answer_card(callback, f"Send:\n<code>/setdesc {pid} New Description</code>", parse_mode="HTML")
     await callback.answer()
 
 
@@ -1309,30 +1311,30 @@ async def set_price(message: Message):
         return
     parts = message.text.split()
     if len(parts) != 3:
-        await message.answer("❌ Usage: <code>/setprice &lt;product_id&gt; &lt;price&gt;</code>\nExample: <code>/setprice 5 9.99</code>", parse_mode="HTML")
+        await answer_card(message, "❌ Usage: <code>/setprice &lt;product_id&gt; &lt;price&gt;</code>\nExample: <code>/setprice 5 9.99</code>", parse_mode="HTML")
         return
     _, pid_raw, price_raw = parts
     if not pid_raw.isdigit():
-        await message.answer("❌ Product ID must be a number.")
+        await answer_card(message, "❌ Product ID must be a number.")
         return
     try:
         price = float(price_raw)
     except ValueError:
-        await message.answer("❌ Price must be a number, e.g. 9.99")
+        await answer_card(message, "❌ Price must be a number, e.g. 9.99")
         return
     if price < 0:
-        await message.answer("❌ Price can't be negative.")
+        await answer_card(message, "❌ Price can't be negative.")
         return
     db = SessionLocal()
     try:
         product = db.query(Product).filter(Product.id == int(pid_raw)).first()
         if not product:
-            await message.answer("❌ Product not found.")
+            await answer_card(message, "❌ Product not found.")
             return
         product.price = Decimal(str(price))
         db.commit()
         invalidate_products_cache()
-        await message.answer(f"✅ Price updated to <b>${price:.2f}</b>.", parse_mode="HTML")
+        await answer_card(message, f"✅ Price updated to <b>${price:.2f}</b>.", parse_mode="HTML")
     finally:
         db.close()
 
@@ -1345,30 +1347,30 @@ async def set_stock(message: Message):
         return
     parts = message.text.split()
     if len(parts) != 3:
-        await message.answer("❌ Usage: <code>/setstock &lt;product_id&gt; &lt;stock&gt;</code>\nExample: <code>/setstock 5 100</code>", parse_mode="HTML")
+        await answer_card(message, "❌ Usage: <code>/setstock &lt;product_id&gt; &lt;stock&gt;</code>\nExample: <code>/setstock 5 100</code>", parse_mode="HTML")
         return
     _, pid_raw, stock_raw = parts
     if not pid_raw.isdigit():
-        await message.answer("❌ Product ID must be a number.")
+        await answer_card(message, "❌ Product ID must be a number.")
         return
     pid = int(pid_raw)
     try:
         stock = int(stock_raw)
     except ValueError:
-        await message.answer("❌ Stock must be a whole number.")
+        await answer_card(message, "❌ Stock must be a whole number.")
         return
     if stock < 0:
-        await message.answer("❌ Stock can't be negative.")
+        await answer_card(message, "❌ Stock can't be negative.")
         return
     db = SessionLocal()
     try:
         product = db.query(Product).filter(Product.id == pid).first()
         if not product:
-            await message.answer("❌ Product not found.")
+            await answer_card(message, "❌ Product not found.")
             return
         delivery_type = (product.delivery_type or "automatic").lower()
         if delivery_type == "automatic" and not getattr(product, "reseller_service_id", None):
-            await message.answer(
+            await answer_card(message,
                 "ℹ️ This product delivers automatically from loaded accounts, "
                 "so stock is derived from the account list. Setting manual stock "
                 "won't persist across automated sales or uploads."
@@ -1385,7 +1387,7 @@ async def set_stock(message: Message):
     except Exception:
         logger.exception("Failed to send stock notification after /setstock")
 
-    await message.answer(f"✅ Stock updated to <b>{stock}</b>.", parse_mode="HTML")
+    await answer_card(message, f"✅ Stock updated to <b>{stock}</b>.", parse_mode="HTML")
 
 
 @router.message(Command("setthreshold"))
@@ -1396,30 +1398,30 @@ async def set_threshold(message: Message):
         return
     parts = message.text.split()
     if len(parts) != 3:
-        await message.answer("❌ Usage: <code>/setthreshold &lt;product_id&gt; &lt;threshold&gt;</code>\nExample: <code>/setthreshold 5 3</code>", parse_mode="HTML")
+        await answer_card(message, "❌ Usage: <code>/setthreshold &lt;product_id&gt; &lt;threshold&gt;</code>\nExample: <code>/setthreshold 5 3</code>", parse_mode="HTML")
         return
     _, pid_raw, threshold_raw = parts
     if not pid_raw.isdigit():
-        await message.answer("❌ Product ID must be a number.")
+        await answer_card(message, "❌ Product ID must be a number.")
         return
     try:
         threshold = int(threshold_raw)
     except ValueError:
-        await message.answer("❌ Threshold must be a whole number.")
+        await answer_card(message, "❌ Threshold must be a whole number.")
         return
     if threshold < 0:
-        await message.answer("❌ Threshold can't be negative.")
+        await answer_card(message, "❌ Threshold can't be negative.")
         return
     db = SessionLocal()
     try:
         product = db.query(Product).filter(Product.id == int(pid_raw)).first()
         if not product:
-            await message.answer("❌ Product not found.")
+            await answer_card(message, "❌ Product not found.")
             return
         product.low_stock_threshold = threshold
         db.commit()
         invalidate_products_cache()
-        await message.answer(f"✅ Low stock alert threshold set to <b>{threshold}</b>.", parse_mode="HTML")
+        await answer_card(message, f"✅ Low stock alert threshold set to <b>{threshold}</b>.", parse_mode="HTML")
     finally:
         db.close()
 
@@ -1432,22 +1434,22 @@ async def set_desc(message: Message):
         return
     parts = message.text.split(maxsplit=2)
     if len(parts) != 3:
-        await message.answer("❌ Usage: <code>/setdesc &lt;product_id&gt; &lt;description&gt;</code>", parse_mode="HTML")
+        await answer_card(message, "❌ Usage: <code>/setdesc &lt;product_id&gt; &lt;description&gt;</code>", parse_mode="HTML")
         return
     _, pid_raw, desc = parts
     if not pid_raw.isdigit():
-        await message.answer("❌ Product ID must be a number.")
+        await answer_card(message, "❌ Product ID must be a number.")
         return
     db = SessionLocal()
     try:
         product = db.query(Product).filter(Product.id == int(pid_raw)).first()
         if not product:
-            await message.answer("❌ Product not found.")
+            await answer_card(message, "❌ Product not found.")
             return
         product.description = desc
         db.commit()
         invalidate_products_cache()
-        await message.answer("✅ Description updated.")
+        await answer_card(message, "✅ Description updated.")
     finally:
         db.close()
 

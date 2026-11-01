@@ -17,7 +17,7 @@ from models.ticket import Ticket
 from models.user import User
 from config import ADMIN_IDS
 from states.support import SupportState
-from utils.ui import show, update_card
+from utils.ui import show, update_card, answer_card
 
 router = Router()
 
@@ -253,7 +253,7 @@ async def show_ticket_details(message: Message, state: FSMContext):
     try:
         ticket_id = int(message.text.strip())
     except ValueError:
-        await message.answer("❌ Invalid ticket ID. Please enter a number.")
+        await answer_card(message, "❌ Invalid ticket ID. Please enter a number.")
         return
 
     db = SessionLocal()
@@ -270,7 +270,7 @@ async def show_ticket_details(message: Message, state: FSMContext):
         )
 
         if not ticket:
-            await message.answer(
+            await answer_card(message,
                 "❌ <b>Ticket Not Found</b>\n\n"
                 "This ticket doesn't exist or doesn't belong to you."
             )
@@ -316,7 +316,7 @@ async def show_ticket_details(message: Message, state: FSMContext):
             )
         )
 
-        await message.answer(text, reply_markup=builder.as_markup())
+        await answer_card(message, text, reply_markup=builder.as_markup())
 
     finally:
         db.close()
@@ -728,14 +728,14 @@ async def create_ticket(message: Message, state: FSMContext):
     priority_emoji = get_priority_emoji(priority)
 
     if len(message.text) < 20:
-        await message.answer(
+        await answer_card(message,
             "⚠️ <b>Message too short!</b>\n\n"
             "Please provide more details (minimum 20 characters)."
         )
         return
 
     if len(message.text) > 2000:
-        await message.answer(
+        await answer_card(message,
             "⚠️ <b>Message too long!</b>\n\n"
             "Please keep your message under 2000 characters."
         )

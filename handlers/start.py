@@ -18,7 +18,7 @@ from models.user import User
 from config import ADMIN_IDS, CHANNEL_LINK, GROUP_LINK, TOS_LINK
 
 from keyboards.menu import get_main_menu, get_admin_main_menu
-from utils.ui import show
+from utils.ui import show, answer_card
 
 # Membership check
 from middleware.membership import check_user_membership, get_join_keyboard
@@ -221,6 +221,33 @@ def _build_start_welcome(
     )
 
 
+def _load_main_menu_text(
+    telegram_id: int,
+    full_name: str,
+    username: str | None,
+    bot_username: str,
+) -> str | None:
+    """Load home-menu data without blocking aiogram's event loop."""
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == telegram_id).first()
+        if not user:
+            return None
+        return _build_start_welcome(user, full_name, telegram_id, username, bot_username)
+    finally:
+        db.close()
+
+
+def _load_profile_text(telegram_id: int) -> str | None:
+    """Load profile data in a worker thread, keeping remote DB waits off-loop."""
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == telegram_id).first()
+        return _build_audit_profile(user, telegram_id) if user else None
+    finally:
+        db.close()
+
+
 # ╔══════════════════════════════════════════════════════════════╗
 # ║  CALLBACK HANDLERS                                         ║
 # ╚══════════════════════════════════════════════════════════════╝
@@ -252,27 +279,22 @@ async def clear_start_menu(callback: CallbackQuery):
 async def main_menu_cb(callback: CallbackQuery, state: FSMContext):
     """Back to main menu — edits the current message."""
     await state.clear()
-
-    db = SessionLocal()
-    try:
-        user = db.query(User).filter(User.telegram_id == callback.from_user.id).first()
-        if not user:
-            await callback.answer("User not found.", show_alert=True)
-            return
-
-        is_admin = callback.from_user.id in ADMIN_IDS
-        bot_username = await _get_bot_username(callback.bot)
-        text = _build_start_welcome(
-            user, callback.from_user.full_name, callback.from_user.id,
-            callback.from_user.username, bot_username,
-        )
-        keyboard = get_admin_main_menu() if is_admin else get_main_menu()
-
-        await show(callback, text, reply_markup=keyboard, parse_mode="HTML")
-    finally:
-        db.close()
-
     await callback.answer()
+
+    bot_username = await _get_bot_username(callback.bot)
+    text = await asyncio.to_thread(
+        _load_main_menu_text,
+        callback.from_user.id,
+        callback.from_user.full_name,
+        callback.from_user.username,
+        bot_username,
+    )
+    if text is None:
+        await answer_card(callback, "User record not found. Send /start to register again.")
+        return
+
+    keyboard = get_admin_main_menu() if callback.from_user.id in ADMIN_IDS else get_main_menu()
+    await show(callback, text, reply_markup=keyboard, parse_mode="HTML")
 
 
 @router.callback_query(F.data == "my_profile")
@@ -280,30 +302,22 @@ async def my_profile(callback: CallbackQuery):
     """Profile → sends NEW audit-style message with Back button. Main menu stays."""
     await callback.answer()
 
-    db = SessionLocal()
-    try:
-        user = db.query(User).filter(User.telegram_id == callback.from_user.id).first()
-        if not user:
-            await callback.answer("User not found.", show_alert=True)
-            return
+    text = await asyncio.to_thread(_load_profile_text, callback.from_user.id)
+    if not text:
+        await answer_card(callback, "User record not found. Send /start to register again.")
+        return
 
-        text = _build_audit_profile(user, callback.from_user.id)
-
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="⬅️ Back", callback_data="profile_back")],
-            ]
-        )
-
-        await callback.message.answer(
-            text,
-            reply_markup=keyboard,
-            parse_mode="HTML",
-            disable_web_page_preview=True
-        )
-
-    finally:
-        db.close()
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Back", callback_data="profile_back")],
+        ]
+    )
+    await answer_card(callback,
+        text,
+        reply_markup=keyboard,
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -313,6 +327,10 @@ async def my_profile(callback: CallbackQuery):
 @router.callback_query(F.data == "check_membership_retry")
 async def retry_membership_check(callback: CallbackQuery):
     """Run a fresh check after a user joins a required chat."""
+    if not callback.message or callback.message.chat.type != "private":
+        await callback.answer("Open the bot in a private chat to verify membership.", show_alert=True)
+        return
+
     is_member = await check_user_membership(
         callback.bot,
         callback.from_user.id,
@@ -323,7 +341,7 @@ async def retry_membership_check(callback: CallbackQuery):
     is_member, failures = is_member
     if is_member:
         await callback.message.delete()
-        await callback.message.answer(
+        await answer_card(callback,
             "✅ <b>Verification Successful!</b>\n\n"
             "Send /start to begin using the bot.",
             parse_mode="HTML"
@@ -408,6 +426,11 @@ def _get_or_create_user(telegram_id: int, username: str, full_name: str, ref_pay
 
 @router.message(CommandStart())
 async def start_cmd(message: Message, command: CommandObject):
+    # This bot's user flow is private-chat only. In particular, never expose
+    # join-required prompts in order/stock notification groups.
+    if message.chat.type != "private":
+        return
+
     telegram_id = message.from_user.id
     start_payload = (command.args or "").strip() if command else ""
     deep_link_product_id = None
@@ -426,7 +449,7 @@ async def start_cmd(message: Message, command: CommandObject):
             fast=deep_link_product_id is not None,
         )
         if not is_member:
-            await message.answer(
+            await answer_card(message,
                 "⚠️ <b>Access Restricted</b>\n\n"
                 "You must join every required chat to use the bot.\n\n"
                 "👇 Join below, then press <b>Try Again</b>",
@@ -448,7 +471,7 @@ async def start_cmd(message: Message, command: CommandObject):
         result = await db_task
     except Exception:
         logger.exception("Failed to create/update user %s on /start", telegram_id)
-        await message.answer(
+        await answer_card(message,
             "❌ <b>Startup Error</b>\n\nSomething went wrong starting your session.\nPlease try again with /start",
             parse_mode="HTML"
         )
@@ -466,7 +489,7 @@ async def start_cmd(message: Message, command: CommandObject):
     user.full_name = full_name
     text = _build_start_welcome(user, full_name, telegram_id, username, bot_username)
     keyboard = get_admin_main_menu() if is_admin else get_main_menu()
-    await message.answer(
+    await answer_card(message,
         text, reply_markup=keyboard, parse_mode="HTML",
         disable_web_page_preview=True
     )

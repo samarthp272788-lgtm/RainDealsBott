@@ -1,3 +1,5 @@
+
+from utils.ui import answer_card
 import json
 import logging
 from decimal import Decimal
@@ -431,10 +433,10 @@ async def _show_product_source_selection(target: Message | CallbackQuery, state:
     )
 
     if isinstance(target, CallbackQuery):
-        await target.message.answer(text, parse_mode="HTML", reply_markup=keyboard)
-        await target.answer()
+        await answer_card(target, text, parse_mode="HTML", reply_markup=keyboard)
+        await answer_card(target, )
     else:
-        await target.answer(text, parse_mode="HTML", reply_markup=keyboard)
+        await answer_card(target, text, parse_mode="HTML", reply_markup=keyboard)
 
 
 @router.message(Command("addproduct"))
@@ -469,7 +471,7 @@ async def add_product_own(callback: CallbackQuery, state: FSMContext):
     )
     await state.set_state(AddProduct.name)
 
-    await callback.message.answer(
+    await answer_card(callback,
         "╔══════════════════════════════╗\n"
         "║  🏠 OWN PRODUCT              ║\n"
         "╚══════════════════════════════╝\n\n"
@@ -511,7 +513,7 @@ async def add_product_reseller(callback: CallbackQuery, state: FSMContext):
                 ]
             ]
         )
-        await callback.message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+        await answer_card(callback, text, parse_mode="HTML", reply_markup=keyboard)
         await callback.answer()
         return
 
@@ -539,7 +541,7 @@ async def add_product_reseller(callback: CallbackQuery, state: FSMContext):
         "Choose a provider to import products from:\n"
     )
 
-    await callback.message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+    await answer_card(callback, text, parse_mode="HTML", reply_markup=keyboard)
     await callback.answer()
 
 
@@ -596,7 +598,7 @@ async def _fetch_and_show_reseller_products(callback: CallbackQuery, state: FSMC
                     parse_mode="HTML"
                 )
             except Exception:
-                await callback.message.answer(
+                await answer_card(callback,
                     "❌ <b>Provider Configuration Error:</b>\n"
                     f"Selected provider '{reseller_id}' was not found or is inactive.\n\n"
                     "Please check <b>Admin → Providers</b>.",
@@ -627,7 +629,7 @@ async def _fetch_and_show_reseller_products(callback: CallbackQuery, state: FSMC
                     parse_mode="HTML"
                 )
             except Exception:
-                await callback.message.answer(
+                await answer_card(callback,
                     f"❌ <b>Provider configuration for {_esc(reseller_name)} is incomplete.</b>\n\n"
                     "Please check provider settings in Admin → Providers.",
                     parse_mode="HTML"
@@ -658,7 +660,7 @@ async def _fetch_and_show_reseller_products(callback: CallbackQuery, state: FSMC
                     parse_mode="HTML"
                 )
             except Exception:
-                await callback.message.answer(
+                await answer_card(callback,
                     f"❌ <b>Connection Timeout:</b> Could not reach provider {_esc(reseller_name)} within timeout.",
                     parse_mode="HTML"
                 )
@@ -672,7 +674,7 @@ async def _fetch_and_show_reseller_products(callback: CallbackQuery, state: FSMC
             try:
                 await callback.message.edit_text(display_msg, parse_mode="HTML")
             except Exception:
-                await callback.message.answer(display_msg, parse_mode="HTML")
+                await answer_card(callback, display_msg, parse_mode="HTML")
             return
         except Exception as e:
             logger.error("Diagnostic Connection Error for provider=%s: %s", prov_id, str(e))
@@ -682,7 +684,7 @@ async def _fetch_and_show_reseller_products(callback: CallbackQuery, state: FSMC
                     parse_mode="HTML"
                 )
             except Exception:
-                await callback.message.answer(
+                await answer_card(callback,
                     f"❌ <b>Connection Error:</b> Could not reach provider {_esc(reseller_name)}.\n<code>{_esc(str(e))}</code>",
                     parse_mode="HTML"
                 )
@@ -692,7 +694,7 @@ async def _fetch_and_show_reseller_products(callback: CallbackQuery, state: FSMC
             try:
                 await callback.message.edit_text(f"📦 No products available from {_esc(reseller_name)}.", parse_mode="HTML")
             except Exception:
-                await callback.message.answer(f"📦 No products available from {_esc(reseller_name)}.", parse_mode="HTML")
+                await answer_card(callback, f"📦 No products available from {_esc(reseller_name)}.", parse_mode="HTML")
             return
 
         logger.info(
@@ -775,7 +777,7 @@ async def _fetch_and_show_reseller_products(callback: CallbackQuery, state: FSMC
             try:
                 await callback.message.edit_text("No in-stock products available from this provider.", parse_mode="HTML")
             except Exception:
-                await callback.message.answer("No in-stock products available from this provider.", parse_mode="HTML")
+                await answer_card(callback, "No in-stock products available from this provider.", parse_mode="HTML")
             return
 
         await state.update_data(reseller_products_cache=products_cache)
@@ -803,7 +805,7 @@ async def _fetch_and_show_reseller_products(callback: CallbackQuery, state: FSMC
         except Exception:
             logger.exception("Failed to edit Telegram message with reseller product buttons")
             try:
-                await callback.message.answer(
+                await answer_card(callback,
                     "╔══════════════════════════════╗\n"
                     "║  📦 PROVIDER PRODUCTS        ║\n"
                     "╚══════════════════════════════╝\n\n"
@@ -883,7 +885,7 @@ async def reseller_product_selected(callback: CallbackQuery, state: FSMContext):
     affordable_quantity = int(provider_balance / reseller_cost)
     max_import_quantity = min(reseller_stock, affordable_quantity) if reseller_stock < 999999 else affordable_quantity
     if max_import_quantity <= 0:
-        await callback.message.answer(
+        await answer_card(callback,
             f"❌ Provider wallet balance is <b>${provider_balance:.2f}</b>; "
             f"this product costs <b>${reseller_cost:.2f}</b> per unit, so no units can be imported.",
             parse_mode="HTML",
@@ -920,7 +922,7 @@ async def reseller_product_selected(callback: CallbackQuery, state: FSMContext):
 
     stock_display = f"{reseller_stock}" if reseller_stock < 999999 else "🟢 In Stock"
 
-    await callback.message.answer(
+    await answer_card(callback,
         f"🔗 <b>Selected Reseller Product:</b>\n"
         f"<b>{_esc(reseller_product_name)}</b>\n\n"
         f"💰 <b>Provider Cost:</b> ${reseller_cost:.2f}\n"
@@ -944,16 +946,16 @@ async def reseller_import_quantity(message: Message, state: FSMContext):
     try:
         quantity = int(message.text.strip())
     except ValueError:
-        await message.answer("Send a whole-number quantity.")
+        await answer_card(message, "Send a whole-number quantity.")
         return
     data = await state.get_data()
     maximum = int(data.get("max_import_quantity", 0))
     if quantity < 1 or quantity > maximum:
-        await message.answer(f"Quantity must be between 1 and {maximum}.")
+        await answer_card(message, f"Quantity must be between 1 and {maximum}.")
         return
     await state.update_data(reseller_import_quantity=quantity)
     await state.set_state(AddProduct.price)
-    await message.answer(
+    await answer_card(message,
         f"✅ Import quantity set to <b>{quantity}</b>.\n"
         f"💰 <b>Enter your selling price (USD):</b>\n\n"
         f"<i>This is the price your customers will pay in your store.</i>\n"
@@ -978,13 +980,13 @@ async def product_name(message: Message, state: FSMContext):
     name = message.text.strip()
 
     if len(name) < 2:
-        await message.answer("❌ <b>Name too short!</b>\nPlease send at least 2 characters.", parse_mode="HTML")
+        await answer_card(message, "❌ <b>Name too short!</b>\nPlease send at least 2 characters.", parse_mode="HTML")
         return
 
     await state.update_data(name=name)
     await state.set_state(AddProduct.icon)
 
-    await message.answer(
+    await answer_card(message,
         f"✅ <b>Name:</b> {_esc(name)}\n\n"
         f"{_divider('─')}\n\n"
         f"✏️ <b>Step 2/10: Icon</b>\n\n"
@@ -1006,13 +1008,13 @@ async def product_icon(message: Message, state: FSMContext):
     icon = message.text.strip()
 
     if len(icon) > 15:
-        await message.answer("❌ <b>Icon too long!</b>\nUse 1-15 characters. An emoji is best: 🎬", parse_mode="HTML")
+        await answer_card(message, "❌ <b>Icon too long!</b>\nUse 1-15 characters. An emoji is best: 🎬", parse_mode="HTML")
         return
 
     await state.update_data(icon=icon)
     await state.set_state(AddProduct.category)
 
-    await message.answer(
+    await answer_card(message,
         f"✅ <b>Icon:</b> {icon}\n\n"
         f"{_divider('─')}\n\n"
         f"✏️ <b>Step 3/10: Category</b>\n\n"
@@ -1038,7 +1040,7 @@ async def product_category(message: Message, state: FSMContext):
     await state.update_data(category=category)
     await state.set_state(AddProduct.price)
 
-    await message.answer(
+    await answer_card(message,
         f"✅ <b>Category:</b> {_esc(category)}\n\n"
         f"{_divider('─')}\n\n"
         f"✏️ <b>Step 4/10: Price</b>\n\n"
@@ -1063,7 +1065,7 @@ async def product_price(message: Message, state: FSMContext):
         price_val = Decimal(message.text.strip())
         price = float(price_val)
     except Exception:
-        await message.answer("❌ <b>Invalid price!</b>\nPlease send a positive number like 0.99 or 9.99",
+        await answer_card(message, "❌ <b>Invalid price!</b>\nPlease send a positive number like 0.99 or 9.99",
                              parse_mode="HTML")
         return
 
@@ -1072,14 +1074,14 @@ async def product_price(message: Message, state: FSMContext):
     if price <= 0:
         if price == 0 and not data.get("_zero_confirmed"):
             await state.update_data(_zero_confirmed=True)
-            await message.answer(
+            await answer_card(message,
                 "⚠️ <b>Price is $0.00 — FREE product!</b>\n\n"
                 "Send <b>0</b> again to confirm.",
                 parse_mode="HTML"
             )
             return
         elif price < 0:
-            await message.answer("❌ <b>Price can't be negative!</b>", parse_mode="HTML")
+            await answer_card(message, "❌ <b>Price can't be negative!</b>", parse_mode="HTML")
             return
 
     await state.update_data(price=price)
@@ -1194,7 +1196,7 @@ async def product_price(message: Message, state: FSMContext):
             ]
         )
 
-        await message.answer(
+        await answer_card(message,
             text,
             parse_mode="HTML",
             reply_markup=keyboard
@@ -1204,7 +1206,7 @@ async def product_price(message: Message, state: FSMContext):
     # Own product sequence continues
     await state.set_state(AddProduct.description)
 
-    await message.answer(
+    await answer_card(message,
         f"✅ <b>Price:</b> ${price:.2f}\n\n"
         f"{_divider('─')}\n\n"
         f"✏️ <b>Step 5/10: Description</b>\n\n"
@@ -1233,7 +1235,7 @@ async def product_description(message: Message, state: FSMContext):
     await state.update_data(description=desc)
     await state.set_state(AddProduct.delivery_type)
 
-    await message.answer(
+    await answer_card(message,
         f"✅ <b>Description:</b> {_esc(desc) if desc else '(empty)'}\n\n"
         f"{_divider('─')}\n\n"
         f"✏️ <b>Step 6/10: Delivery Type</b>\n\n"
@@ -1258,7 +1260,7 @@ async def product_delivery(message: Message, state: FSMContext):
     dt = message.text.strip().lower()
 
     if dt not in ("automatic", "manual", "hybrid"):
-        await message.answer(
+        await answer_card(message,
             "❌ <b>Invalid!</b>\n\n"
             "Please send one of:\n"
             "• <b>automatic</b>\n"
@@ -1277,7 +1279,7 @@ async def product_delivery(message: Message, state: FSMContext):
         "hybrid": "🔀 Hybrid",
     }
 
-    await message.answer(
+    await answer_card(message,
         f"✅ <b>Delivery:</b> {delivery_labels.get(dt, dt)}\n\n"
         f"{_divider('─')}\n\n"
         f"✏️ <b>Step 7/10: Delivery Instructions</b> <i>(Optional)</i>\n\n"
@@ -1318,7 +1320,7 @@ async def product_delivery_instruction(message: Message, state: FSMContext):
     await state.update_data(delivery_instruction=instruction)
     await state.set_state(AddProduct.preorder)
 
-    await message.answer(
+    await answer_card(message,
         f"✅ <b>Delivery Instruction:</b> {_esc(instruction) if instruction else '(none set)'}\n\n"
         f"{_divider('─')}\n\n"
         f"✏️ <b>Step 8/10: Preorder</b>\n\n"
@@ -1369,7 +1371,7 @@ async def product_preorder(message: Message, state: FSMContext):
         f"<code>1-10=5.00\n11-50=4.00\n51+=3.00</code>"
     )
 
-    await message.answer(text, parse_mode="HTML")
+    await answer_card(message, text, parse_mode="HTML")
 
 
 @router.message(AddProduct.bulk_pricing)
@@ -1388,7 +1390,7 @@ async def product_bulk_pricing(message: Message, state: FSMContext):
         await state.update_data(bulk_pricing=None)
         await state.set_state(AddProduct.accounts)
 
-        await message.answer(
+        await answer_card(message,
             f"✅ <b>Bulk Pricing:</b> Skipped\n"
             f"    └ Using flat pricing: base price applies to all quantities\n\n"
             f"{_divider('═')}\n\n"
@@ -1408,7 +1410,7 @@ async def product_bulk_pricing(message: Message, state: FSMContext):
     bulk_data = _parse_bulk_pricing(raw)
 
     if bulk_data is None:
-        await message.answer(
+        await answer_card(message,
             "❌ <b>Invalid format!</b>\n\n"
             f"{_divider('─')}\n\n"
             "Please use the correct format:\n\n"
@@ -1432,7 +1434,7 @@ async def product_bulk_pricing(message: Message, state: FSMContext):
         current = sorted_tiers[i]
         next_tier = sorted_tiers[i + 1]
         if current.get("max") and current["max"] >= next_tier.get("min", 0):
-            await message.answer(
+            await answer_card(message,
                 "❌ <b>Overlapping tiers!</b>\n\n"
                 f"Tier {current.get('min')}-{current.get('max')} overlaps with "
                 f"tier starting at {next_tier.get('min')}.\n\n"
@@ -1464,7 +1466,7 @@ async def product_bulk_pricing(message: Message, state: FSMContext):
     confirm_lines.append("<code>email2@gmail.com:password2</code>\n")
     confirm_lines.append("\n💡 <i>Send 'skip' if no accounts yet</i>")
 
-    await message.answer("\n".join(confirm_lines), parse_mode="HTML")
+    await answer_card(message, "\n".join(confirm_lines), parse_mode="HTML")
 
 
 @router.message(AddProduct.accounts)
@@ -1599,4 +1601,4 @@ async def save_product(message: Message, state: FSMContext):
         ]
     )
 
-    await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+    await answer_card(message, text, parse_mode="HTML", reply_markup=keyboard)

@@ -1,3 +1,5 @@
+
+from utils.ui import answer_card
 import asyncio
 import logging
 from html import escape
@@ -469,7 +471,7 @@ async def deliver_order_start(callback: CallbackQuery, state: FSMContext):
     finally:
         db.close()
 
-    await callback.message.answer(
+    await answer_card(callback,
         "📤 Send the content to deliver to the buyer "
         "(account, key, or any message).\n\n"
         "It will be sent to them exactly as you type it, "
@@ -575,15 +577,15 @@ async def deliver_order_finish(message: Message, state: FSMContext):
         result = await _dispatch_blocking(_do_deliver, order_id, message.text)
     except SQLAlchemyError:
         logger.exception("Database error delivering order %s", order_id)
-        await message.answer("❌ Database error while delivering. Please try again.")
+        await answer_card(message, "❌ Database error while delivering. Please try again.")
         return
     except Exception:
         logger.exception("Unexpected error delivering order %s", order_id)
-        await message.answer("❌ Unexpected error while delivering.")
+        await answer_card(message, "❌ Unexpected error while delivering.")
         return
 
     if "error" in result:
-        await message.answer(f"❌ {result['error']}")
+        await answer_card(message, f"❌ {result['error']}")
         return
 
     try:
@@ -659,14 +661,14 @@ async def deliver_order_finish(message: Message, state: FSMContext):
             try:
                 await send_manual_delivery(order_id, destination_id, message.from_user.id)
             except DeliveryBridgeError as exc:
-                await message.answer(
+                await answer_card(message,
                     f"⚠️ Order was marked delivered, but the Delivery Bot could not confirm delivery: {exc}",
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                         InlineKeyboardButton(text="🔁 Check / retry delivery", callback_data=f"retry_api_delivery_{order_id}")
                     ]]),
                 )
                 return
-            await message.answer(
+            await answer_card(message,
                 f"✅ Manual delivery sent through the Delivery Bot to {recipient_label}.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                     InlineKeyboardButton(text="🔁 Check delivery status", callback_data=f"retry_api_delivery_{order_id}")
@@ -682,7 +684,7 @@ async def deliver_order_finish(message: Message, state: FSMContext):
             )
     except Exception:
         logger.exception("Failed to notify delivery recipient %s", result.get("delivery_telegram_id") or result["buyer_id"])
-        await message.answer(
+        await answer_card(message,
             "⚠️ Order marked delivered, but I couldn't message the "
             "recipient directly. They must start the correct bot before delivery."
         )

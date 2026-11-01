@@ -17,6 +17,9 @@ class ManagerLoginChallenge(Base):
     approved_at: Mapped[datetime | None] = mapped_column(DateTime)
     approved_by: Mapped[int | None] = mapped_column(BigInteger)
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    telegram_chat_id: Mapped[int | None] = mapped_column(BigInteger)
+    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger)
+    card_cleaned_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 
 class ManagerAuthSession(Base):

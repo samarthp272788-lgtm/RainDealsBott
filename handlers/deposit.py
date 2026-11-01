@@ -28,7 +28,7 @@ from services.deposit_checker import verify_deposit
 from keyboards.deposit import get_deposit_menu
 import config
 from config import BEP20_ADDRESS, POLYGON_ADDRESS, BINANCE_PAY_ID
-from utils.ui import show, update_card
+from utils.ui import show, update_card, answer_card
 
 logger = logging.getLogger(__name__)
 
@@ -909,7 +909,7 @@ async def select_network(callback: CallbackQuery, state: FSMContext):
         deposit_id = await asyncio.to_thread(_create_deposit, telegram_id, 0.0, network)
     except Exception:
         logger.exception("Failed to create deposit")
-        await callback.message.answer("❌ Failed to create deposit. Please try again.")
+        await answer_card(callback, "❌ Failed to create deposit. Please try again.")
         return
 
     await state.update_data(network=network, deposit_id=deposit_id)

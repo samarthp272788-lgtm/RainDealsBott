@@ -22,7 +22,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 import config
 from config import ADMIN_IDS
-from utils.ui import show, update_card
+from utils.ui import show, update_card, answer_card
 from database import SessionLocal, transaction, retry_on_write_conflict
 from models.product import Product
 from models.user import User
@@ -292,59 +292,50 @@ def _money(value) -> Decimal:
 
 
 def _active_custom_price(db, telegram_id: int, product_id: int) -> Decimal | None:
-    """Product-specific rate wins over the user's all-products rate."""
-    product_rate = (
-        db.query(CustomRate.price)
-        .filter(CustomRate.telegram_id == telegram_id, CustomRate.product_id == product_id,
-                CustomRate.is_active == True)
-        .order_by(CustomRate.id.desc())
-        .first()
-    )
-    if product_rate:
-        return _money(product_rate[0])
-    all_products_rate = (
-        db.query(CustomRate.price)
-        .filter(CustomRate.telegram_id == telegram_id, CustomRate.product_id.is_(None),
-                CustomRate.is_active == True)
-        .order_by(CustomRate.id.desc())
-        .first()
-    )
-    if all_products_rate:
-        return _money(all_products_rate[0])
-
-    # Rate Control is a live lookup: editing a product's controlled price in
-    # Admin applies to every assigned user immediately, even on an old screen.
-    has_rate_control = (
-        db.query(RateControlAssignment.id)
+    """Resolve a user's price override in at most two database round trips."""
+    rate_rows = (
+        db.query(CustomRate.product_id, CustomRate.price)
         .filter(
-            RateControlAssignment.telegram_id == telegram_id,
-            RateControlAssignment.is_active == True,
+            CustomRate.telegram_id == telegram_id,
+            CustomRate.is_active == True,
+            (CustomRate.product_id == product_id) | CustomRate.product_id.is_(None),
         )
-        .first()
+        .order_by(CustomRate.id.desc())
+        .all()
     )
-    if not has_rate_control:
-        return None
+    specific_price = None
+    default_price = None
+    for rate_product_id, price in rate_rows:
+        if rate_product_id == product_id and specific_price is None:
+            specific_price = price
+        elif rate_product_id is None and default_price is None:
+            default_price = price
+    if specific_price is not None:
+        return _money(specific_price)
+    if default_price is not None:
+        return _money(default_price)
+
+    assignment_exists = db.query(RateControlAssignment.id).filter(
+        RateControlAssignment.telegram_id == telegram_id,
+        RateControlAssignment.is_active == True,
+    ).exists()
     controlled_price = (
         db.query(ProductRateControl.price)
         .filter(
             ProductRateControl.product_id == product_id,
             ProductRateControl.is_active == True,
+            assignment_exists,
         )
         .first()
     )
     return _money(controlled_price[0]) if controlled_price else None
 
-
 def _get_custom_price(telegram_id: int, product_id: int) -> Decimal | None:
-    db = SessionLocal()
-    try:
-        return _active_custom_price(db, telegram_id, product_id)
-    finally:
-        db.close()
-
+    """Use the short-lived catalog cache for repeated product detail lookups."""
+    return _get_catalog_custom_prices(telegram_id, [product_id]).get(int(product_id))
 
 def _get_catalog_custom_prices(telegram_id: int, product_ids: list[int]) -> dict[int, Decimal]:
-    """Load custom prices for a whole catalog without a database query per button."""
+    """Resolve catalog pricing with at most two DB round trips on cache miss."""
     ids = list({int(product_id) for product_id in product_ids})
     if not ids:
         return {}
@@ -357,53 +348,43 @@ def _get_catalog_custom_prices(telegram_id: int, product_ids: list[int]) -> dict
 
     db = SessionLocal()
     try:
-        specific_rates = (
+        rate_rows = (
             db.query(CustomRate.product_id, CustomRate.price)
             .filter(
                 CustomRate.telegram_id == telegram_id,
-                CustomRate.product_id.in_(ids),
                 CustomRate.is_active == True,
+                (CustomRate.product_id.in_(ids)) | CustomRate.product_id.is_(None),
             )
             .order_by(CustomRate.id.desc())
             .all()
         )
         prices: dict[int, Decimal] = {}
-        for product_id, price in specific_rates:
-            prices.setdefault(product_id, _money(price))
+        default_price = None
+        for product_id, price in rate_rows:
+            if product_id is None:
+                if default_price is None:
+                    default_price = _money(price)
+            else:
+                prices.setdefault(int(product_id), _money(price))
 
-        all_products_rate = (
-            db.query(CustomRate.price)
-            .filter(
-                CustomRate.telegram_id == telegram_id,
-                CustomRate.product_id.is_(None),
-                CustomRate.is_active == True,
-            )
-            .order_by(CustomRate.id.desc())
-            .first()
-        )
-        if all_products_rate:
-            default_price = _money(all_products_rate[0])
+        if default_price is not None:
             prices = {product_id: prices.get(product_id, default_price) for product_id in ids}
         else:
-            has_rate_control = (
-                db.query(RateControlAssignment.id)
+            assignment_exists = db.query(RateControlAssignment.id).filter(
+                RateControlAssignment.telegram_id == telegram_id,
+                RateControlAssignment.is_active == True,
+            ).exists()
+            controlled_rates = (
+                db.query(ProductRateControl.product_id, ProductRateControl.price)
                 .filter(
-                    RateControlAssignment.telegram_id == telegram_id,
-                    RateControlAssignment.is_active == True,
+                    ProductRateControl.product_id.in_(ids),
+                    ProductRateControl.is_active == True,
+                    assignment_exists,
                 )
-                .first()
+                .all()
             )
-            if has_rate_control:
-                controlled_rates = (
-                    db.query(ProductRateControl.product_id, ProductRateControl.price)
-                    .filter(
-                        ProductRateControl.product_id.in_(ids),
-                        ProductRateControl.is_active == True,
-                    )
-                    .all()
-                )
-                for product_id, price in controlled_rates:
-                    prices.setdefault(product_id, _money(price))
+            for product_id, price in controlled_rates:
+                prices.setdefault(int(product_id), _money(price))
 
         with _catalog_custom_prices_lock:
             if len(_catalog_custom_prices_cache) >= CATALOG_CUSTOM_PRICES_CACHE_MAX_ENTRIES:
@@ -412,7 +393,6 @@ def _get_catalog_custom_prices(telegram_id: int, product_ids: list[int]) -> dict
         return prices
     finally:
         db.close()
-
 
 CATALOG_CUSTOM_PRICES_CACHE_TTL_SECONDS = 15
 CATALOG_CUSTOM_PRICES_CACHE_MAX_ENTRIES = 1024
@@ -2347,7 +2327,7 @@ async def show_delivery_instruction(callback: CallbackQuery):
         f"<i>If you have any issues, contact support!</i>"
     )
 
-    await callback.message.answer(
+    await answer_card(callback,
         text,
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
@@ -2693,7 +2673,7 @@ async def _fetch_and_show_reseller_products(callback: CallbackQuery, reseller_id
     _reseller_import_locks.add(lock_key)
     logger.info("IMPORT START user=%s provider=%s", user_id, reseller_id)
 
-    loading_message = await callback.message.answer("🔄 Fetching products...")
+    loading_message = await answer_card(callback, "🔄 Fetching products...")
 
     try:
         db = SessionLocal()

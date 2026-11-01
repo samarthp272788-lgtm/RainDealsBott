@@ -6,7 +6,7 @@ from sqlalchemy import func
 from database import SessionLocal
 from models.user import User
 from models.referral import Referral
-from utils.ui import show
+from utils.ui import show, answer_card
 
 router = Router()
 
@@ -247,7 +247,7 @@ async def copy_referral(callback: CallbackQuery):
             bot = await callback.bot.get_me()
             referral_link = f"https://t.me/{bot.username}?start={user.referral_code}"
 
-            await callback.message.answer(
+            await answer_card(callback,
                 f"📋 <b>Your Referral Link:</b>\n\n"
                 f"<code>{referral_link}</code>\n\n"
                 f"<i>Tap the link above to copy it!</i>"

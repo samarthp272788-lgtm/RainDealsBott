@@ -26,6 +26,7 @@ ever silently fails to respond.
 """
 
 import logging
+from collections import OrderedDict
 from html.parser import HTMLParser
 
 from aiogram.exceptions import TelegramBadRequest
@@ -43,6 +44,24 @@ SAFE_TEXT_LIMIT = 3900
 # "card" for a given chat, so text-reply steps know what to edit.
 _CARD_CHAT_ID_KEY = "_card_chat_id"
 _CARD_MESSAGE_ID_KEY = "_card_message_id"
+
+# Lightweight fallback for handlers that don't receive an FSMContext.
+# FSM data is still preferred when supplied; the cache prevents ordinary
+# menus and text prompts from stacking bubbles during the process lifetime.
+_CARD_LOCATIONS: OrderedDict[tuple[int, int], tuple[int, int]] = OrderedDict()
+_CARD_CACHE_LIMIT = 10_000
+
+
+def _remember_card(user_id: int, chat_id: int, message_id: int) -> None:
+    key = (int(user_id), int(chat_id))
+    _CARD_LOCATIONS[key] = (int(chat_id), int(message_id))
+    _CARD_LOCATIONS.move_to_end(key)
+    while len(_CARD_LOCATIONS) > _CARD_CACHE_LIMIT:
+        _CARD_LOCATIONS.popitem(last=False)
+
+
+def _forget_card(user_id: int, chat_id: int) -> None:
+    _CARD_LOCATIONS.pop((int(user_id), int(chat_id)), None)
 
 
 class _HTMLTruncator(HTMLParser):
@@ -136,12 +155,13 @@ def truncate_html(text: str, limit: int = SAFE_TEXT_LIMIT) -> str:
     return result
 
 
-def _kwargs(reply_markup, parse_mode):
+def _kwargs(reply_markup, parse_mode, extra=None):
     """Only pass parse_mode through when explicitly given, so callers
     that don't set it keep relying on the bot's default parse mode
     (HTML, configured in main.py) instead of Telegram disabling
     parsing entirely."""
-    kwargs = {"reply_markup": reply_markup}
+    kwargs = dict(extra or {})
+    kwargs["reply_markup"] = reply_markup
     if parse_mode is not None:
         kwargs["parse_mode"] = parse_mode
     return kwargs
@@ -153,6 +173,7 @@ async def show(
     reply_markup=None,
     parse_mode: str | None = None,
     state=None,
+    **extra,
 ):
     """
     Single-card navigation for button taps: edits the tapped message
@@ -162,7 +183,7 @@ async def show(
     reply (e.g. "send the quantity", "send the amount") so that the
     follow-up message handler knows which card to keep editing.
     """
-    kwargs = _kwargs(reply_markup, parse_mode)
+    kwargs = _kwargs(reply_markup, parse_mode, extra)
 
     try:
         msg = await callback.message.edit_text(text, **kwargs)
@@ -177,7 +198,7 @@ async def show(
             # exact failure on the fallback send below.
             logger.warning("show(): message too long (%d chars), truncating", len(text))
             safe_text = truncate_html(text)
-            safe_kwargs = _kwargs(reply_markup, parse_mode)
+            safe_kwargs = _kwargs(reply_markup, parse_mode, extra)
             try:
                 msg = await callback.message.edit_text(safe_text, **safe_kwargs)
             except TelegramBadRequest as e2:
@@ -190,6 +211,7 @@ async def show(
             logger.info("show(): edit_text failed (%s), sending a new message", e)
             msg = await callback.message.answer(text, **kwargs)
 
+    _remember_card(callback.from_user.id, msg.chat.id, msg.message_id)
     if state is not None:
         await state.update_data(
             **{_CARD_CHAT_ID_KEY: msg.chat.id, _CARD_MESSAGE_ID_KEY: msg.message_id}
@@ -207,6 +229,7 @@ async def update_card(
     delete_input: bool = True,
     chat_id: int | None = None,
     message_id: int | None = None,
+    **extra,
 ):
     """
     Single-card navigation for typed replies: edits the same card that
@@ -228,8 +251,6 @@ async def update_card(
     if delete_input:
         try:
             await message.delete()
-        except TelegramBadRequest:
-            pass
         except Exception:
             pass
 
@@ -238,43 +259,91 @@ async def update_card(
         chat_id = chat_id or data.get(_CARD_CHAT_ID_KEY)
         message_id = message_id or data.get(_CARD_MESSAGE_ID_KEY)
 
-    kwargs = _kwargs(reply_markup, parse_mode)
+    if (chat_id is None or message_id is None) and message.from_user:
+        remembered = _CARD_LOCATIONS.get((message.from_user.id, message.chat.id))
+        if remembered:
+            chat_id = chat_id or remembered[0]
+            message_id = message_id or remembered[1]
 
+    kwargs = _kwargs(reply_markup, parse_mode, extra)
     if chat_id and message_id:
         try:
             msg = await message.bot.edit_message_text(
                 text, chat_id=chat_id, message_id=message_id, **kwargs
             )
-            if state is not None:
-                await state.update_data(
-                    **{_CARD_CHAT_ID_KEY: msg.chat.id, _CARD_MESSAGE_ID_KEY: msg.message_id}
-                )
-            return msg
-        except TelegramBadRequest as e:
-            err = str(e).lower()
-            if "message is not modified" in err:
+        except TelegramBadRequest as exc:
+            if "message is not modified" in str(exc).lower():
                 return None
-            if "message is too long" in err:
+            if "message is too long" in str(exc).lower():
                 logger.warning("update_card(): message too long (%d chars), truncating", len(text))
                 text = truncate_html(text)
-                kwargs = _kwargs(reply_markup, parse_mode)
                 try:
                     msg = await message.bot.edit_message_text(
                         text, chat_id=chat_id, message_id=message_id, **kwargs
                     )
-                    if state is not None:
-                        await state.update_data(
-                            **{_CARD_CHAT_ID_KEY: msg.chat.id, _CARD_MESSAGE_ID_KEY: msg.message_id}
-                        )
-                    return msg
-                except TelegramBadRequest as e2:
-                    logger.info("update_card(): edit failed after truncation (%s), sending a new card", e2)
+                except TelegramBadRequest as retry_exc:
+                    logger.info("update_card(): edit failed after truncation (%s)", retry_exc)
+                    msg = None
             else:
-                logger.info("update_card(): edit failed (%s), sending a new card", e)
+                logger.info("update_card(): edit failed (%s), sending a new card", exc)
+                msg = None
+        if msg is not None:
+            if state is not None:
+                await state.update_data(
+                    **{_CARD_CHAT_ID_KEY: msg.chat.id, _CARD_MESSAGE_ID_KEY: msg.message_id}
+                )
+            if message.from_user:
+                _remember_card(message.from_user.id, msg.chat.id, msg.message_id)
+            return msg
 
     msg = await message.answer(text, **kwargs)
     if state is not None:
         await state.update_data(
             **{_CARD_CHAT_ID_KEY: msg.chat.id, _CARD_MESSAGE_ID_KEY: msg.message_id}
         )
+    if message.from_user:
+        _remember_card(message.from_user.id, msg.chat.id, msg.message_id)
     return msg
+
+
+async def answer_card(
+    target,
+    text: str | None = None,
+    *args,
+    state=None,
+    reply_markup=None,
+    parse_mode: str | None = None,
+    delete_input: bool = True,
+    **kwargs,
+):
+    """Replace a conversation's current card for Message or CallbackQuery replies.
+
+    Callback acknowledgements with no text remain ephemeral Telegram popups.
+    Actual text replies edit the tracked card, falling back to a new message.
+    """
+    if isinstance(target, CallbackQuery):
+        if text is None:
+            return await target.answer(*args, **kwargs)
+        return await show(
+            target,
+            text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+            state=state,
+            **kwargs,
+        )
+
+    if isinstance(target, Message):
+        if text is None:
+            return await target.answer(*args, reply_markup=reply_markup, parse_mode=parse_mode, **kwargs)
+        return await update_card(
+            target,
+            state=state,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+            delete_input=delete_input,
+            **kwargs,
+        )
+
+    raise TypeError("answer_card expects an aiogram Message or CallbackQuery")

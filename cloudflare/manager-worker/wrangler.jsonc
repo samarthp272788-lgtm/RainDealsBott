@@ -1,0 +1,20 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  "name": "raindeals-manager-staging",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-31",
+  "workers_dev": true,
+  "preview_urls": false,
+  "triggers": { "crons": ["* * * * *"] },
+  "services": [
+    { "binding": "TIDB", "service": "raindeals-tidb-rpc-staging", "entrypoint": "TiDBService" },
+    { "binding": "API", "service": "raindeals-api-staging" }
+  ],
+  "vars": {
+    "ADMIN_VERIFY_BOT_USERNAME": "verificationoctabot",
+    "MANAGER_ADMIN_IDS": "1316577060,7943742895,5327735171",
+    "MAIN_BOT_SETTINGS_INTEGRATED": "true",
+    "BOT_USERNAME": "",
+    "API_BASE_URL": "https://raindeals-api-staging.samarthp2727-rd.workers.dev"
+  }
+}

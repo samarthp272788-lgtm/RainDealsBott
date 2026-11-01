@@ -1,3 +1,5 @@
+
+from utils.ui import answer_card
 # handlers/admin.py — FIXED ADMIN PANEL WITH DASHBOARD, BROADCAST & FULL PROVIDER MANAGEMENT
 import asyncio
 import hashlib
@@ -49,7 +51,11 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 
-def _create_manager_web_link(telegram_id: int) -> str:
+def _create_manager_web_link(
+    telegram_id: int,
+    telegram_chat_id: int,
+    telegram_message_id: int,
+) -> str:
     """Create a short-lived, single-use manager login token for this admin."""
     token = secrets.token_urlsafe(32)
     now = datetime.utcnow()
@@ -68,10 +74,36 @@ def _create_manager_web_link(telegram_id: int) -> str:
                 approved_at=now,
                 approved_by=telegram_id,
                 consumed_at=None,
+                telegram_chat_id=telegram_chat_id,
+                telegram_message_id=telegram_message_id,
+                card_cleaned_at=None,
             )
         )
         db.commit()
         return token
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _update_manager_web_link_card(token: str, telegram_chat_id: int, telegram_message_id: int) -> None:
+    """Attach the final card id (including the edit fallback case) to a challenge."""
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    db = SessionLocal()
+    try:
+        db.query(ManagerLoginChallenge).filter(
+            ManagerLoginChallenge.token_hash == digest,
+            ManagerLoginChallenge.consumed_at.is_(None),
+        ).update(
+            {
+                ManagerLoginChallenge.telegram_chat_id: telegram_chat_id,
+                ManagerLoginChallenge.telegram_message_id: telegram_message_id,
+            },
+            synchronize_session=False,
+        )
+        db.commit()
     except Exception:
         db.rollback()
         raise
@@ -186,7 +218,7 @@ async def maintenance_mode_prompt(callback: CallbackQuery, state: FSMContext):
     enabled = await asyncio.to_thread(is_maintenance_enabled)
     status = "ON — user actions are blocked" if enabled else "OFF — the store is available"
     await state.set_state(MaintenanceModeState.waiting_password)
-    await callback.message.answer(
+    await answer_card(callback,
         f"🛠 <b>Maintenance Mode</b>\nStatus: <b>{status}</b>\n\n"
         "Enter the maintenance password to continue.",
         parse_mode="HTML",
@@ -203,7 +235,7 @@ async def maintenance_mode_cancel(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Access denied.", show_alert=True)
         return
     await state.clear()
-    await callback.message.answer("Maintenance mode change cancelled.")
+    await answer_card(callback, "Maintenance mode change cancelled.")
     await callback.answer()
 
 
@@ -220,7 +252,7 @@ async def maintenance_mode_password(message: Message, state: FSMContext):
     submitted_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
     if not hmac.compare_digest(submitted_hash, MAINTENANCE_PASSWORD_HASH):
         await state.clear()
-        await message.answer("❌ Incorrect password. No changes were made.")
+        await answer_card(message, "❌ Incorrect password. No changes were made.")
         return
 
     await state.clear()
@@ -228,7 +260,7 @@ async def maintenance_mode_password(message: Message, state: FSMContext):
     target_enabled = not enabled
     action = "enable" if target_enabled else "disable"
     label = "Turn ON" if target_enabled else "Turn OFF"
-    await message.answer(
+    await answer_card(message,
         f"Password verified. Confirm to <b>{action}</b> maintenance mode?",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
@@ -395,7 +427,7 @@ async def admin_cmd(message: Message, state: FSMContext):
     dashboard = await asyncio.to_thread(
         _load_admin_dashboard, message.from_user.full_name, message.from_user.id
     )
-    await message.answer(
+    await answer_card(message,
         dashboard,
         reply_markup=_get_admin_panel_with_providers(),
         parse_mode="HTML",
@@ -439,11 +471,12 @@ async def manager_web_access(callback: CallbackQuery, state: FSMContext):
         return
     await state.clear()
     await state.set_state(ManagerWebState.waiting_password)
-    await callback.message.answer(
+    await answer_card(callback,
         "🔐 <b>Manager Web access</b>\n\n"
         "Enter your manager password in this private chat to generate a one-time login link. "
         "Your password message will be deleted after it is received.",
         parse_mode="HTML",
+        state=state,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="✖ Cancel", callback_data="manager_web_cancel")
         ]]),
@@ -456,9 +489,9 @@ async def manager_web_cancel(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("Access denied.", show_alert=True)
         return
-    await state.clear()
     if callback.message:
-        await callback.message.answer("Manager Web link generation cancelled.")
+        await answer_card(callback, "Manager Web link generation cancelled.", state=state)
+    await state.clear()
     await callback.answer()
 
 
@@ -469,6 +502,9 @@ async def manager_web_password(message: Message, state: FSMContext):
         return
 
     password = (message.text or "").strip()
+    card_data = await state.get_data()
+    card_chat_id = int(card_data.get("_card_chat_id") or message.chat.id)
+    card_message_id = int(card_data.get("_card_message_id") or 0)
     try:
         await message.delete()
     except Exception:
@@ -476,21 +512,38 @@ async def manager_web_password(message: Message, state: FSMContext):
 
     submitted_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
     if not hmac.compare_digest(submitted_hash, MAINTENANCE_PASSWORD_HASH):
+        await answer_card(
+            message,
+            "❌ Incorrect password. No Manager Web link was created.",
+            state=state,
+        )
         await state.clear()
-        await message.answer("❌ Incorrect password. No Manager Web link was created.")
         return
 
-    await state.clear()
+    if card_message_id <= 0:
+        await answer_card(
+            message,
+            "⚠️ The Manager Web card expired. Open Manager Web from the Admin Panel and try again.",
+            state=state,
+        )
+        await state.clear()
+        return
+
     try:
         token = await asyncio.to_thread(
             _create_manager_web_link,
             message.from_user.id,
+            card_chat_id,
+            card_message_id,
         )
     except Exception:
         logger.exception("Could not create one-time Manager Web login link")
-        await message.answer(
-            "⚠️ Could not create a Manager Web link. Check the database connection and try again."
+        await answer_card(
+            message,
+            "⚠️ Could not create a Manager Web link. Check the database connection and try again.",
+            state=state,
         )
+        await state.clear()
         return
 
     login_url = f"{MANAGER_WEB_URL}/login/bot#{token}"
@@ -499,14 +552,26 @@ async def manager_web_password(message: Message, state: FSMContext):
             [InlineKeyboardButton(text="🌐 Open Manager Web", url=login_url)]
         ]
     )
-    await message.answer(
+    link_card = await answer_card(message,
         "🔐 <b>Private Manager Web link</b>\n\n"
         "This link is unique, expires in 2 minutes, and works once. Opening it signs you in without another Telegram verification prompt. "
-        "It starts a 60-minute manager session. Keep the link private; anyone who gets it can use it before it expires.",
+        "It starts a 60-minute manager session. The button is removed as soon as the link is used or expires.",
         parse_mode="HTML",
         reply_markup=keyboard,
         disable_web_page_preview=True,
+        state=state,
     )
+    if link_card is not None:
+        try:
+            await asyncio.to_thread(
+                _update_manager_web_link_card,
+                token,
+                link_card.chat.id,
+                link_card.message_id,
+            )
+        except Exception:
+            logger.exception("Could not attach the final Telegram card to the Manager Web link")
+    await state.clear()
 
 
 
@@ -691,7 +756,7 @@ async def process_provider_name(message: Message, state: FSMContext):
 
     name = (message.text or "").strip()
     if not name or len(name) < 2:
-        await message.answer("❌ <b>Invalid Name!</b> Please send a valid provider name (at least 2 characters).",
+        await answer_card(message, "❌ <b>Invalid Name!</b> Please send a valid provider name (at least 2 characters).",
                              parse_mode="HTML")
         return
 
@@ -701,7 +766,7 @@ async def process_provider_name(message: Message, state: FSMContext):
     default_key = name.lower().replace(" ", "_").replace("-", "_")
     default_key = "".join(c for c in default_key if c.isalnum() or c == "_")
 
-    await message.answer(
+    await answer_card(message,
         f"✅ <b>Name:</b> {safe(name)}\n\n"
         "🛠 <b>MANUAL PROVIDER SETUP (Step 2/7)</b>\n\n"
         "Please send a unique <b>Provider Key</b> (slug identifier).\n\n"
@@ -723,7 +788,7 @@ async def process_provider_key(message: Message, state: FSMContext):
     clean_key = "".join(c for c in raw_key if c.isalnum() or c in ("_", "-"))
 
     if not clean_key:
-        await message.answer("❌ <b>Invalid Key!</b> Key must contain letters, numbers, hyphens, or underscores.",
+        await answer_card(message, "❌ <b>Invalid Key!</b> Key must contain letters, numbers, hyphens, or underscores.",
                              parse_mode="HTML")
         return
 
@@ -731,7 +796,7 @@ async def process_provider_key(message: Message, state: FSMContext):
     try:
         existing = db.query(Provider).filter(Provider.provider_key == clean_key).first()
         if existing:
-            await message.answer("❌ <b>Provider key already exists!</b> Please send a different unique provider key.",
+            await answer_card(message, "❌ <b>Provider key already exists!</b> Please send a different unique provider key.",
                                  parse_mode="HTML")
             return
     finally:
@@ -740,7 +805,7 @@ async def process_provider_key(message: Message, state: FSMContext):
     await state.update_data(provider_key=clean_key)
     await state.set_state(ProviderSetupState.waiting_base_url)
 
-    await message.answer(
+    await answer_card(message,
         f"✅ <b>Provider Key:</b> <code>{safe(clean_key)}</code>\n\n"
         "🛠 <b>MANUAL PROVIDER SETUP (Step 3/7)</b>\n\n"
         "Please send the <b>Base URL</b> of the provider API.\n\n"
@@ -760,7 +825,7 @@ async def process_provider_base_url(message: Message, state: FSMContext):
 
     url = (message.text or "").strip().rstrip("/")
     if not _validate_base_url(url):
-        await message.answer(
+        await answer_card(message,
             "❌ <b>Invalid URL!</b> Base URL must start with <code>http://</code> or <code>https://</code>.",
             parse_mode="HTML")
         return
@@ -779,7 +844,7 @@ async def process_provider_base_url(message: Message, state: FSMContext):
         ]
     )
 
-    await message.answer(
+    await answer_card(message,
         f"✅ <b>Base URL:</b> <code>{safe(url)}</code>\n\n"
         "🛠 <b>MANUAL PROVIDER SETUP (Step 4/7)</b>\n\n"
         "Select or send the <b>API Type</b>:\n"
@@ -852,7 +917,7 @@ async def process_provider_api_type_msg(message: Message, state: FSMContext):
         ]
     )
 
-    await message.answer(
+    await answer_card(message,
         f"✅ <b>API Type:</b> <code>{safe(api_type)}</code>\n\n"
         "🛠 <b>MANUAL PROVIDER SETUP (Step 5/7)</b>\n\n"
         "Select or send the <b>Authentication Type</b>:",
@@ -895,7 +960,7 @@ async def process_provider_auth_type_msg(message: Message, state: FSMContext):
     await state.update_data(auth_type=auth_type)
     await state.set_state(ProviderSetupState.waiting_api_key)
 
-    await message.answer(
+    await answer_card(message,
         f"✅ <b>Auth Type:</b> <code>{safe(auth_type)}</code>\n\n"
         "🛠 <b>MANUAL PROVIDER SETUP (Step 6/7)</b>\n\n"
         "Please send the <b>API Key / Token</b> for this provider.\n\n"
@@ -920,11 +985,11 @@ async def process_provider_api_key(message: Message, state: FSMContext):
     data = await state.get_data()
     if data.get("auth_type") == "hmac":
         if not api_key:
-            await message.answer("HMAC authentication requires an API key.")
+            await answer_card(message, "HMAC authentication requires an API key.")
             return
 
         await state.set_state(ProviderSetupState.waiting_api_secret)
-        await message.answer(
+        await answer_card(message,
             "API key saved securely. Send the API secret for this provider.",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="admin_provider_cancel")]]
@@ -935,7 +1000,7 @@ async def process_provider_api_key(message: Message, state: FSMContext):
     await state.update_data(api_secret=None)
     await state.set_state(ProviderSetupState.waiting_configuration)
 
-    await message.answer(
+    await answer_card(message,
         "✅ <b>API Key saved securely (hidden)</b>\n\n"
         "🛠 <b>MANUAL PROVIDER SETUP (Step 7/7)</b>\n\n"
         "Send additional JSON configuration (optional) or send <b>skip</b>:\n\n"
@@ -955,7 +1020,7 @@ async def process_provider_api_secret(message: Message, state: FSMContext):
 
     api_secret = (message.text or "").strip()
     if not api_secret or api_secret.lower() in ("none", "skip"):
-        await message.answer("HMAC authentication requires an API secret.")
+        await answer_card(message, "HMAC authentication requires an API secret.")
         return
 
     await state.update_data(api_secret=api_secret)
@@ -964,7 +1029,7 @@ async def process_provider_api_secret(message: Message, state: FSMContext):
     except Exception:
         pass
     await state.set_state(ProviderSetupState.waiting_configuration)
-    await message.answer(
+    await answer_card(message,
         "API secret saved securely. Send optional JSON configuration or send skip.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="Skip Configuration", callback_data="skip_provider_config")]]
@@ -996,7 +1061,7 @@ async def process_provider_configuration(message: Message, state: FSMContext):
             json.loads(raw_text)
             config_val = raw_text
         except Exception:
-            await message.answer("❌ <b>Invalid JSON format!</b> Please send valid JSON or send 'skip'.",
+            await answer_card(message, "❌ <b>Invalid JSON format!</b> Please send valid JSON or send 'skip'.",
                                  parse_mode="HTML")
             return
 
@@ -1031,9 +1096,9 @@ async def show_provider_preview(target: Message | CallbackQuery, state: FSMConte
 
     if isinstance(target, CallbackQuery):
         await _safe_edit_text(target.message, preview_text, reply_markup=keyboard, parse_mode="HTML")
-        await target.answer()
+        await answer_card(target, )
     else:
-        await target.answer(preview_text, reply_markup=keyboard, parse_mode="HTML")
+        await answer_card(target, preview_text, reply_markup=keyboard, parse_mode="HTML")
 
 
 @router.callback_query(F.data == "admin_provider_save_confirm")
@@ -1309,7 +1374,7 @@ async def process_edit_provider_field_save(message: Message, state: FSMContext):
         try:
             provider = db.query(Provider).filter(Provider.id == provider_id).first()
             if provider and not provider.api_secret:
-                await message.answer("Add the provider API secret before switching to HMAC authentication.")
+                await answer_card(message, "Add the provider API secret before switching to HMAC authentication.")
                 return
         finally:
             db.close()
@@ -1322,7 +1387,7 @@ async def process_edit_provider_field_save(message: Message, state: FSMContext):
 
     if field_name in ("api_key", "api_secret") and new_val.lower() == "keep":
         await state.clear()
-        await message.answer("Existing API key kept.", reply_markup=InlineKeyboardMarkup(
+        await answer_card(message, "Existing API key kept.", reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="📋 Provider List", callback_data="admin_provider_list")]]))
         return
 
@@ -1330,12 +1395,12 @@ async def process_edit_provider_field_save(message: Message, state: FSMContext):
     try:
         p = db.query(Provider).filter(Provider.id == provider_id).first()
         if not p:
-            await message.answer("Provider not found.")
+            await answer_card(message, "Provider not found.")
             await state.clear()
             return
 
         if field_name == "base_url" and not _validate_base_url(new_val):
-            await message.answer(
+            await answer_card(message,
                 "❌ Invalid URL! Base URL must start with <code>http://</code> or <code>https://</code>.",
                 parse_mode="HTML")
             return
@@ -1344,12 +1409,12 @@ async def process_edit_provider_field_save(message: Message, state: FSMContext):
             try:
                 json.loads(new_val)
             except Exception:
-                await message.answer("❌ Invalid JSON format for configuration.", parse_mode="HTML")
+                await answer_card(message, "❌ Invalid JSON format for configuration.", parse_mode="HTML")
                 return
 
         setattr(p, field_name, new_val)
         db.commit()
-        await message.answer(
+        await answer_card(message,
             f"✅ Provider <b>{field_name}</b> updated!",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(
@@ -1606,11 +1671,11 @@ async def send_broadcast(message: Message, state: FSMContext):
     """Handle the broadcast message and send to all users."""
     if message.from_user.id not in ADMIN_IDS:
         await state.clear()
-        await message.answer("⛔ Access denied. You are not an admin.")
+        await answer_card(message, "⛔ Access denied. You are not an admin.")
         return
 
     # Send initial status message
-    status_msg = await message.answer(
+    status_msg = await answer_card(message,
         "📢 <b>Broadcasting...</b>\n\n⏳ Fetching users from database...",
         parse_mode="HTML"
     )
@@ -1829,14 +1894,14 @@ async def user_balance_set(callback: CallbackQuery, state: FSMContext):
 async def save_user_balance(message: Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         await state.clear()
-        await message.answer("⛔ Access denied.")
+        await answer_card(message, "⛔ Access denied.")
         return
     try:
         amount = Decimal((message.text or "").strip())
         if not amount.is_finite() or max(0, -amount.as_tuple().exponent) > 8:
             raise InvalidOperation
     except (InvalidOperation, ValueError):
-        await message.answer("❌ Send a valid amount with at most 8 decimal places.")
+        await answer_card(message, "❌ Send a valid amount with at most 8 decimal places.")
         return
 
     data = await state.get_data()
@@ -1844,16 +1909,16 @@ async def save_user_balance(message: Message, state: FSMContext):
     try:
         user = db.query(User).filter(User.id == data.get("user_id")).first()
         if not user:
-            await message.answer("❌ User not found.")
+            await answer_card(message, "❌ User not found.")
             return
         old_balance = user.balance
         new_balance = amount if data.get("mode") == "set" else user.balance + amount
         if new_balance < Decimal("0"):
-            await message.answer(f"❌ Balance cannot be negative. Current: {_money(user.balance)}")
+            await answer_card(message, f"❌ Balance cannot be negative. Current: {_money(user.balance)}")
             return
         user.balance = new_balance
         db.commit()
-        await message.answer(
+        await answer_card(message,
             f"✅ <b>Balance updated</b>\n\n👤 {safe(user.full_name)}\n"
             f"Previous: <b>{_money(old_balance)}</b>\nNew: <b>{_money(user.balance)}</b>",
             parse_mode="HTML",
@@ -2127,7 +2192,7 @@ async def rate_control_save_price(message: Message, state: FSMContext):
     product_name = data.get("rate_control_product_name", "product")
     if not product_id:
         await state.clear()
-        await message.answer("⚠️ Setup expired. Open Rate Control and try again.")
+        await answer_card(message, "⚠️ Setup expired. Open Rate Control and try again.")
         return
     raw_value = (message.text or "").strip().lower()
     db = SessionLocal()
@@ -2139,7 +2204,7 @@ async def rate_control_save_price(message: Message, state: FSMContext):
                 db.commit()
                 invalidate_catalog_custom_prices_cache()
             await state.clear()
-            await message.answer(
+            await answer_card(message,
                 f"✅ Rate Control price removed for <b>{safe(product_name)}</b>.\n"
                 "Assigned users now see the normal product price for it.",
                 parse_mode="HTML", reply_markup=_custom_rate_menu_markup(),
@@ -2151,7 +2216,7 @@ async def rate_control_save_price(message: Message, state: FSMContext):
                 raise InvalidOperation
             price = price.quantize(Decimal("0.00000001"))
         except (InvalidOperation, ValueError):
-            await message.answer("❌ Send a valid price greater than 0, or <code>remove</code>.", parse_mode="HTML")
+            await answer_card(message, "❌ Send a valid price greater than 0, or <code>remove</code>.", parse_mode="HTML")
             return
         if control:
             control.price = price
@@ -2163,7 +2228,7 @@ async def rate_control_save_price(message: Message, state: FSMContext):
         db.close()
     invalidate_catalog_custom_prices_cache()
     await state.clear()
-    await message.answer(
+    await answer_card(message,
         f"✅ Rate Control saved\n\nProduct: <b>{safe(product_name)}</b>\nPrice: <b>${price}</b> per unit\n\n"
         "This price applies immediately to every user assigned to All Products (Rate Control).",
         parse_mode="HTML", reply_markup=_custom_rate_menu_markup(),
@@ -2196,19 +2261,19 @@ async def custom_rate_user_id(message: Message, state: FSMContext):
     try:
         telegram_id = int((message.text or "").strip())
     except ValueError:
-        await message.answer("❌ Send only the user's numeric Telegram ID.")
+        await answer_card(message, "❌ Send only the user's numeric Telegram ID.")
         return
     db = SessionLocal()
     try:
         user = db.query(User).filter(User.telegram_id == telegram_id).first()
         if not user:
-            await message.answer("❌ User not found. The user must first start the bot.")
+            await answer_card(message, "❌ User not found. The user must first start the bot.")
             return
         user_name = user.full_name
     finally:
         db.close()
     await state.update_data(custom_rate_user_id=telegram_id, custom_rate_user_name=user_name)
-    await message.answer(
+    await answer_card(message,
         f"✅ User: <b>{safe(user_name)}</b>\n<code>{telegram_id}</code>\n\n"
         "🏷 <b>STEP 2</b> — Where should this rate apply?", parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -2338,14 +2403,14 @@ async def custom_rate_save(message: Message, state: FSMContext):
             raise InvalidOperation
         price = price.quantize(Decimal("0.00000001"))
     except (InvalidOperation, ValueError):
-        await message.answer("❌ Send a valid price greater than 0. Example: <code>0.024</code>", parse_mode="HTML")
+        await answer_card(message, "❌ Send a valid price greater than 0. Example: <code>0.024</code>", parse_mode="HTML")
         return
     data = await state.get_data()
     telegram_id = data.get("custom_rate_user_id")
     product_id = data.get("custom_rate_product_id")
     if not telegram_id:
         await state.clear()
-        await message.answer("⚠️ Setup expired. Open Custom Rates and try again.")
+        await answer_card(message, "⚠️ Setup expired. Open Custom Rates and try again.")
         return
     db = SessionLocal()
     try:
@@ -2370,7 +2435,7 @@ async def custom_rate_save(message: Message, state: FSMContext):
     invalidate_catalog_custom_prices_cache()
     await state.clear()
     scope = "all products" if product_id is None else f"product #{product_id}"
-    await message.answer(
+    await answer_card(message,
         f"✅ <b>Custom rate active</b>\n\nUser: <code>{telegram_id}</code>\n"
         f"Scope: <b>{scope}</b>\nPrice: <b>${price}</b> per unit\n\n"
         "The next checkout uses this price immediately.", parse_mode="HTML",

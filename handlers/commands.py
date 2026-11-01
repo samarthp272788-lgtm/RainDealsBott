@@ -1,3 +1,5 @@
+
+from utils.ui import answer_card
 import asyncio
 from html import escape
 
@@ -24,7 +26,7 @@ router = Router()
 async def shop_command(message: Message):
     products = await _fetch_active_products()
     if not products:
-        await message.answer("📭 No products are available right now.")
+        await answer_card(message, "📭 No products are available right now.")
         return
 
     if any((getattr(product, "source", "own") or "own") == "reseller" for product in products):
@@ -45,7 +47,7 @@ async def shop_command(message: Message):
         )])
     if len(products) > 20:
         buttons.append([InlineKeyboardButton(text="🛍 Open full catalog", callback_data="products_menu")])
-    await message.answer(
+    await answer_card(message,
         "🛍 <b>Available products</b>\nSelect a product to view details:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
@@ -58,7 +60,7 @@ async def wallet_command(message: Message):
     try:
         user = db.query(User).filter(User.telegram_id == message.from_user.id).first()
         if not user:
-            await message.answer("Please send /start first to create your account.")
+            await answer_card(message, "Please send /start first to create your account.")
             return
         balance = _format_balance(user.balance)
         deposited = _format_balance(user.total_deposited)
@@ -70,7 +72,7 @@ async def wallet_command(message: Message):
     finally:
         db.close()
 
-    await message.answer(
+    await answer_card(message,
         text,
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -89,7 +91,7 @@ async def orders_command(message: Message):
                   .filter(Order.telegram_id == message.from_user.id)
                   .order_by(Order.id.desc()).limit(10).all())
         if not orders:
-            await message.answer("📭 <b>No recent orders found.</b>", parse_mode="HTML")
+            await answer_card(message, "📭 <b>No recent orders found.</b>", parse_mode="HTML")
             return
         buttons = [[InlineKeyboardButton(
             text=f"#{order.id} · {escape(str(order.product_name or 'Product'))[:28]} · ${float(order.amount):.2f}",
@@ -97,7 +99,7 @@ async def orders_command(message: Message):
         )] for order in orders]
     finally:
         db.close()
-    await message.answer(
+    await answer_card(message,
         "📦 <b>Your recent orders</b>\nSelect an order to view its details:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
@@ -110,12 +112,12 @@ async def profile_command(message: Message):
     try:
         user = db.query(User).filter(User.telegram_id == message.from_user.id).first()
         if not user:
-            await message.answer("Please send /start first to create your account.")
+            await answer_card(message, "Please send /start first to create your account.")
             return
         text = _build_audit_profile(user, message.from_user.id)
     finally:
         db.close()
-    await message.answer(
+    await answer_card(message,
         text,
         parse_mode="HTML",
         disable_web_page_preview=True,

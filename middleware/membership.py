@@ -16,6 +16,12 @@ from config import (
     MEMBERSHIP_CACHE_TTL,
     MEMBERSHIP_RETRY_DELAY_SECONDS,
     MEMBERSHIP_VERIFY_ATTEMPTS,
+    GROUP_ID,
+    ORDER_NOTIFICATION_CHANNEL_ID,
+    STOCK_NOTIFICATION_CHANNEL_ID,
+    ADMIN_ORDER_NOTIFICATION_CHANNEL_ID,
+    NOTIFICATION_CHANNEL_ID,
+    STOCK_GROUP_ID,
 )
 from database import SessionLocal
 from models.user import User
@@ -40,6 +46,46 @@ def _extract_username(link: str) -> str | None:
 CHANNEL_USERNAME = _extract_username(CHANNEL_LINK)
 GROUP_USERNAME = _extract_username(GROUP_LINK)
 ADDITIONAL_CHANNEL_CHAT_ID = ADDITIONAL_CHANNEL_ID or _extract_username(ADDITIONAL_CHANNEL_LINK)
+
+
+def _chat_matches_target(chat, target: Any) -> bool:
+    """Match a configured numeric group id or public @username to a chat."""
+    if target is None or not str(target).strip():
+        return False
+    value = str(target).strip()
+    if value.lstrip("-").isdigit():
+        try:
+            return int(value) == int(chat.id)
+        except (TypeError, ValueError):
+            return False
+    username = value.rsplit("/", 1)[-1].lstrip("@").lower()
+    return bool(username and getattr(chat, "username", None) and username == chat.username.lower())
+
+
+def is_order_notification_chat(chat) -> bool:
+    """Notification destinations are output-only; user traffic stays in DMs."""
+    targets = (
+        GROUP_ID,
+        CHANNEL_USERNAME,
+        GROUP_USERNAME,
+        ORDER_NOTIFICATION_CHANNEL_ID,
+        STOCK_NOTIFICATION_CHANNEL_ID,
+        ADMIN_ORDER_NOTIFICATION_CHANNEL_ID,
+        NOTIFICATION_CHANNEL_ID,
+        STOCK_GROUP_ID,
+    )
+    return any(_chat_matches_target(chat, target) for target in targets)
+
+
+async def _delete_group_message(message: Message) -> None:
+    try:
+        await message.delete()
+    except Exception as error:
+        logger.info(
+            "Could not remove message from notification-only chat %s; bot needs delete-message permission (%s)",
+            message.chat.id,
+            type(error).__name__,
+        )
 
 
 async def check_user_membership(
@@ -210,6 +256,19 @@ class BannedUserMiddleware(BaseMiddleware):
         # middleware receives the Message/CallbackQuery itself.
         actual_event = event.event if isinstance(event, Update) else event
         from_user = getattr(actual_event, "from_user", None)
+
+        # Order/stock destinations are output-only. Remove Telegram join/leave
+        # service bubbles and non-admin chatter there, and never answer with a
+        # membership prompt in a notification group.
+        if isinstance(actual_event, Message) and actual_event.chat.type != "private":
+            if is_order_notification_chat(actual_event.chat):
+                is_join_leave = bool(
+                    actual_event.new_chat_members or actual_event.left_chat_member
+                )
+                if is_join_leave or (from_user and from_user.id not in ADMIN_IDS):
+                    await _delete_group_message(actual_event)
+                return None
+
         if from_user and from_user.id not in ADMIN_IDS and await asyncio.to_thread(is_maintenance_enabled):
             if isinstance(actual_event, CallbackQuery):
                 if actual_event.message:
@@ -227,7 +286,15 @@ class BannedUserMiddleware(BaseMiddleware):
                 await actual_event.answer(MAINTENANCE_TEXT, parse_mode="HTML")
             return None
 
-        if from_user and from_user.id not in ADMIN_IDS:
+        private_chat_event = (
+            isinstance(actual_event, Message)
+            and actual_event.chat.type == "private"
+        ) or (
+            isinstance(actual_event, CallbackQuery)
+            and actual_event.message is not None
+            and actual_event.message.chat.type == "private"
+        )
+        if from_user and from_user.id not in ADMIN_IDS and private_chat_event:
             is_membership_retry = (
                 isinstance(actual_event, CallbackQuery)
                 and actual_event.data == "check_membership_retry"

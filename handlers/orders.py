@@ -24,7 +24,7 @@ from database import SessionLocal
 from models.order import Order
 from models.order_rating import OrderRating
 from models.product import Product
-from utils.ui import show, update_card
+from utils.ui import show, update_card, answer_card
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -927,7 +927,7 @@ async def show_delivery_instruction_from_orders(callback: CallbackQuery):
         f"<i>If you have any issues, contact support!</i>"
     )
 
-    await callback.message.answer(
+    await answer_card(callback,
         text,
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
@@ -1440,13 +1440,13 @@ async def handle_order_id_search(message: Message, state: FSMContext):
     await state.clear()
 
     if message.text and message.text.lower() in ["cancel", "exit", "back"]:
-        await message.answer("🔍 Search cancelled.")
+        await answer_card(message, "🔍 Search cancelled.")
         return
 
     try:
         order_id = int(message.text.strip())
     except ValueError:
-        await message.answer("❌ Please enter a valid order ID number.")
+        await answer_card(message, "❌ Please enter a valid order ID number.")
         return
 
     db = SessionLocal()
@@ -1463,7 +1463,7 @@ async def handle_order_id_search(message: Message, state: FSMContext):
         db.close()
 
     if not order:
-        await message.answer(
+        await answer_card(message,
             f"❌ <b>Order #{order_id} Not Found</b>\n\n"
             "It may belong to another user or doesn't exist.",
             parse_mode="HTML",
@@ -1486,7 +1486,7 @@ async def handle_order_id_search(message: Message, state: FSMContext):
     )
     text = _format_order(order, detailed=True, rating=rating)
 
-    await message.answer(
+    await answer_card(message,
         text,
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
