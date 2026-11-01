@@ -18,7 +18,19 @@ from utils.ui import show
 
 router = Router()
 
-STAGING_API_URL = "https://raindeals-api-staging.samarthp2727-rd.workers.dev"
+DEFAULT_API_URL = "https://raindeals-api.samarthp2727-rd.workers.dev"
+
+
+def _api_root() -> str:
+    """Return the API service root, even if config includes /api/v1."""
+    value = (API_BASE_URL or DEFAULT_API_URL).strip().rstrip("/")
+    if value.endswith("/api/v1"):
+        value = value[:-len("/api/v1")]
+    return value
+
+
+def _base_url() -> str:
+    return f"{_api_root()}/api/v1"
 
 
 def _api_menu() -> InlineKeyboardMarkup:
@@ -44,10 +56,6 @@ def _api_menu() -> InlineKeyboardMarkup:
             ],
         ]
     )
-
-
-def _base_url() -> str:
-    return API_BASE_URL or "Your configured API domain"
 
 
 @router.callback_query(F.data == "api_key_menu")
@@ -84,6 +92,9 @@ async def api_key_menu(callback: CallbackQuery):
     else:
         status = "❌ No active API key"
 
+    api_root_href = escape(_api_root(), quote=True)
+    api_base = escape(_base_url())
+
     await show(
         callback,
         "🔑 <b>RESELLER API ACCESS</b>\n\n"
@@ -92,9 +103,10 @@ async def api_key_menu(callback: CallbackQuery):
         "website's server, never public browser code. Your API key uses "
         "your wallet balance, current custom rates, stock, and automatic "
         "delivery.\n\n"
-        f'🌐 Base URL: <a href="{STAGING_API_URL}/">RainDeals API</a>\n'
-        f'📚 Documentation: <a href="{STAGING_API_URL}/docs/">'
-        "Rain API Docs</a>\n\n"
+        f'🌐 API service: <a href="{api_root_href}/">Open API</a>\n'
+        f'📚 API access panel &amp; documentation: '
+        f'<a href="{api_root_href}/docs/">Open API guide</a>\n'
+        f"🔗 Base endpoint: <code>{api_base}</code>\n\n"
         "Your active key stays visible here until you generate a new one "
         "or revoke it. Generating a new key immediately revokes the old key.",
         parse_mode="HTML",
@@ -129,7 +141,9 @@ async def api_key_generate(callback: CallbackQuery):
         f"<code>{escape(raw_key)}</code>\n\n"
         "🔒 Keep it in your Wasmer server secret/environment variable. "
         "Do not place it in website JavaScript, HTML, screenshots, or GitHub.\n\n"
-        f"API base: <code>{escape(_base_url())}/api/v1</code>",
+        f'📚 API access panel &amp; documentation: '
+        f'<a href="{escape(_api_root(), quote=True)}/docs/">Open API guide</a>\n'
+        f"API base: <code>{escape(_base_url())}</code>",
         parse_mode="HTML",
         reply_markup=_api_menu(),
     )
