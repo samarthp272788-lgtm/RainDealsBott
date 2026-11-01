@@ -50,7 +50,7 @@ async def api_key_menu(callback: CallbackQuery):
         f"{status}\n\n"
         "Use this API through the Wasmer reseller gateway from your website's server, never public browser code. "
         "Your API key uses your wallet balance, current custom rates, stock, and automatic delivery.\n\n"
-        f"🌐 Base URL: <code>{escape(_base_url())}/api/v1</code>\n"
+        f"🌐 Base URL: <a href=\"https://raindeals-api-staging.samarthp2727-rd.workers.dev/\">\n"
         "📚 Documentation: <a href=\"https://raindeals-api-staging.samarthp2727-rd.workers.dev/docs/\">Rain API Docs</a>\n\n"
         "Your active key stays visible here until you generate a new one or revoke it. "
         "Generating a new key immediately revokes the old key.",
