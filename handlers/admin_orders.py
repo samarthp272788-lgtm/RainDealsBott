@@ -15,9 +15,9 @@ from aiogram.fsm.context import FSMContext
 from sqlalchemy.exc import SQLAlchemyError
 
 import config
-from config import ADMIN_IDS, DELIVERY_BOT_TOKEN
+from config import ADMIN_IDS
 from database import SessionLocal, transaction, retry_on_write_conflict
-from delivery_bot_app import delivery_bot
+from services.delivery_bridge import DeliveryBridgeError, send_manual_delivery
 from models.api_key import ApiOrder
 from models.order import Order
 from models.user import User
@@ -437,9 +437,11 @@ async def deliver_order_start(callback: CallbackQuery, state: FSMContext):
     try:
         order = db.get(Order, order_id)
         is_api_order = bool(order and db.query(ApiOrder.id).filter(ApiOrder.order_id == order.id).first())
-        if order and (order.delivery_telegram_id or is_api_order) and not DELIVERY_BOT_TOKEN:
+        if order and (order.delivery_telegram_id or is_api_order) and not (
+            config.DELIVERY_BRIDGE_URL and config.DELIVERY_BRIDGE_SECRET
+        ):
             await callback.answer(
-                "DELIVERY_BOT_TOKEN is not configured. Add it before delivering this reseller manual order.",
+                "The Cloudflare delivery bridge is not configured. Ask the manager to configure it before delivery.",
                 show_alert=True,
             )
             return
@@ -653,25 +655,23 @@ async def deliver_order_finish(message: Message, state: FSMContext):
             # Without it, NEVER send codes to the API-key owner/customer: send
             # them only to the administrator who is fulfilling this order.
             destination_id = result["delivery_telegram_id"] or message.from_user.id
-            if not delivery_bot:
+            recipient_label = "the customer" if result["delivery_telegram_id"] else "you (admin delivery copy)"
+            try:
+                await send_manual_delivery(order_id, destination_id, message.from_user.id)
+            except DeliveryBridgeError as exc:
                 await message.answer(
-                    "⚠️ Order was marked delivered, but DELIVERY_BOT_TOKEN is not configured. "
-                    "Add it before delivering reseller manual orders."
+                    f"⚠️ Order was marked delivered, but the Delivery Bot could not confirm delivery: {exc}",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text="🔁 Check / retry delivery", callback_data=f"retry_api_delivery_{order_id}")
+                    ]]),
                 )
                 return
-            recipient_label = "the customer" if result["delivery_telegram_id"] else "you (admin delivery copy)"
-            await delivery_bot.send_message(
-                destination_id,
-                ("📦 <b>Your order has been delivered</b>\n\n" if result["delivery_telegram_id"] else
-                 "📤 <b>Admin delivery copy</b>\n\nNo customer Telegram ID was supplied. Forward the details below yourself.\n\n") +
-                "━━━━━━━━━━━━━━━━━━\n\n"
-                f"🧾 <b>Order:</b> <code>#{full_order.id}</code>\n"
-                f"📦 <b>Product:</b> {escape(str(full_order.product_name or 'Product'))}\n"
-                f"🔢 <b>Quantity:</b> {full_order.quantity or 1}\n\n"
-                f"🔑 <b>Your delivery:</b>\n<pre>{escape(str(result['delivered_text']))}</pre>",
-                parse_mode="HTML",
+            await message.answer(
+                f"✅ Manual delivery sent through the Delivery Bot to {recipient_label}.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="🔁 Check delivery status", callback_data=f"retry_api_delivery_{order_id}")
+                ]]),
             )
-            await message.answer(f"✅ Manual delivery sent through the Delivery Bot to {recipient_label}.")
         else:
             destination_id = result["buyer_id"]
             await message.bot.send_message(
@@ -687,3 +687,36 @@ async def deliver_order_finish(message: Message, state: FSMContext):
             "recipient directly. They must start the correct bot before delivery."
         )
         return
+
+
+@router.callback_query(F.data.startswith("retry_api_delivery_"))
+async def retry_api_manual_delivery(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    try:
+        order_id = int(callback.data.rsplit("_", 1)[1])
+    except (TypeError, ValueError):
+        await callback.answer("Invalid order.", show_alert=True)
+        return
+
+    db = SessionLocal()
+    try:
+        order = db.query(Order).filter(Order.id == order_id).first()
+        is_api_order = bool(order and db.query(ApiOrder.id).filter(ApiOrder.order_id == order_id).first())
+        if not order or not is_api_order or order.delivery_type != "manual" or order.status != "completed" or order.refunded or not order.delivered_account:
+            await callback.answer("This order is not eligible for delivery retry.", show_alert=True)
+            return
+        recipient_id = int(order.delivery_telegram_id or callback.from_user.id)
+    finally:
+        db.close()
+
+    try:
+        result = await send_manual_delivery(order_id, recipient_id, callback.from_user.id)
+    except DeliveryBridgeError as exc:
+        await callback.answer(str(exc)[:180], show_alert=True)
+        return
+    await callback.answer(
+        "Already sent; no duplicate was sent." if result.get("status") == "already_sent" else "Delivery sent.",
+        show_alert=True,
+    )
