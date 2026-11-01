@@ -179,7 +179,7 @@ def _build_audit_profile(user, telegram_id: int) -> str:
         "📞 Support — Get help from our support team"
         "</blockquote>\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "📢 Stay Updated: @Senacoun\n\n"
+        "📢 Stay Updated: @Raindrop7707\n\n"
         "👇 Tap a button below to get started."
     )
 
