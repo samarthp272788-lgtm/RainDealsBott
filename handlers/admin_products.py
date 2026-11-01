@@ -15,6 +15,7 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 from aiogram.fsm.context import FSMContext
+from sqlalchemy import func
 
 from config import (
     ADMIN_IDS,
@@ -55,6 +56,109 @@ print("✅ admin_products imported")
 
 # Per-user per-provider asynchronous locks for preventing concurrent duplicate fetches
 _provider_fetch_locks: dict[tuple[int, str], asyncio.Lock] = {}
+
+_ADD_CATEGORY_PAGE_SIZE = 18
+
+
+def _load_product_category_options() -> list[dict[str, str | int]]:
+    """Return unique stored categories and their product counts for admin pickers."""
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(Product.category, func.count(Product.id))
+            .filter(Product.category.isnot(None), Product.category != "")
+            .group_by(Product.category)
+            .order_by(Product.category.asc())
+            .all()
+        )
+    finally:
+        db.close()
+
+    merged: dict[str, dict[str, str | int]] = {}
+    for raw_category, count in rows:
+        name = (raw_category or "").strip()
+        if not name:
+            continue
+        key = name.casefold()
+        if key in merged:
+            merged[key]["count"] = int(merged[key]["count"]) + int(count)
+        else:
+            merged[key] = {"name": name, "count": int(count)}
+    return sorted(merged.values(), key=lambda item: str(item["name"]).casefold())
+
+
+def _add_product_category_keyboard(options: list[dict[str, str | int]], page: int = 0) -> InlineKeyboardMarkup:
+    total_pages = max(1, (len(options) + _ADD_CATEGORY_PAGE_SIZE - 1) // _ADD_CATEGORY_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * _ADD_CATEGORY_PAGE_SIZE
+    page_options = options[start:start + _ADD_CATEGORY_PAGE_SIZE]
+
+    rows = []
+    row = []
+    for index, option in enumerate(page_options, start=start):
+        name = str(option["name"])
+        label = name if len(name) <= 31 else name[:28].rstrip() + "…"
+        row.append(InlineKeyboardButton(
+            text=f"🏷 {label} ({option['count']})",
+            callback_data=f"add_product_category_pick_{index}",
+            style="primary",
+        ))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="⬅ Previous", callback_data=f"add_product_category_page_{page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="add_product_category_page_current"))
+        if page + 1 < total_pages:
+            nav.append(InlineKeyboardButton(text="Next ➡", callback_data=f"add_product_category_page_{page + 1}"))
+        rows.append(nav)
+
+    rows.extend([
+        [InlineKeyboardButton(text="➕ New Category", callback_data="add_product_category_new")],
+        [InlineKeyboardButton(text="⏭ Skip Category (General)", callback_data="add_product_category_skip")],
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _show_add_product_category_picker(target, state: FSMContext, page: int = 0):
+    data = await state.get_data()
+    options = data.get("product_category_options", [])
+    current = data.get("icon", "📦")
+    if options:
+        details = "Tap a saved category, create a new one, or skip to General."
+    else:
+        details = "There are no saved categories yet. Create one or skip to General."
+    return await answer_card(
+        target,
+        f"✅ <b>Icon:</b> {_esc(current)}\n\n"
+        f"{_divider('─')}\n\n"
+        "✏️ <b>Step 3/10: Category</b>\n\n"
+        f"{details}",
+        parse_mode="HTML",
+        reply_markup=_add_product_category_keyboard(options, page),
+        state=state,
+    )
+
+
+async def _continue_add_product_after_category(target, state: FSMContext, category: str):
+    await state.update_data(category=category, category_input=False)
+    await state.set_state(AddProduct.price)
+    return await answer_card(
+        target,
+        f"✅ <b>Category:</b> {_esc(category)}\n\n"
+        f"{_divider('─')}\n\n"
+        "✏️ <b>Step 4/10: Price</b>\n\n"
+        "Send the base price per unit (USD).\n\n"
+        "<i>Example: 9.99</i>\n\n"
+        "💡 <i>You'll be able to add bulk/tiered pricing in a later step!</i>",
+        parse_mode="HTML",
+        state=state,
+    )
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -998,7 +1102,7 @@ async def product_name(message: Message, state: FSMContext):
 
 @router.message(AddProduct.icon)
 async def product_icon(message: Message, state: FSMContext):
-    """Step 3/10: Ask for category."""
+    """Step 3/10: Select an existing category, create one, or skip."""
     if message.from_user.id not in ADMIN_IDS:
         return
 
@@ -1013,26 +1117,112 @@ async def product_icon(message: Message, state: FSMContext):
 
     await state.update_data(icon=icon)
     await state.set_state(AddProduct.category)
+    options = await asyncio.to_thread(_load_product_category_options)
+    await state.update_data(product_category_options=options, category_input=False)
+    await _show_add_product_category_picker(message, state)
 
-    await answer_card(message,
-        f"✅ <b>Icon:</b> {icon}\n\n"
-        f"{_divider('─')}\n\n"
-        f"✏️ <b>Step 3/10: Category</b>\n\n"
-        f"Send a category name. You can use an existing category or create a new one.\n\n"
-        f"<b>Available categories:</b>\n"
-        f"• premium\n• budget\n• vpn\n• email\n"
-        f"• streaming\n• gaming\n• software\n• education\n\n"
-        f"<i>Examples: ChatGPT, CAPCUT, Gemini, Canva, VPN</i>",
-        parse_mode="HTML"
+
+@router.callback_query(F.data.startswith("add_product_category_page_"))
+async def add_product_category_page(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    if callback.data.endswith("current"):
+        await callback.answer()
+        return
+    try:
+        page = int(callback.data.removeprefix("add_product_category_page_"))
+    except ValueError:
+        await callback.answer("Invalid category page.", show_alert=True)
+        return
+    if await state.get_state() != AddProduct.category.state:
+        await callback.answer("This product setup has expired. Start again.", show_alert=True)
+        return
+    await _show_add_product_category_picker(callback, state, page)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("add_product_category_pick_"))
+async def add_product_category_pick(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    if await state.get_state() != AddProduct.category.state:
+        await callback.answer("This product setup has expired. Start again.", show_alert=True)
+        return
+    try:
+        index = int(callback.data.removeprefix("add_product_category_pick_"))
+    except ValueError:
+        await callback.answer("Invalid category.", show_alert=True)
+        return
+    data = await state.get_data()
+    options = data.get("product_category_options", [])
+    if index < 0 or index >= len(options):
+        await callback.answer("That category is no longer available.", show_alert=True)
+        return
+    category = str(options[index]["name"])
+    await callback.answer()
+    await _continue_add_product_after_category(callback, state, category)
+
+
+@router.callback_query(F.data == "add_product_category_new")
+async def add_product_category_new(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    if await state.get_state() != AddProduct.category.state:
+        await callback.answer("This product setup has expired. Start again.", show_alert=True)
+        return
+    await state.update_data(category_input=True)
+    await callback.answer()
+    await answer_card(
+        callback,
+        "➕ <b>New product category</b>\n\n"
+        "Send the category name (up to 255 characters).\n"
+        "Example: <code>Gemini AI Pro</code>",
+        parse_mode="HTML",
+        state=state,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="⬅ Back to Categories", callback_data="add_product_category_back")
+        ]]),
     )
+
+
+@router.callback_query(F.data == "add_product_category_back")
+async def add_product_category_back(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    if await state.get_state() != AddProduct.category.state:
+        await callback.answer("This product setup has expired. Start again.", show_alert=True)
+        return
+    await state.update_data(category_input=False)
+    await callback.answer()
+    await _show_add_product_category_picker(callback, state)
+
+
+@router.callback_query(F.data == "add_product_category_skip")
+async def add_product_category_skip(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    if await state.get_state() != AddProduct.category.state:
+        await callback.answer("This product setup has expired. Start again.", show_alert=True)
+        return
+    await callback.answer()
+    await _continue_add_product_after_category(callback, state, "General")
 
 
 @router.message(AddProduct.category)
 async def product_category(message: Message, state: FSMContext):
-    """Step 4/10: Ask for price."""
+    """Accept typed category text only after the admin chooses New Category."""
     if message.from_user.id not in ADMIN_IDS:
         return
 
+    data = await state.get_data()
+    if not data.get("category_input"):
+        await _show_add_product_category_picker(message, state)
+        return
     if not message.text:
         return
 
@@ -1040,19 +1230,12 @@ async def product_category(message: Message, state: FSMContext):
     if len(category) > 255:
         await answer_card(message, "❌ <b>Category name is too long.</b> Use 255 characters or fewer.", parse_mode="HTML")
         return
-    await state.update_data(category=category)
-    await state.set_state(AddProduct.price)
-
-    await answer_card(message,
-        f"✅ <b>Category:</b> {_esc(category)}\n\n"
-        f"{_divider('─')}\n\n"
-        f"✏️ <b>Step 4/10: Price</b>\n\n"
-        f"Send the base price per unit (USD).\n\n"
-        f"<i>Example: 9.99</i>\n\n"
-        f"💡 <i>You'll be able to add bulk/tiered\n"
-        f"pricing in a later step!</i>",
-        parse_mode="HTML"
+    existing = next(
+        (str(item["name"]) for item in data.get("product_category_options", [])
+         if str(item["name"]).casefold() == category.casefold()),
+        None,
     )
+    await _continue_add_product_after_category(message, state, existing or category)
 
 
 @router.message(AddProduct.price)
