@@ -292,6 +292,17 @@ def _kwargs(reply_markup, parse_mode, extra=None):
     return kwargs
 
 
+def _caption_kwargs(kwargs):
+    """Remove text-only options before calling Telegram's caption methods."""
+    caption_kwargs = dict(kwargs)
+    # Telegram/Aiogram accepts link-preview controls for text messages, not
+    # editMessageCaption. Keep these options on the text-edit path, but strip
+    # them if update_card/show falls back to editing a photo caption.
+    caption_kwargs.pop("disable_web_page_preview", None)
+    caption_kwargs.pop("link_preview_options", None)
+    return caption_kwargs
+
+
 async def show(
     callback: CallbackQuery,
     text: str,
@@ -345,7 +356,10 @@ async def show(
             # not text. Edit that caption in place before creating a second
             # message, so navigation and status updates stay on one card.
             try:
-                msg = await callback.message.edit_caption(caption=text, **kwargs)
+                msg = await callback.message.edit_caption(
+                    caption=text,
+                    **_caption_kwargs(kwargs),
+                )
             except TelegramBadRequest as caption_error:
                 if "message is not modified" in str(caption_error).lower():
                     msg = callback.message
@@ -461,7 +475,7 @@ async def update_card(
                         caption=text,
                         chat_id=chat_id,
                         message_id=message_id,
-                        **kwargs,
+                        **_caption_kwargs(kwargs),
                     )
                 except TelegramBadRequest as caption_exc:
                     if "message is not modified" in str(caption_exc).lower():
