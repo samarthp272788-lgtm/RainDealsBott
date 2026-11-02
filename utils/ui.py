@@ -393,6 +393,7 @@ async def update_card(
     message_id: int | None = None,
     owner_id: int | None = None,
     replace_media: bool = False,
+    force_new_card: bool = False,
     **extra,
 ):
     """
@@ -418,17 +419,49 @@ async def update_card(
         except Exception:
             pass
 
-    if (chat_id is None or message_id is None) and state is not None:
+    card_owner_id = int(owner_id or (message.from_user.id if message.from_user else 0))
+
+    if force_new_card:
+        # A user may have cleared chat history while the database still points
+        # at the old home-menu message. Replace it with a fresh, visible card
+        # on /start instead of trusting Telegram to edit that stale message.
+        if (chat_id is None or message_id is None) and card_owner_id:
+            remembered = _CARD_LOCATIONS.get((card_owner_id, message.chat.id))
+            if remembered:
+                chat_id = chat_id or remembered[0]
+                message_id = message_id or remembered[1]
+        if chat_id and message_id:
+            _cancel_scheduled_card_transition(chat_id, message_id)
+            _cancel_scheduled_card_delete(chat_id, message_id)
+            try:
+                await message.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            except Exception:
+                logger.debug("Could not remove the previous home-menu card %s", message_id)
+        if card_owner_id:
+            _forget_card(card_owner_id, message.chat.id)
+        chat_id = None
+        message_id = None
+    elif (chat_id is None or message_id is None) and state is not None:
         data = await state.get_data()
         chat_id = chat_id or data.get(_CARD_CHAT_ID_KEY)
         message_id = message_id or data.get(_CARD_MESSAGE_ID_KEY)
 
-    card_owner_id = int(owner_id or (message.from_user.id if message.from_user else 0))
-    if (chat_id is None or message_id is None) and card_owner_id:
+    if not force_new_card and (chat_id is None or message_id is None) and card_owner_id:
         remembered = _CARD_LOCATIONS.get((card_owner_id, message.chat.id))
         if remembered:
             chat_id = chat_id or remembered[0]
             message_id = message_id or remembered[1]
+
+    if force_new_card:
+        msg = await message.answer(text, **_kwargs(reply_markup, parse_mode, extra))
+        if state is not None:
+            await state.update_data(
+                **{_CARD_CHAT_ID_KEY: msg.chat.id, _CARD_MESSAGE_ID_KEY: msg.message_id}
+            )
+        if card_owner_id:
+            _remember_card(card_owner_id, msg.chat.id, msg.message_id)
+            schedule_success_notice(msg, text, owner_id=card_owner_id)
+        return msg
 
     if chat_id and message_id and replace_media:
         try:

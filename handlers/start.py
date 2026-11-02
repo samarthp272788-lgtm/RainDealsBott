@@ -594,6 +594,7 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
         chat_id=result["profile"].get("home_menu_chat_id"),
         message_id=result["profile"].get("home_menu_message_id"),
         owner_id=telegram_id,
+        force_new_card=True,
         disable_web_page_preview=True,
     )
     if menu_card:
