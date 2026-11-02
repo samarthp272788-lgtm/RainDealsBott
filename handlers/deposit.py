@@ -6,6 +6,7 @@ import secrets
 import logging
 import asyncio
 import time
+from html import escape
 from datetime import datetime, timedelta
 from pathlib import Path
 from decimal import Decimal, ROUND_HALF_UP
@@ -1059,40 +1060,68 @@ def _switch_invoice_network(deposit_id: int, network: str) -> bool:
 
 
 def _invoice_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="↩️ Change payment method", callback_data="deposit_start")],
-    ])
+    # Keep the controls from the original deposit card.
+    return _cancel_kb()
 
 
 def _invoice_payload(network: str, data: dict) -> tuple[str, str | None]:
-    code = data.get("invoice_code", "")
+    """Build the original deposit-card copy for the combined QR/photo card."""
+    code = escape(str(data.get("invoice_code", "")))
+    deposit_id = escape(str(data.get("deposit_id", "")))
     expiry = datetime.fromisoformat(data["invoice_expires_at"])
     remaining = max(0, int((expiry - datetime.utcnow()).total_seconds()))
     mins, secs = divmod(remaining, 60)
-    common = (
-        f"🧾 <b>Invoice:</b> <code>{code}</code>\n"
-        f"⏳ <b>Expires in:</b> {mins}:{secs:02d}\n\n"
-    )
+    network_config = _get_network_info(network)
+    divider = _divider("─", 28)
     qr = None
+
     if network == "UPI":
-        body = (f"🟢 <b>UPI payment</b>\n{common}"
-                f"UPI ID: <code>{getattr(config, 'UPI_ID', '')}</code>\n\n"
-                "Pay any amount using the QR/UPI ID. The verified transfer amount is converted and credited. ")
+        upi_id = escape(str(getattr(config, "UPI_ID", "") or "Not configured"))
         qr = getattr(config, "UPI_QR_FILE", "")
-        reference = "UTR / transaction reference"
+        payment_info = (
+            f"🟢 <b>UPI Payment Details</b>\n\n"
+            f"<blockquote><code>{upi_id}</code></blockquote>\n\n"
+            "📱 Scan the QR above or use the UPI ID.\n"
+            "💳 Pay any amount; the verified amount is credited.\n\n"
+            "<b>📋 After payment, send:</b> UTR / Transaction ID"
+        )
+        reference = "UTR / Transaction reference"
     elif network in CRYPTO_NETWORKS:
-        address = NETWORK_ADDRESSES.get(network, "")
-        body = (f"{_get_network_info(network)['icon']} <b>{_get_network_info(network)['label']}</b>\n{common}"
-                f"Send USDT to:\n<code>{address}</code>\n\n"
-                "Send the USDT amount you choose on this network. The verified amount is credited.")
+        address = escape(str(NETWORK_ADDRESSES.get(network, "") or "Not configured"))
         qr = getattr(config, f"{network}_QR_FILE", "")
-        reference = "Transaction hash (TXID)"
+        payment_info = (
+            f"{network_config['icon']} <b>{network_config['label']} Deposit Address</b>\n\n"
+            f"<blockquote><code>{address}</code></blockquote>\n\n"
+            "⚠️ <b>Important:</b> Send only USDT on the network shown above.\n"
+            "💰 Send the amount you choose; the verified amount is credited.\n\n"
+            "<b>📋 After sending, paste:</b> Transaction Hash (TXID)"
+        )
+        reference = "Transaction Hash (TXID)"
     else:
-        body = (f"🔴 <b>Binance Pay</b>\n{common}"
-                f"Pay ID: <code>{BINANCE_PAY_ID}</code>\n\n"
-                "Pay the amount you choose, then submit the Binance Pay transaction/order reference. The verified amount is credited.")
-        reference = "Binance Pay reference"
-    body += f"\n\n📋 After paying, send your <b>{reference}</b>.\nTo use another method, return to payment options; this invoice code and expiry stay the same."
+        pay_id = escape(str(BINANCE_PAY_ID or "Not configured"))
+        payment_info = (
+            "🔴 <b>Binance Pay Details</b>\n\n"
+            f"<b>Pay ID:</b> <blockquote><code>{pay_id}</code></blockquote>\n\n"
+            "📱 Open Binance Pay and send any amount.\n"
+            "💰 The verified transfer amount is credited.\n\n"
+            "<b>📋 After payment, send:</b> Binance Pay Order ID"
+        )
+        reference = "Binance Pay Order ID"
+
+    body = (
+        f"{network_config['icon']} <b>DEPOSIT CREATED</b>\n\n"
+        f"<b>📋 Deposit Details</b>\n"
+        f"{divider}\n\n"
+        f"🆔 <b>Deposit ID:</b> <code>#{deposit_id}</code>\n"
+        f"🧾 <b>Invoice:</b> <code>{code}</code>\n"
+        f"📡 <b>Network:</b> {network_config['icon']} {network_config['label']}\n"
+        f"⏳ <b>Expires in:</b> {mins}:{secs:02d}\n"
+        f"📊 <b>Status:</b> ⏳ Awaiting Payment\n\n"
+        f"{_divider('═', 28)}\n\n"
+        f"{payment_info}\n\n"
+        f"{_divider('═', 28)}\n\n"
+        f"💡 After payment, send your <b>{reference}</b> here for verification."
+    )
     return body, qr
 
 
