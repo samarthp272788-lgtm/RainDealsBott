@@ -1,0 +1,34 @@
+"""Idempotent schema setup for buyer order information and shared invoices."""
+
+from sqlalchemy import text
+
+from database import Base, engine
+from models.order_requirement_submission import OrderRequirementSubmission
+
+
+def _ensure_column(connection, table: str, column: str, definition: str) -> None:
+    exists = connection.execute(text(
+        "SELECT 1 FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=:table AND COLUMN_NAME=:column"
+    ), {"table": table, "column": column}).first()
+    if not exists:
+        connection.execute(text(f"ALTER TABLE `{table}` ADD COLUMN `{column}` {definition}"))
+
+
+def ensure_order_requirements_schema() -> None:
+    Base.metadata.create_all(bind=engine, tables=[OrderRequirementSubmission.__table__])
+    with engine.begin() as connection:
+        _ensure_column(connection, "products", "required_info", "JSON NULL")
+        _ensure_column(connection, "orders", "reserved_delivery", "TEXT NULL")
+        _ensure_column(connection, "deposits", "invoice_code", "VARCHAR(32) NULL")
+        _ensure_column(connection, "deposits", "invoice_expires_at", "DATETIME NULL")
+        _ensure_column(connection, "deposits", "invoice_usdt_amount", "DECIMAL(20,8) NULL")
+        index_exists = connection.execute(text(
+            "SELECT 1 FROM information_schema.STATISTICS "
+            "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='deposits' "
+            "AND COLUMN_NAME='invoice_code' AND NON_UNIQUE=0"
+        )).first()
+        if not index_exists:
+            connection.execute(text(
+                "CREATE UNIQUE INDEX uq_deposits_invoice_code ON deposits (invoice_code)"
+            ))

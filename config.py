@@ -442,6 +442,10 @@ DEPOSIT_CONFIRMATION_PROVIDER = "RPC"
 # ==========================================================
 
 UPI_ID = "luquman@fam"
+UPI_QR_FILE = os.getenv("UPI_QR_FILE", "").strip()
+BEP20_QR_FILE = os.getenv("BEP20_QR_FILE", "").strip()
+POLYGON_QR_FILE = os.getenv("POLYGON_QR_FILE", "").strip()
+DELIVERY_BOT_USERNAME = os.getenv("DELIVERY_BOT_USERNAME", "").strip().lstrip("@")
 
 IMAP_HOST = "imap.gmail.com"
 

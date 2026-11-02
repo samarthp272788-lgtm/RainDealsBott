@@ -31,6 +31,7 @@ from services.product_api_access import ensure_product_api_access_schema
 from services.provider_schema import ensure_provider_schema
 from services.maintenance_mode import ensure_maintenance_schema, is_maintenance_enabled
 from services.order_rating_schema import ensure_order_rating_schema
+from services.order_requirements_schema import ensure_order_requirements_schema
 from services.upstream_callbacks import process_upstream_callback
 from services.cloudflare_bridge import dispatch_update, ensure_schema, verify_request
 from config import API_MAX_REQUEST_BYTES
@@ -81,6 +82,7 @@ async def lifespan(app: FastAPI):
         await asyncio.to_thread(ensure_provider_schema)
         await asyncio.to_thread(ensure_maintenance_schema)
         await asyncio.to_thread(ensure_order_rating_schema)
+        await asyncio.to_thread(ensure_order_requirements_schema)
 
         if TELEGRAM_TRANSPORT == "cloudflare":
             if len(CLOUDFLARE_BRIDGE_SECRET) < 32:

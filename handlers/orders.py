@@ -24,6 +24,9 @@ from database import SessionLocal
 from models.order import Order
 from models.order_rating import OrderRating
 from models.product import Product
+from models.order_requirement_submission import OrderRequirementSubmission
+from states.product_states import OrderRequirementStates
+import config
 from utils.ui import show, update_card, answer_card
 
 router = Router()
@@ -582,6 +585,170 @@ async def my_orders(callback: CallbackQuery):
 # ║              ORDER DETAIL VIEW                              ║
 # ╚══════════════════════════════════════════════════════════════╝
 
+def _order_requirement_context(order_id: int, telegram_id: int):
+    db = SessionLocal()
+    try:
+        order = db.query(Order).filter(Order.id == order_id, Order.telegram_id == telegram_id).first()
+        if not order:
+            return None, [], None
+        product = db.query(Product).filter(Product.id == order.product_id).first() if order.product_id else None
+        submission = db.query(OrderRequirementSubmission).filter_by(order_id=order_id).first()
+        requirements = product.required_info if product and isinstance(product.required_info, list) else []
+        return order, requirements, submission
+    finally:
+        db.close()
+
+
+def _requirement_prompt(field: dict, index: int, total: int) -> str:
+    kind = str(field.get("type", "text")).lower()
+    label = _esc(str(field.get("label") or kind.title()))
+    hint = {
+        "email": "Send the email address as text.",
+        "phone": "Send the phone number as text.",
+        "photo": "Upload a clear photo or screenshot.",
+        "contact": "Use Telegram's paperclip menu to share your contact.",
+        "text": "Send the requested information as text.",
+    }.get(kind, "Send the requested information.")
+    return f"🧾 <b>Order information {index + 1}/{total}</b>\n\n<b>{label}</b>\n{hint}\n\nSend /cancel to stop; you can resume from My Orders."
+
+
+def _save_order_requirement_submission(order_id: int, telegram_id: int, values: dict) -> dict:
+    db = SessionLocal()
+    try:
+        order = db.query(Order).filter(
+            Order.id == order_id, Order.telegram_id == telegram_id
+        ).with_for_update().first()
+        if not order:
+            return {"error": "Order not found."}
+        existing = db.query(OrderRequirementSubmission).filter_by(order_id=order_id).first()
+        if existing:
+            return {"error": "Information was already submitted for this order."}
+        if order.status != "pending_info":
+            return {"error": "This order is not waiting for buyer information."}
+        db.add(OrderRequirementSubmission(order_id=order.id, telegram_id=telegram_id, values=values))
+        if order.is_preorder:
+            order.status = "preorder"
+        elif order.reserved_delivery:
+            order.delivered_account = order.reserved_delivery
+            order.reserved_delivery = None
+            order.status = "completed"
+        else:
+            order.status = "pending_manual"
+        db.commit()
+        return {"status": order.status, "delivery": order.delivered_account, "product_name": order.product_name}
+    except Exception:
+        db.rollback()
+        logger.exception("Could not save order requirements for order %s", order_id)
+        return {"error": "Could not save the information. Please try again."}
+    finally:
+        db.close()
+
+
+@router.callback_query(F.data.startswith("order_submit_info_"))
+async def order_submit_info(callback: CallbackQuery, state: FSMContext):
+    order_id = int(callback.data.removeprefix("order_submit_info_"))
+    order, requirements, submission = await asyncio.to_thread(
+        _order_requirement_context, order_id, callback.from_user.id
+    )
+    if not order or order.status != "pending_info" or not requirements or submission:
+        await callback.answer("This order cannot accept more information.", show_alert=True)
+        return
+    await callback.answer()
+    await state.clear()
+    await state.update_data(order_requirement_order_id=order_id, order_requirement_fields=requirements,
+                            order_requirement_index=0, order_requirement_values={})
+    await state.set_state(OrderRequirementStates.waiting_input)
+    await show(callback, _requirement_prompt(requirements[0], 0, len(requirements)), parse_mode="HTML",
+               reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="order_cancel_info")]]))
+
+
+@router.callback_query(F.data == "order_cancel_info")
+async def order_cancel_info(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer("Stopped. You can continue from My Orders.")
+    await show(callback, "Information entry stopped. Open the order again when you're ready.",
+               reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📦 My Orders", callback_data="orders_menu")]]))
+
+
+@router.message(OrderRequirementStates.waiting_input)
+async def order_requirement_input(message: Message, state: FSMContext):
+    if (message.text or "").strip().lower() == "/cancel":
+        await state.clear()
+        await answer_card(message, "Stopped. You can continue from My Orders.")
+        return
+    data = await state.get_data()
+    fields = data.get("order_requirement_fields") or []
+    index = int(data.get("order_requirement_index", 0))
+    if index >= len(fields):
+        await state.clear()
+        await answer_card(message, "This information request expired. Open the order again.")
+        return
+    field = fields[index]
+    kind = str(field.get("type", "text")).lower()
+    if kind == "photo":
+        if not message.photo:
+            await answer_card(message, "Please upload a photo for this field.")
+            return
+        value = {"kind": "photo", "file_id": message.photo[-1].file_id}
+    elif kind == "contact":
+        if not message.contact:
+            await answer_card(message, "Please share a Telegram contact using the attachment menu.")
+            return
+        value = {"kind": "contact", "phone": message.contact.phone_number,
+                 "first_name": message.contact.first_name, "user_id": message.contact.user_id}
+    elif kind == "email":
+        text = (message.text or "").strip()
+        if len(text) > 254 or "@" not in text or "." not in text.rsplit("@", 1)[-1]:
+            await answer_card(message, "Please send a valid email address.")
+            return
+        value = {"kind": "text", "value": text[:254]}
+    elif kind == "phone":
+        text = (message.text or "").strip()
+        digits = sum(ch.isdigit() for ch in text)
+        if digits < 7 or len(text) > 40:
+            await answer_card(message, "Please send a valid phone/contact number.")
+            return
+        value = {"kind": "text", "value": text}
+    else:
+        text = (message.text or "").strip()
+        if not text or len(text) > 3000:
+            await answer_card(message, "Please send text up to 3000 characters.")
+            return
+        value = {"kind": "text", "value": text}
+
+    values = data.get("order_requirement_values") or {}
+    values[str(field.get("label") or kind)] = value
+    index += 1
+    if index < len(fields):
+        await state.update_data(order_requirement_values=values, order_requirement_index=index)
+        await answer_card(message, _requirement_prompt(fields[index], index, len(fields)), parse_mode="HTML")
+        return
+
+    order_id = int(data["order_requirement_order_id"])
+    result = await asyncio.to_thread(_save_order_requirement_submission, order_id, message.from_user.id, values)
+    await state.clear()
+    if result.get("error"):
+        await answer_card(message, f"⚠️ {_esc(result['error'])}")
+        return
+    if result["status"] == "completed":
+        delivery = result.get("delivery") or ""
+        await answer_card(message,
+            f"✅ <b>Information received — Order #{order_id} is delivered.</b>\n\n"
+            f"<code>{_esc(delivery)}</code>" if delivery else f"✅ Order #{order_id} is complete.",
+            parse_mode="HTML")
+    elif result["status"] == "preorder":
+        await answer_card(message, f"✅ Information saved for Order #{order_id}. It will be fulfilled when stock is available.")
+    else:
+        await answer_card(message, f"✅ Information saved for Order #{order_id}. The team can now fulfill it.")
+        channel = getattr(config, "ADMIN_ORDER_NOTIFICATION_CHANNEL_ID", "")
+        if channel:
+            try:
+                await message.bot.send_message(channel,
+                    f"🧾 <b>Buyer information received</b>\nOrder: <code>#{order_id}</code>\n"
+                    f"Buyer: <code>{message.from_user.id}</code>\nOpen Admin → Orders to review.", parse_mode="HTML")
+            except Exception:
+                logger.exception("Failed to notify admins of order information submission")
+
 @router.callback_query(F.data.startswith("order_detail_"))
 async def order_detail(callback: CallbackQuery):
     """Show detailed view of a single order with advanced features."""
@@ -675,6 +842,11 @@ async def order_detail(callback: CallbackQuery):
             "This usually takes a few minutes.\n\n"
             "<i>Do not close this window.</i>"
         ),
+        "pending_info": (
+            "🧾 <b>Waiting for your information</b>\n\n"
+            "Open the button below and submit the details requested for this product. "
+            "Delivery is held until the details are received."
+        ),
     }
 
     text += f"\n{status_messages.get(order.status, '')}"
@@ -687,8 +859,25 @@ async def order_detail(callback: CallbackQuery):
         if product and product.delivery_instruction:
             has_instruction = True
 
+    requirement_order, required_fields, requirement_submission = await asyncio.to_thread(
+        _order_requirement_context, order.id, callback.from_user.id
+    )
+
     # Action buttons based on status
     action_buttons = []
+
+    if order.status == "pending_info" and required_fields and not requirement_submission:
+        action_buttons.append([InlineKeyboardButton(
+            text="🧾 Send Required Information",
+            callback_data=f"order_submit_info_{order.id}",
+            style="success",
+        )])
+    elif requirement_submission:
+        action_buttons.append([InlineKeyboardButton(
+            text="✅ Information Submitted",
+            callback_data=f"order_detail_{order.id}",
+            style="success",
+        )])
 
     # Delivery Instructions button — shows for completed orders that have instructions
     if order.status == "completed" and has_instruction:

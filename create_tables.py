@@ -9,6 +9,7 @@ from models.referral import Referral
 from models.provider import Provider
 from models.custom_rate import CustomRate
 from models.rate_control import ProductRateControl, RateControlAssignment
+from models.order_requirement_submission import OrderRequirementSubmission
 
 
 print("Creating tables...")

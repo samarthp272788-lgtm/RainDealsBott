@@ -2084,6 +2084,8 @@ def _do_purchase(
         stock_before = product.stock or 0
 
         delivered_accounts: list[str] = []
+        reserved_delivery: list[str] = []
+        required_info = product.required_info if isinstance(product.required_info, list) else []
         is_preorder_order = False
         new_stock = stock_before
 
@@ -2095,6 +2097,9 @@ def _do_purchase(
             product.file_content = "\n".join(accounts[quantity:])
             new_stock = len(accounts) - quantity
             product.stock = new_stock
+            if required_info:
+                reserved_delivery = delivered_accounts
+                delivered_accounts = []
         elif can_manual_fulfill:
             new_stock = stock_before - quantity
             product.stock = new_stock
@@ -2107,7 +2112,9 @@ def _do_purchase(
         if new_stock < 0:
             return {"error": "Stock changed while processing your order. Please try again."}
 
-        status = "completed" if delivered_accounts else ("preorder" if is_preorder_order else "pending_manual")
+        status = "pending_info" if required_info else (
+            "completed" if delivered_accounts else ("preorder" if is_preorder_order else "pending_manual")
+        )
 
         user.balance = user_balance - total_amount
         user.total_orders += 1
@@ -2116,6 +2123,7 @@ def _do_purchase(
         order = Order(
             telegram_id=user.telegram_id, product_id=product.id, product_name=product.name,
             delivered_account="\n".join(delivered_accounts) if delivered_accounts else None,
+            reserved_delivery="\n".join(reserved_delivery) if reserved_delivery else None,
             amount=total_amount, quantity=quantity, delivery_type=delivery_type,
             is_preorder=is_preorder_order, status=status, refunded=False,
             delivery_telegram_id=delivery_telegram_id,
@@ -2146,6 +2154,7 @@ def _do_purchase(
             "quantity": quantity, "total_price": total_amount, "price_per_unit": price,
             "low_stock_alert": low_stock_alert, "referral_commission_paid": referral_commission_paid,
             "delivery_instruction": product.delivery_instruction,
+            "required_info": required_info,
         }
     invalidate_products_cache()
     return result
@@ -2709,6 +2718,23 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
 
             reply_markup = _build_success_keyboard(product_id, result["order_id"], has_instr)
 
+        elif result["status"] == "pending_info":
+            charge_text = "🎁 Free" if is_free else f"${result['total_price']:.2f}"
+            text = (
+                "🧾 <b>ORDER NEEDS YOUR DETAILS</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+                f"🧾 <b>Order:</b> <code>#{result['order_id']}</code>\n"
+                f"📦 <b>Product:</b> {_esc(str(result['name']))}\n"
+                f"🔢 <b>Quantity:</b> {result['quantity']}\n"
+                f"💰 <b>Total:</b> {charge_text}\n\n"
+                "Open <b>My Orders</b>, select this order, then tap <b>Send information</b> "
+                "to provide the requested details. Delivery is held until you submit them.\n\n"
+                f"💳 <b>Balance:</b> <code>${result['balance']:.2f}</code>"
+            )
+            reply_markup = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📦 Open My Orders", callback_data=f"order_detail_{result['order_id']}", style="primary")],
+                [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")],
+            ])
         elif result["status"] == "preorder":
             charge_text = "🎁 Free" if is_free else f"${result['total_price']:.2f}"
             text = (

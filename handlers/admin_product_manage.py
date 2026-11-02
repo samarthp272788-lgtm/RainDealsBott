@@ -1,5 +1,6 @@
 
 from utils.ui import answer_card
+from utils.uploads import text_from_message
 # handlers/admin_product_manage.py — FULLY WORKING ADMIN PRODUCT MANAGEMENT
 
 import json
@@ -523,6 +524,10 @@ ${float(product.price or 0):.2f}
                     callback_data=f"edit_category_{product.id}"
                 )
             ],
+            [InlineKeyboardButton(
+                text="🧾 Edit Buyer Information",
+                callback_data=f"edit_required_info_{product.id}"
+            )],
             [
                 InlineKeyboardButton(
                     text="🔗 Create Product Link",
@@ -705,7 +710,13 @@ async def save_accounts(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
 
-    if not message.text:
+    try:
+        account_text = await text_from_message(message)
+    except ValueError as exc:
+        await answer_card(message, f"❌ {html_escape(str(exc))}")
+        return
+    if account_text is None:
+        await answer_card(message, "Send account lines as text or upload a .txt/.csv file.")
         return
 
     data = await state.get_data()
@@ -718,7 +729,7 @@ async def save_accounts(message: Message, state: FSMContext):
             return
 
         old_accounts = product.file_content or ""
-        new_accounts = (message.text or "").strip()
+        new_accounts = account_text.strip()
 
         if old_accounts:
             product.file_content = old_accounts + "\n" + new_accounts
@@ -843,7 +854,13 @@ async def replace_accounts_save(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
 
-    if not message.text:
+    try:
+        account_text = await text_from_message(message)
+    except ValueError as exc:
+        await answer_card(message, f"❌ {html_escape(str(exc))}")
+        return
+    if account_text is None:
+        await answer_card(message, "Send account lines as text or upload a .txt/.csv file.")
         return
 
     data = await state.get_data()
@@ -855,7 +872,7 @@ async def replace_accounts_save(message: Message, state: FSMContext):
             await answer_card(message, "❌ Product not found.")
             return
 
-        product.file_content = (message.text or "").strip()
+        product.file_content = account_text.strip()
         product.stock = len(
             [line for line in product.file_content.splitlines() if line.strip()]
         )
@@ -1346,6 +1363,83 @@ async def save_product_category(message: Message, state: FSMContext):
         await answer_card(message, panel_text, reply_markup=markup, parse_mode="HTML")
     else:
         await answer_card(message, "✅ Product category updated.")
+
+@router.callback_query(F.data.startswith("edit_required_info_"))
+async def edit_required_info_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    pid = int(callback.data.removeprefix("edit_required_info_"))
+    product = await asyncio.to_thread(_load_product, pid)
+    if not product:
+        await callback.answer("Product not found.", show_alert=True)
+        return
+    await state.update_data(edit_required_info_pid=pid)
+    await state.set_state(EditProduct.required_info)
+    await answer_card(callback,
+        "Send one buyer requirement per line, or <code>skip</code> to remove them.\n\n"
+        "<code>email:Email address</code>\n<code>phone:Contact number</code>\n"
+        "<code>photo:Upload a screenshot</code>\n<code>contact:Share Telegram contact</code>\n"
+        "<code>text:Other information</code>", parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="cancel_edit_required_info")]]))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "cancel_edit_required_info")
+async def cancel_required_info_edit(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    pid = data.get("edit_required_info_pid")
+    await state.clear()
+    if pid:
+        await _refresh_manage_panel(callback, int(pid))
+    else:
+        await callback.answer("Edit cancelled.")
+
+
+@router.message(EditProduct.required_info)
+async def save_required_info_edit(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    data = await state.get_data()
+    pid = data.get("edit_required_info_pid")
+    raw = (message.text or "").strip()
+    requirements = []
+    if raw.lower() not in {"skip", "none", "no", "n"}:
+        allowed = {"email", "phone", "photo", "contact", "text"}
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            kind, sep, label = line.strip().partition(":")
+            kind = kind.strip().lower()
+            if kind not in allowed:
+                await answer_card(message, "❌ Allowed types: email, phone, photo, contact, text. Example: <code>email:Email address</code>", parse_mode="HTML")
+                return
+            requirements.append({"type": kind, "label": (label.strip() if sep and label.strip() else kind.title())[:100]})
+    if len(requirements) > 8:
+        await answer_card(message, "❌ Maximum 8 fields.")
+        return
+    db = SessionLocal()
+    try:
+        product = db.query(Product).filter(Product.id == int(pid)).first() if pid else None
+        if not product:
+            await answer_card(message, "❌ Product edit expired or product not found.")
+            return
+        product.required_info = requirements or None
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Failed saving buyer requirements for product %s", pid)
+        await answer_card(message, "❌ Could not save buyer requirements.")
+        return
+    finally:
+        db.close()
+        await state.clear()
+    product = await asyncio.to_thread(_load_product, int(pid))
+    if product:
+        panel_text, markup = _build_product_panel(product)
+        await answer_card(message, panel_text, reply_markup=markup, parse_mode="HTML")
+
 
 @router.callback_query(F.data.startswith("edit_price_"))
 async def edit_price(callback: CallbackQuery):

@@ -24,6 +24,7 @@ from models.api_key import ApiOrder
 from models.order import Order
 from models.user import User
 from models.product import Product
+from models.order_requirement_submission import OrderRequirementSubmission
 from states.delivery_states import DeliverOrder
 
 from handlers.products import (
@@ -39,6 +40,7 @@ router = Router()
 STATUS_LABELS = {
     "completed": "✅ Completed",
     "pending_manual": "⏳ Pending (manual fulfillment)",
+    "pending_info": "🧾 Waiting for buyer information",
     "preorder": "📦 Preorder (waitlisted)",
     "refunded": "💸 Refunded",
     "deleted": "🗑 Deleted",
@@ -150,6 +152,8 @@ async def order_info(callback: CallbackQuery):
             return
 
         user = db.query(User).filter(User.telegram_id == order.telegram_id).first()
+        requirement_submission = db.query(OrderRequirementSubmission).filter_by(order_id=order.id).first()
+        submitted_values = requirement_submission.values if requirement_submission else {}
         username = f"@{user.username}" if user and user.username else "Not set"
 
         delivered = order.delivered_account or "Not delivered yet"
@@ -183,6 +187,22 @@ Refunded:
 {"✅ YES" if order.refunded else "❌ NO"}
 """
 
+        photo_file_ids = []
+        if submitted_values:
+            text += "\n🧾 Buyer information:\n"
+            for label, item in submitted_values.items():
+                kind = item.get("kind") if isinstance(item, dict) else "text"
+                if kind == "photo":
+                    photo_file_ids.append((label, item.get("file_id")))
+                    value = "Photo attached (shown below)"
+                elif kind == "contact":
+                    value = f"{item.get('first_name', '')} · {item.get('phone', '')}"
+                elif isinstance(item, dict):
+                    value = item.get("value", "")
+                else:
+                    value = str(item)
+                text += f"• <b>{escape(str(label))}:</b> <code>{escape(str(value))}</code>\n"
+
         keyboard = []
 
         needs_fulfillment = (
@@ -214,6 +234,9 @@ Refunded:
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
         )
+        for label, file_id in photo_file_ids:
+            if file_id:
+                await callback.message.answer_photo(file_id, caption=f"Order #{order.id} · {escape(str(label))}")
         await callback.answer()
 
     finally:
@@ -271,7 +294,18 @@ def _do_refund(order_id: int, admin_id: int) -> dict:
 
         stock_restored = False
         if product is not None and not order.is_preorder:
-            if order.delivered_account and order.status == "completed":
+            if order.reserved_delivery and order.status == "pending_info":
+                restored_accounts = [
+                    account.strip() for account in order.reserved_delivery.splitlines() if account.strip()
+                ]
+                existing = [
+                    account.strip() for account in (product.file_content or "").splitlines() if account.strip()
+                ]
+                product.file_content = "\n".join(restored_accounts + existing)
+                product.stock = len(restored_accounts) + len(existing)
+                order.reserved_delivery = None
+                stock_restored = bool(restored_accounts)
+            elif order.delivered_account and order.status == "completed":
                 # Automatic (or hybrid-auto) delivery: the exact
                 # account strings were consumed from file_content —
                 # put them back so they can be resold.
@@ -286,7 +320,7 @@ def _do_refund(order_id: int, admin_id: int) -> dict:
                     product.file_content = "\n".join(restored_accounts + existing)
                     product.stock = len(restored_accounts) + len(existing)
                     stock_restored = True
-            elif order.status in ("pending_manual", "completed"):
+            elif order.status in ("pending_info", "pending_manual", "completed"):
                 # Manual/hybrid-manual fulfillment: only the numeric
                 # counter moved, so give the units back there.
                 product.stock = (product.stock or 0) + (order.quantity or 1)
@@ -439,7 +473,7 @@ async def deliver_order_start(callback: CallbackQuery, state: FSMContext):
     try:
         order = db.get(Order, order_id)
         is_api_order = bool(order and db.query(ApiOrder.id).filter(ApiOrder.order_id == order.id).first())
-        if order and (order.delivery_telegram_id or is_api_order) and not (
+        if order and order.delivery_type in {"manual", "hybrid"} and not (
             config.DELIVERY_BRIDGE_URL and config.DELIVERY_BRIDGE_SECRET
         ):
             await callback.answer(
@@ -467,6 +501,11 @@ async def deliver_order_start(callback: CallbackQuery, state: FSMContext):
             destination_note = (
                 "\n\n👤 No customer Telegram ID was supplied. The Delivery Bot will "
                 "send the completed details only to you, so you can forward them yourself."
+            )
+        elif order and order.delivery_type in {"manual", "hybrid"}:
+            destination_note = (
+                "\n\n📨 The Delivery Bot will send the details to the buyer. If they have not "
+                "started it, the order will wait until they send /start."
             )
     finally:
         db.close()
@@ -651,15 +690,21 @@ async def deliver_order_finish(message: Message, state: FSMContext):
             InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")
         ])
 
-        is_api_manual = result["is_api_order"] and full_order.delivery_type == "manual"
-        if is_api_manual:
-            # An API reseller may optionally provide their end customer's ID.
-            # Without it, NEVER send codes to the API-key owner/customer: send
-            # them only to the administrator who is fulfilling this order.
-            destination_id = result["delivery_telegram_id"] or message.from_user.id
-            recipient_label = "the customer" if result["delivery_telegram_id"] else "you (admin delivery copy)"
+        uses_delivery_bot = full_order.delivery_type in {"manual", "hybrid"}
+        if uses_delivery_bot:
+            # Normal shop orders go to their buyer. API orders go to the
+            # explicitly supplied end customer, or only to the fulfilling
+            # admin when no customer Telegram ID was supplied.
+            destination_id = (
+                result["delivery_telegram_id"]
+                or (message.from_user.id if result["is_api_order"] else result["buyer_id"])
+            )
+            recipient_label = (
+                "the customer" if result["delivery_telegram_id"] or not result["is_api_order"]
+                else "you (admin delivery copy)"
+            )
             try:
-                await send_manual_delivery(order_id, destination_id, message.from_user.id)
+                delivery_result = await send_manual_delivery(order_id, destination_id, message.from_user.id)
             except DeliveryBridgeError as exc:
                 await answer_card(message,
                     f"⚠️ Order was marked delivered, but the Delivery Bot could not confirm delivery: {exc}",
@@ -668,8 +713,24 @@ async def deliver_order_finish(message: Message, state: FSMContext):
                     ]]),
                 )
                 return
+            waiting = delivery_result.get("status") == "waiting_for_start"
+            if waiting and not result["is_api_order"] and config.DELIVERY_BOT_USERNAME:
+                try:
+                    await message.bot.send_message(
+                        destination_id,
+                        "📦 Your order is ready. Start the Delivery Bot to receive it here:\n"
+                        f"https://t.me/{escape(config.DELIVERY_BOT_USERNAME)}?start=order_{order_id}",
+                    )
+                except Exception:
+                    logger.info("Could not send delivery-bot start link to buyer %s", destination_id)
+            status_text = (
+                f"⏳ Delivery is queued for {recipient_label}. The Delivery Bot will send it "
+                "automatically after the recipient opens it and sends /start."
+                if waiting else
+                f"✅ Manual delivery sent through the Delivery Bot to {recipient_label}."
+            )
             await answer_card(message,
-                f"✅ Manual delivery sent through the Delivery Bot to {recipient_label}.",
+                status_text,
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                     InlineKeyboardButton(text="🔁 Check delivery status", callback_data=f"retry_api_delivery_{order_id}")
                 ]]),
@@ -706,10 +767,10 @@ async def retry_api_manual_delivery(callback: CallbackQuery):
     try:
         order = db.query(Order).filter(Order.id == order_id).first()
         is_api_order = bool(order and db.query(ApiOrder.id).filter(ApiOrder.order_id == order_id).first())
-        if not order or not is_api_order or order.delivery_type != "manual" or order.status != "completed" or order.refunded or not order.delivered_account:
+        if not order or order.delivery_type not in {"manual", "hybrid"} or order.status != "completed" or order.refunded or not order.delivered_account:
             await callback.answer("This order is not eligible for delivery retry.", show_alert=True)
             return
-        recipient_id = int(order.delivery_telegram_id or callback.from_user.id)
+        recipient_id = int(order.delivery_telegram_id or (callback.from_user.id if is_api_order else order.telegram_id))
     finally:
         db.close()
 
@@ -719,6 +780,8 @@ async def retry_api_manual_delivery(callback: CallbackQuery):
         await callback.answer(str(exc)[:180], show_alert=True)
         return
     await callback.answer(
-        "Already sent; no duplicate was sent." if result.get("status") == "already_sent" else "Delivery sent.",
+        "Already sent; no duplicate was sent." if result.get("status") == "already_sent" else
+        "Queued. It will be sent after the recipient starts the Delivery Bot." if result.get("status") == "waiting_for_start" else
+        "Delivery sent.",
         show_alert=True,
     )

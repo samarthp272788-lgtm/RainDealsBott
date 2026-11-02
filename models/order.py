@@ -102,6 +102,9 @@ class Order(Base):
         nullable=True,
     )
 
+    # Reserved stock withheld until the buyer submits required order details.
+    reserved_delivery: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     # For a manual reseller API order, this is the reseller's end customer.
     # The separate DELIVERY_BOT_TOKEN bot receives the completed delivery.
     # NULL means deliver using the normal store-bot buyer ID.

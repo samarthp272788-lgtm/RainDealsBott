@@ -69,6 +69,10 @@ class Product(Base):
         default=None,
     )
 
+    # Buyer information requested after checkout, e.g. email, phone, photo.
+    # List entries: {"type": "email|phone|photo|contact|text", "label": "..."}.
+    required_info: Mapped[Optional[list]] = mapped_column(JSON, nullable=True, default=None)
+
     # DECIMAL(20, 8) — always compare/multiply as Decimal.
     price: Mapped[Decimal] = mapped_column(
         Numeric(20, 8),

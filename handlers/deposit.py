@@ -2,10 +2,12 @@
 
 import re
 import uuid
+import secrets
 import logging
 import asyncio
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
 from decimal import Decimal, ROUND_HALF_UP
 
 from aiogram import Router, F
@@ -14,6 +16,7 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    FSInputFile,
 )
 from aiogram.fsm.context import FSMContext
 from sqlalchemy.exc import IntegrityError
@@ -652,15 +655,16 @@ def _apply_promo_to_user(telegram_id: int, promo_code: str, promo_amount: Decima
 # ╚══════════════════════════════════════════════════════════════╝
 
 @router.callback_query(F.data == "deposit_start")
-async def deposit_menu(callback: CallbackQuery):
+async def deposit_menu(callback: CallbackQuery, state: FSMContext):
     """Display the deposit method selection menu."""
     started = time.perf_counter()
     try:
         await callback.answer()
+        await state.clear()
 
         text = (
             f"💰 <b>DEPOSIT FUNDS</b>\n\n"
-            f"<b>Select your preferred payment method:</b>\n\n"
+            f"<b>Choose a payment method.</b> You will create one 5-minute invoice and can switch methods without creating another invoice.\n\n"
             f"{_divider('─', 28)}\n\n"
             f"🟡 <b>USDT (BEP20)</b>\n"
             f"   └ Fast & low fees · Binance Smart Chain\n\n"
@@ -673,7 +677,7 @@ async def deposit_menu(callback: CallbackQuery):
             f"🏷️ <b>Redeem Promocode</b>\n"
             f"   └ Use a promo code to get bonus credits\n\n"
             f"{_divider('─', 28)}\n\n"
-            f"💡 <i>All deposits are verified automatically</i>"
+            f"💡 <i>After paying, submit the transaction reference to verify it automatically.</i>"
         )
 
         await show(
@@ -896,257 +900,219 @@ async def process_promo_code(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.in_(NETWORK_CALLBACKS.keys()))
 async def select_network(callback: CallbackQuery, state: FSMContext):
-    """Create a deposit immediately; the verified reference supplies the amount."""
+    """Select or switch the payment method for a single active invoice."""
     await callback.answer()
-
     network = NETWORK_CALLBACKS[callback.data]
-    network_config = _get_network_info(network)
-    telegram_id = callback.from_user.id
+    data = await state.get_data()
+    deposit_id = data.get("deposit_id")
+    expires_at = data.get("invoice_expires_at")
+    if not deposit_id:
+        active = await asyncio.to_thread(_active_invoice, callback.from_user.id)
+        if active:
+            deposit_id = active["id"]
+            expires_at = active["expires_at"]
+            data = {
+                **data,
+                "deposit_id": active["id"],
+                "invoice_code": active["code"],
+                "invoice_expires_at": active["expires_at"],
+                "amount_usdt": active["amount_usdt"],
+                "network": active["network"],
+            }
+    if deposit_id and expires_at:
+        try:
+            expiry = datetime.fromisoformat(expires_at)
+        except (TypeError, ValueError):
+            expiry = datetime.min
+        if expiry > datetime.utcnow():
+            if not await asyncio.to_thread(_switch_invoice_network, int(deposit_id), network):
+                await callback.message.answer("This invoice is no longer switchable. Start a new deposit.")
+                await state.clear()
+                return
+            await state.update_data(
+                deposit_id=int(deposit_id),
+                invoice_code=data.get("invoice_code"),
+                invoice_expires_at=expires_at,
+                amount_usdt=data.get("amount_usdt"),
+                network=network,
+            )
+            await state.set_state(DepositState.waiting_txid)
+            await _show_invoice(callback, state, int(deposit_id), network, data)
+            return
+        await state.clear()
 
     try:
-        # 0 is the existing database-safe marker for an amount that will be
-        # determined from the submitted UTR/TXID.
-        deposit_id = await asyncio.to_thread(_create_deposit, telegram_id, 0.0, network)
+        invoice = await asyncio.to_thread(_create_invoice, callback.from_user.id, Decimal("0"), network)
     except Exception:
-        logger.exception("Failed to create deposit")
-        await answer_card(callback, "❌ Failed to create deposit. Please try again.")
+        logger.exception("Failed to create payment invoice")
+        await show(callback, "❌ Could not create an invoice. Please try again.", reply_markup=_back_to_menu_kb())
         return
-
-    await state.update_data(network=network, deposit_id=deposit_id)
-
-    if network == "UPI":
-        payment_details = f"<blockquote><code>{getattr(config, 'UPI_ID', '')}</code></blockquote>"
-        reference = "UTR / Transaction ID"
-    elif network == BINANCE_PAY_NETWORK:
-        payment_details = f"<blockquote><code>{BINANCE_PAY_ID}</code></blockquote>"
-        reference = "Binance Pay Order ID"
-    else:
-        payment_details = f"<blockquote><code>{NETWORK_ADDRESSES.get(network, '')}</code></blockquote>"
-        reference = "Transaction Hash (TXID)"
-
-    text = (
-        f"{network_config['icon']} <b>DEPOSIT CREATED</b>\n\n"
-        f"🆔 <b>Deposit ID:</b> <code>#{deposit_id}</code>\n"
-        f"📡 <b>Network:</b> {network_config['label']}\n"
-        f"📊 <b>Status:</b> ⏳ Awaiting Payment\n\n"
-        f"{payment_details}\n\n"
-        f"After payment, send your <b>{reference}</b>.\n"
-        "<i>The amount will be fetched automatically from the payment reference.</i>"
-    )
-    await show(callback, text, parse_mode="HTML", reply_markup=_cancel_kb(), state=state)
+    invoice_data = {
+        **data,
+        "deposit_id": invoice["id"],
+        "invoice_code": invoice["code"],
+        "invoice_expires_at": invoice["expires_at"],
+        "amount_usdt": invoice["amount_usdt"],
+        "network": network,
+    }
+    await state.update_data(**invoice_data)
     await state.set_state(DepositState.waiting_txid)
+    await _show_invoice(callback, state, int(invoice["id"]), network, invoice_data)
 
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║              AMOUNT PROCESSING                              ║
 # ╚══════════════════════════════════════════════════════════════╝
 
-def _create_deposit(telegram_id: int, amount: float, network: str) -> int:
-    """Create a new deposit record."""
+def _create_invoice(telegram_id: int, amount_usdt: Decimal, network: str) -> dict:
+    """Create one five-minute invoice shared by all payment methods."""
     db = SessionLocal()
     try:
+        active = (db.query(Deposit)
+                  .filter(Deposit.telegram_id == telegram_id,
+                          Deposit.status.in_(["waiting_hash", "pending"]),
+                          Deposit.tx_hash.is_(None),
+                          Deposit.invoice_expires_at > datetime.utcnow())
+                  .order_by(Deposit.id.desc()).first())
+        if active:
+            active.network = network
+            active.invoice_usdt_amount = amount_usdt
+            active.amount = Decimal("0") if network in {"UPI", "BINANCE"} else amount_usdt
+            db.commit()
+            return {"id": active.id, "code": active.invoice_code or active.order_id,
+                    "expires_at": active.invoice_expires_at.isoformat(),
+                    "amount_usdt": str(active.invoice_usdt_amount)}
+        code = None
+        for _ in range(8):
+            candidate = f"PAYOUT{secrets.randbelow(900000) + 100000}"
+            if not db.query(Deposit.id).filter(Deposit.invoice_code == candidate).first():
+                code = candidate
+                break
+        if not code:
+            raise RuntimeError("Could not allocate a unique invoice code")
+        expires = datetime.utcnow() + timedelta(minutes=5)
         deposit = Deposit(
             telegram_id=telegram_id,
-            order_id=str(uuid.uuid4()),
-            amount=amount,
+            order_id=code,
+            invoice_code=code,
+            invoice_expires_at=expires,
+            invoice_usdt_amount=amount_usdt,
+            amount=Decimal("0") if network in {"UPI", "BINANCE"} else amount_usdt,
             network=network,
             status="waiting_hash",
         )
         db.add(deposit)
         db.commit()
         db.refresh(deposit)
-        return deposit.id
+        return {"id": deposit.id, "code": code, "expires_at": expires.isoformat(), "amount_usdt": str(amount_usdt)}
     finally:
         db.close()
 
 
-@router.message(DepositState.waiting_amount)
-async def process_amount(message: Message, state: FSMContext):
-    """Validate and process the deposit amount, then go directly to payment details."""
-
+def _active_invoice(telegram_id: int) -> dict | None:
+    db = SessionLocal()
     try:
-        amount = round(float(message.text.strip()), 2)
-        if amount <= 0:
-            raise ValueError
-    except (TypeError, ValueError):
-        await update_card(
-            message, state,
-            (
-                "⚠️ <b>Invalid Amount</b>\n\n"
-                f"{_divider('─', 28)}\n\n"
-                "❌ Please send a valid positive number.\n\n"
-                "<i>Example: 10 or 25.50</i>"
-            ),
-            parse_mode="HTML",
-            reply_markup=_cancel_kb()
-        )
-        return
+        deposit = (db.query(Deposit)
+                   .filter(Deposit.telegram_id == telegram_id,
+                           Deposit.status.in_(["waiting_hash", "pending"]),
+                           Deposit.tx_hash.is_(None),
+                           Deposit.invoice_expires_at > datetime.utcnow())
+                   .order_by(Deposit.id.desc()).first())
+        if not deposit:
+            return None
+        return {"id": deposit.id, "code": deposit.invoice_code or deposit.order_id,
+                "expires_at": deposit.invoice_expires_at.isoformat(),
+                "amount_usdt": str(deposit.invoice_usdt_amount or 0),
+                "network": deposit.network}
+    finally:
+        db.close()
 
-    data = await state.get_data()
-    network = data.get("network")
-    network_config = _get_network_info(network)
-    telegram_id = message.from_user.id
 
-    await state.update_data(amount=amount)
+def _switch_invoice_network(deposit_id: int, network: str) -> bool:
+    db = SessionLocal()
+    try:
+        deposit = db.query(Deposit).filter(Deposit.id == deposit_id).first()
+        if not deposit or deposit.status not in {"waiting_hash", "pending"} or deposit.tx_hash:
+            return False
+        if deposit.invoice_expires_at and deposit.invoice_expires_at <= datetime.utcnow():
+            return False
+        deposit.network = network
+        deposit.amount = Decimal("0") if network in {"UPI", "BINANCE"} else Decimal(str(deposit.invoice_usdt_amount or 0))
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
-    timestamp = _format_timestamp()
-    amount_formatted = _format_amount(amount, network)
 
-    # ═══════════════════════════════════════════════════════
-    # UPI
-    # ═══════════════════════════════════════════════════════
+def _invoice_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🟡 BEP20", callback_data="deposit_bep20"),
+         InlineKeyboardButton(text="🟣 Polygon", callback_data="deposit_polygon")],
+        [InlineKeyboardButton(text="🟢 UPI", callback_data="deposit_upi"),
+         InlineKeyboardButton(text="🔴 Binance Pay", callback_data="deposit_binance")],
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="deposit_start")],
+    ])
+
+
+def _invoice_payload(network: str, data: dict) -> tuple[str, str | None]:
+    code = data.get("invoice_code", "")
+    expiry = datetime.fromisoformat(data["invoice_expires_at"])
+    remaining = max(0, int((expiry - datetime.utcnow()).total_seconds()))
+    mins, secs = divmod(remaining, 60)
+    common = (
+        f"🧾 <b>Invoice:</b> <code>{code}</code>\n"
+        f"⏳ <b>Expires in:</b> {mins}:{secs:02d}\n\n"
+    )
+    qr = None
     if network == "UPI":
-        upi_id = getattr(config, "UPI_ID", None)
-        if not upi_id:
-            logger.error("UPI_ID not configured")
-            await state.clear()
-            await update_card(
-                message, state,
-                (
-                    f"⚠️ <b>Method Unavailable</b>\n\n"
-                    f"{_divider('─', 28)}\n\n"
-                    f"❌ UPI payments are not available right now.\n"
-                    f"Please choose another payment method."
-                ),
-                parse_mode="HTML",
-                reply_markup=_back_to_menu_kb(),
-            )
-            return
-
-        payment_info = (
-            f"🟢 <b>UPI Payment Details</b>\n\n"
-            f"<blockquote><code>{upi_id}</code></blockquote>\n"
-            f"<b>Amount to Pay:</b> ₹{amount:,.2f}\n\n"
-            f"📱 Open any UPI app (GPay, PhonePe, Paytm)\n"
-            f"🔍 Scan or enter the UPI ID above\n"
-            f"💳 Enter amount: <b>₹{amount:,.2f}</b>\n"
-            f"✅ Complete the payment\n\n"
-            f"<b>📋 After payment, send:</b>\n"
-            f"UTR / Transaction ID\n"
-            f"(12-digit number or app ref like FMPIB6269486679)"
-        )
-        instruction_note = "📱 Complete your UPI payment and send the UTR/Transaction reference here."
-
-    # ═══════════════════════════════════════════════════════
-    # BINANCE PAY
-    # ═══════════════════════════════════════════════════════
-    elif network == BINANCE_PAY_NETWORK:
-        if not BINANCE_PAY_ID:
-            logger.error("BINANCE_PAY_ID not configured")
-            await state.clear()
-            await update_card(
-                message, state,
-                (
-                    f"⚠️ <b>Method Unavailable</b>\n\n"
-                    f"{_divider('─', 28)}\n\n"
-                    f"❌ Binance Pay is not available right now.\n"
-                    f"Please choose another payment method."
-                ),
-                parse_mode="HTML",
-                reply_markup=_back_to_menu_kb(),
-            )
-            return
-
-        payment_info = (
-            f"🔴 <b>Binance Pay Details</b>\n\n"
-            f"<b>Pay ID:</b>\n"
-            f"<blockquote><code>{BINANCE_PAY_ID}</code></blockquote>\n\n"
-            f"<b>Amount to Send:</b> {amount_formatted}\n\n"
-            f"📱 Open Binance App\n"
-            f"💳 Go to Pay → Send\n"
-            f"🔍 Enter Pay ID above\n"
-            f"💵 Enter amount: <b>${amount:,.2f} USDT</b>\n"
-            f"✅ Confirm & send\n\n"
-            f"<b>📋 After payment, send:</b>\n"
-            f"Order ID from your Binance Pay receipt"
-        )
-        instruction_note = "💳 Complete your Binance Pay transfer and send the Order ID."
-
-    # ═══════════════════════════════════════════════════════
-    # CRYPTO (BEP20 / POLYGON)
-    # ═══════════════════════════════════════════════════════
+        body = (f"🟢 <b>UPI payment</b>\n{common}"
+                f"UPI ID: <code>{getattr(config, 'UPI_ID', '')}</code>\n\n"
+                "Pay any amount using the QR/UPI ID. The verified transfer amount is converted and credited. ")
+        qr = getattr(config, "UPI_QR_FILE", "")
+        reference = "UTR / transaction reference"
     elif network in CRYPTO_NETWORKS:
-        address = NETWORK_ADDRESSES.get(network)
-        if not address:
-            logger.error("No receive address for network %s", network)
-            await state.clear()
-            await update_card(
-                message, state,
-                (
-                    f"⚠️ <b>Network Unavailable</b>\n\n"
-                    f"{_divider('─', 28)}\n\n"
-                    f"❌ {network_config['label']} is not available right now."
-                ),
-                parse_mode="HTML",
-                reply_markup=_back_to_menu_kb(),
-            )
-            return
-
-        payment_info = (
-            f"{network_config['icon']} <b>{network_config['label']} Deposit Address</b>\n\n"
-            f"<blockquote><code>{address}</code></blockquote>\n\n"
-            f"<b>Amount to Send:</b> {amount_formatted}\n\n"
-            f"⚠️ <b>Important:</b>\n"
-            f"• Send only USDT on <b>{network_config['description']}</b>\n"
-            f"• Min confirmations required: 12\n"
-            f"• Do not send from an exchange using a different network\n\n"
-            f"<b>📋 After sending, paste:</b>\n"
-            f"Transaction Hash (TXID)\n"
-            f"(starts with 0x, 66 characters total)"
-        )
-        instruction_note = "📤 Send the exact amount to the address above, then paste the TXID here."
-
+        address = NETWORK_ADDRESSES.get(network, "")
+        body = (f"{_get_network_info(network)['icon']} <b>{_get_network_info(network)['label']}</b>\n{common}"
+                f"Send USDT to:\n<code>{address}</code>\n\n"
+                "Send the USDT amount you choose on this network. The verified amount is credited.")
+        qr = getattr(config, f"{network}_QR_FILE", "")
+        reference = "Transaction hash (TXID)"
     else:
-        logger.error("Unknown network %s", network)
-        await state.clear()
-        await update_card(
-            message, state,
-            "❌ <b>Error</b>\n\nSomething went wrong. Please start a new deposit.",
-            parse_mode="HTML",
-            reply_markup=_back_to_menu_kb(),
-        )
-        return
+        body = (f"🔴 <b>Binance Pay</b>\n{common}"
+                f"Pay ID: <code>{BINANCE_PAY_ID}</code>\n\n"
+                "Pay the amount you choose, then submit the Binance Pay transaction/order reference. The verified amount is credited.")
+        reference = "Binance Pay reference"
+    body += f"\n\n📋 After paying, send your <b>{reference}</b>.\nYou can switch methods above; the invoice code and expiry stay the same."
+    return body, qr
 
-    # Create deposit record
-    try:
-        deposit_id = await asyncio.to_thread(
-            _create_deposit, telegram_id, amount, network
-        )
-    except Exception as e:
-        logger.exception("Failed to create deposit: %s", e)
-        await update_card(
-            message, state,
-            "❌ <b>Error</b>\n\nFailed to create deposit. Please try again.",
-            parse_mode="HTML",
-            reply_markup=_cancel_kb(),
-        )
-        return
 
-    await state.update_data(deposit_id=deposit_id)
-
-    text = (
-        f"{network_config['icon']} <b>DEPOSIT CREATED</b>\n\n"
-        f"<b>📋 Deposit Details</b>\n"
-        f"{_divider('─', 28)}\n\n"
-        f"🆔 <b>Deposit ID:</b> <code>#{deposit_id}</code>\n"
-        f"📡 <b>Network:</b> {network_config['icon']} {network_config['label']}\n"
-        f"💰 <b>Amount:</b> {amount_formatted}\n"
-        f"🕐 <b>Created:</b> {timestamp}\n"
-        f"📊 <b>Status:</b> ⏳ Awaiting Payment\n\n"
-        f"{_divider('═', 28)}\n\n"
-        f"{payment_info}\n\n"
-        f"{_divider('═', 28)}\n\n"
-        f"💡 {instruction_note}"
-    )
-
-    await update_card(
-        message, state,
-        text,
-        parse_mode="HTML",
-        reply_markup=_cancel_kb(),
-    )
-
-    await state.set_state(DepositState.waiting_txid)
+async def _show_invoice(target, state: FSMContext, deposit_id: int, network: str, data: dict):
+    body, qr = _invoice_payload(network, data)
+    if isinstance(target, CallbackQuery):
+        await show(target, body, parse_mode="HTML", reply_markup=_invoice_keyboard(), state=state)
+        bot = target.bot
+        chat_id = target.message.chat.id
+    else:
+        await update_card(target, state, body, parse_mode="HTML", reply_markup=_invoice_keyboard())
+        bot = target.bot
+        chat_id = target.chat.id
+    previous_photo = data.get("invoice_photo_message_id")
+    if previous_photo:
+        try:
+            await bot.delete_message(chat_id, int(previous_photo))
+        except Exception:
+            pass
+    if qr:
+        try:
+            path = Path(qr)
+            photo = FSInputFile(path) if path.is_file() else qr
+            sent = await bot.send_photo(chat_id=chat_id, photo=photo, caption=f"Invoice {data.get('invoice_code')} · {_get_network_info(network)['label']}")
+            await state.update_data(invoice_photo_message_id=sent.message_id)
+        except Exception:
+            logger.exception("Could not send configured %s QR image", network)
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -1167,6 +1133,10 @@ def _save_txid(deposit_id: int, txid: str) -> str:
         deposit = db.query(Deposit).filter(Deposit.id == deposit_id).first()
         if not deposit:
             return "not_found"
+        if deposit.invoice_expires_at and deposit.invoice_expires_at <= datetime.utcnow():
+            deposit.status = "expired"
+            db.commit()
+            return "expired"
         deposit.tx_hash = txid
         try:
             db.commit()
@@ -1281,6 +1251,13 @@ async def process_txid(message: Message, state: FSMContext):
             parse_mode="HTML",
             reply_markup=_back_to_menu_kb(),
         )
+        return
+    if result == "expired":
+        await state.clear()
+        await update_card(message, None,
+            "⏰ <b>Invoice expired</b>\n\nThis five-minute invoice has expired. Start a new deposit to get a fresh invoice.",
+            chat_id=card_chat_id, message_id=card_message_id,
+            parse_mode="HTML", reply_markup=_status_kb("failure", network))
         return
     if result == "duplicate":
         await update_card(

@@ -26,6 +26,10 @@ class Deposit(Base):
         unique=True
     )
 
+    invoice_code = Column(String(32), unique=True, nullable=True, index=True)
+    invoice_expires_at = Column(DateTime, nullable=True, index=True)
+    invoice_usdt_amount = Column(DECIMAL(20, 8), nullable=True)
+
     tx_hash = Column(
         String(255),
         unique=True,

@@ -14,6 +14,7 @@ class AddProduct(StatesGroup):
     description = State()
     delivery_type = State()
     delivery_instruction = State()
+    required_info = State()
     preorder = State()
     bulk_pricing = State()
     accounts = State()
@@ -32,6 +33,7 @@ class EditProduct(StatesGroup):
     new_value = State()
     name = State()
     category = State()
+    required_info = State()
 
 
 class AddStock(StatesGroup):
@@ -57,4 +59,8 @@ class EditAccounts(StatesGroup):
 class EditBulkPricing(StatesGroup):
     select_product = State()
     pricing = State()
+    waiting_input = State()
+
+
+class OrderRequirementStates(StatesGroup):
     waiting_input = State()

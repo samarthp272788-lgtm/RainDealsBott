@@ -1,5 +1,6 @@
 
 from utils.ui import answer_card
+from utils.uploads import text_from_message
 import json
 import logging
 from decimal import Decimal
@@ -1329,6 +1330,7 @@ async def product_price(message: Message, state: FSMContext):
                     is_active=True,
                     delivery_type=data.get("delivery_type", "automatic"),
                     delivery_instruction=data.get("delivery_instruction", None),
+                    required_info=None,
                     preorder=False,
                     bulk_pricing=None,
                     low_stock_threshold=3,
@@ -1485,7 +1487,7 @@ async def product_delivery(message: Message, state: FSMContext):
 
 @router.message(AddProduct.delivery_instruction)
 async def product_delivery_instruction(message: Message, state: FSMContext):
-    """Step 8/10: Ask if preorder is allowed."""
+    """Ask which buyer details are required for this product."""
     if message.from_user.id not in ADMIN_IDS:
         return
 
@@ -1498,19 +1500,55 @@ async def product_delivery_instruction(message: Message, state: FSMContext):
         instruction = None
 
     await state.update_data(delivery_instruction=instruction)
-    await state.set_state(AddProduct.preorder)
+    await state.set_state(AddProduct.required_info)
 
     await answer_card(message,
         f"✅ <b>Delivery Instruction:</b> {_esc(instruction) if instruction else '(none set)'}\n\n"
         f"{_divider('─')}\n\n"
-        f"✏️ <b>Step 8/10: Preorder</b>\n\n"
-        f"Allow preorders when out of stock?\n\n"
-        f"📦 <b>What are preorders?</b>\n"
-        f"Users can buy even when stock is 0.\n"
-        f"They'll receive the product when restocked.\n\n"
-        f"Send: <b>yes</b> or <b>no</b>",
+        f"✏️ <b>Step 8/11: Buyer information</b> <i>(Optional)</i>\n\n"
+        f"If fulfillment needs details from the buyer, enter one requirement per line.\n"
+        f"After buying, the customer will open My Orders and use <b>Send information</b>.\n\n"
+        f"Formats:\n"
+        f"<code>email:Email address</code>\n"
+        f"<code>phone:Contact number</code>\n"
+        f"<code>photo:Upload a screenshot</code>\n"
+        f"<code>contact:Share your Telegram contact</code>\n"
+        f"<code>text:Other required information</code>\n\n"
+        f"Send <b>skip</b> if no buyer information is needed.",
         parse_mode="HTML"
     )
+
+
+@router.message(AddProduct.required_info)
+async def product_required_info(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS or not message.text:
+        return
+    raw = message.text.strip()
+    requirements = []
+    if raw.lower() not in {"skip", "none", "no", "n"}:
+        allowed = {"email", "phone", "photo", "contact", "text"}
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            kind, sep, label = line.partition(":")
+            kind = kind.strip().lower()
+            if kind not in allowed:
+                await answer_card(message,
+                    "❌ Use <code>email</code>, <code>phone</code>, <code>photo</code>, "
+                    "<code>contact</code>, or <code>text</code>. Example: "
+                    "<code>email:Customer email</code>", parse_mode="HTML")
+                return
+            requirements.append({"type": kind, "label": (label.strip() if sep and label.strip() else kind.title())[:100]})
+        if len(requirements) > 8:
+            await answer_card(message, "❌ You can add up to 8 required fields.")
+            return
+    await state.update_data(required_info=requirements or None)
+    await state.set_state(AddProduct.preorder)
+    await answer_card(message,
+        f"✅ Buyer information fields: <b>{len(requirements)}</b>\n\n"
+        "✏️ <b>Step 9: Preorder</b>\nAllow orders when stock is empty? Send <b>yes</b> or <b>no</b>.",
+        parse_mode="HTML")
 
 
 @router.message(AddProduct.preorder)
@@ -1655,11 +1693,17 @@ async def save_product(message: Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         return
 
-    if not message.text:
+    try:
+        account_text = await text_from_message(message)
+    except ValueError as exc:
+        await answer_card(message, f"❌ {_esc(str(exc))}")
+        return
+    if account_text is None:
+        await answer_card(message, "Send account lines as text or upload a .txt/.csv file. Send <b>skip</b> for no stock.", parse_mode="HTML")
         return
 
     data = await state.get_data()
-    raw_text = message.text.strip()
+    raw_text = account_text.strip()
 
     # Handle accounts
     if raw_text.lower() in ("skip", "none", "no", ""):
@@ -1687,6 +1731,7 @@ async def save_product(message: Message, state: FSMContext):
             is_active=True,
             delivery_type=data.get("delivery_type", "automatic"),
             delivery_instruction=data.get("delivery_instruction", None),
+            required_info=data.get("required_info"),
             preorder=data.get("preorder", False),
             bulk_pricing=data.get("bulk_pricing", None),
             low_stock_threshold=3,
@@ -1723,6 +1768,7 @@ async def save_product(message: Message, state: FSMContext):
         f"💰 <b>Base Price:</b> ${float(product.price):.2f}",
         f"📊 <b>Stock:</b> {product.stock}",
         f"🚚 <b>Delivery:</b> {product.delivery_type}",
+        f"🧾 <b>Buyer details required:</b> {len(product.required_info or [])}",
         f"📦 <b>Preorder:</b> {'🟢 Yes' if product.preorder else '🔴 No'}",
     ]
 
