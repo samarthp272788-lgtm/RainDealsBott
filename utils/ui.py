@@ -377,6 +377,8 @@ async def update_card(
     delete_input: bool = True,
     chat_id: int | None = None,
     message_id: int | None = None,
+    owner_id: int | None = None,
+    replace_media: bool = False,
     **extra,
 ):
     """
@@ -407,11 +409,27 @@ async def update_card(
         chat_id = chat_id or data.get(_CARD_CHAT_ID_KEY)
         message_id = message_id or data.get(_CARD_MESSAGE_ID_KEY)
 
-    if (chat_id is None or message_id is None) and message.from_user:
-        remembered = _CARD_LOCATIONS.get((message.from_user.id, message.chat.id))
+    card_owner_id = int(owner_id or (message.from_user.id if message.from_user else 0))
+    if (chat_id is None or message_id is None) and card_owner_id:
+        remembered = _CARD_LOCATIONS.get((card_owner_id, message.chat.id))
         if remembered:
             chat_id = chat_id or remembered[0]
             message_id = message_id or remembered[1]
+
+    if chat_id and message_id and replace_media:
+        try:
+            await message.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception:
+            pass
+        msg = await message.answer(text, **_kwargs(reply_markup, parse_mode, extra))
+        if state is not None:
+            await state.update_data(
+                **{_CARD_CHAT_ID_KEY: msg.chat.id, _CARD_MESSAGE_ID_KEY: msg.message_id}
+            )
+        if card_owner_id:
+            _remember_card(card_owner_id, msg.chat.id, msg.message_id)
+            schedule_success_notice(msg, text, owner_id=card_owner_id)
+        return msg
 
     if chat_id and message_id:
         _cancel_scheduled_card_transition(chat_id, message_id)
@@ -461,9 +479,9 @@ async def update_card(
                 await state.update_data(
                     **{_CARD_CHAT_ID_KEY: msg.chat.id, _CARD_MESSAGE_ID_KEY: msg.message_id}
                 )
-            if message.from_user:
-                _remember_card(message.from_user.id, msg.chat.id, msg.message_id)
-                schedule_success_notice(msg, text, owner_id=message.from_user.id)
+            if card_owner_id:
+                _remember_card(card_owner_id, msg.chat.id, msg.message_id)
+                schedule_success_notice(msg, text, owner_id=card_owner_id)
             return msg
 
     msg = await message.answer(text, **kwargs)
@@ -471,9 +489,9 @@ async def update_card(
         await state.update_data(
             **{_CARD_CHAT_ID_KEY: msg.chat.id, _CARD_MESSAGE_ID_KEY: msg.message_id}
         )
-    if message.from_user:
-        _remember_card(message.from_user.id, msg.chat.id, msg.message_id)
-        schedule_success_notice(msg, text, owner_id=message.from_user.id)
+    if card_owner_id:
+        _remember_card(card_owner_id, msg.chat.id, msg.message_id)
+        schedule_success_notice(msg, text, owner_id=card_owner_id)
     return msg
 
 

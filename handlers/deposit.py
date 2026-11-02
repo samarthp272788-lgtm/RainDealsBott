@@ -640,6 +640,17 @@ async def deposit_menu(callback: CallbackQuery, state: FSMContext):
     started = time.perf_counter()
     try:
         await callback.answer()
+        verifying = await asyncio.to_thread(_submitted_invoice, callback.from_user.id)
+        if verifying:
+            await state.clear()
+            await show(
+                callback,
+                _verification_pending_text(verifying),
+                parse_mode="HTML",
+                reply_markup=_verification_pending_keyboard(),
+                replace_media=bool(callback.message.photo),
+            )
+            return
         active = await asyncio.to_thread(_active_invoice, callback.from_user.id)
         if active:
             await state.update_data(
@@ -892,6 +903,17 @@ async def select_network(callback: CallbackQuery, state: FSMContext):
     """Select or switch the payment method for a single active invoice."""
     await callback.answer()
     network = NETWORK_CALLBACKS[callback.data]
+    verifying = await asyncio.to_thread(_submitted_invoice, callback.from_user.id)
+    if verifying:
+        await state.clear()
+        await show(
+            callback,
+            _verification_pending_text(verifying),
+            parse_mode="HTML",
+            reply_markup=_verification_pending_keyboard(),
+            replace_media=bool(callback.message.photo),
+        )
+        return
     data = await state.get_data()
     deposit_id = data.get("deposit_id")
     expires_at = data.get("invoice_expires_at")
@@ -936,6 +958,16 @@ async def select_network(callback: CallbackQuery, state: FSMContext):
         logger.exception("Failed to create payment invoice")
         await show(callback, "❌ Could not create an invoice. Please try again.", reply_markup=_back_to_menu_kb())
         return
+    if invoice.get("verification_pending"):
+        await state.clear()
+        await show(
+            callback,
+            _verification_pending_text(invoice),
+            parse_mode="HTML",
+            reply_markup=_verification_pending_keyboard(),
+            replace_media=bool(callback.message.photo),
+        )
+        return
     invoice_data = {
         **data,
         "deposit_id": invoice["id"],
@@ -957,6 +989,22 @@ def _create_invoice(telegram_id: int, amount_usdt: Decimal, network: str) -> dic
     """Create one five-minute invoice shared by all payment methods."""
     db = SessionLocal()
     try:
+        # Serialize invoice creation per user. Simultaneous taps then observe
+        # and reuse the same active invoice rather than creating duplicates.
+        user = (
+            db.query(User)
+            .filter(User.telegram_id == telegram_id)
+            .with_for_update()
+            .first()
+        )
+        if not user:
+            raise RuntimeError("Cannot create a deposit invoice for an unknown user")
+
+        verifying = _submitted_invoice_from_db(db, telegram_id)
+        if verifying:
+            verifying["verification_pending"] = True
+            return verifying
+
         active = (db.query(Deposit)
                   .filter(Deposit.telegram_id == telegram_id,
                           Deposit.status.in_(["waiting_hash", "pending"]),
@@ -1015,6 +1063,59 @@ def _active_invoice(telegram_id: int) -> dict | None:
                 "network": deposit.network}
     finally:
         db.close()
+
+
+def _submitted_invoice_from_db(db, telegram_id: int) -> dict | None:
+    deposit = (
+        db.query(Deposit)
+        .filter(
+            Deposit.telegram_id == telegram_id,
+            Deposit.status.in_(["waiting_hash", "pending"]),
+            Deposit.tx_hash.isnot(None),
+        )
+        .order_by(Deposit.id.desc())
+        .first()
+    )
+    if not deposit:
+        return None
+    return {
+        "id": deposit.id,
+        "code": deposit.invoice_code or deposit.order_id,
+        "network": deposit.network or "",
+        "tx_hash": deposit.tx_hash or "",
+        "status": deposit.status,
+    }
+
+
+def _submitted_invoice(telegram_id: int) -> dict | None:
+    db = SessionLocal()
+    try:
+        return _submitted_invoice_from_db(db, telegram_id)
+    finally:
+        db.close()
+
+
+def _verification_pending_text(deposit: dict) -> str:
+    reference = str(deposit.get("tx_hash") or "")
+    if len(reference) > 28:
+        reference = reference[:24] + "..."
+    network = _get_network_info(str(deposit.get("network") or ""))
+    return (
+        "⏳ <b>PAYMENT VERIFICATION IN PROGRESS</b>\n\n"
+        f"🆔 <b>Deposit:</b> <code>#{deposit.get('id')}</code>\n"
+        f"🧾 <b>Invoice:</b> <code>{escape(str(deposit.get('code') or ''))}</code>\n"
+        f"📡 <b>Network:</b> {network['icon']} {escape(network['label'])}\n"
+        f"🔑 <b>Reference:</b> <code>{escape(reference or 'Submitted')}</code>\n\n"
+        "Your reference is already saved. The bot will keep checking this payment; "
+        "you do not need another invoice or to submit it again."
+    )
+
+
+def _verification_pending_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📜 My Deposits", callback_data="my_deposits")],
+        [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu")],
+    ])
 
 
 def _switch_invoice_network(deposit_id: int, network: str) -> bool:

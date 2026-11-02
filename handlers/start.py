@@ -18,7 +18,7 @@ from models.user import User
 from config import ADMIN_IDS, CHANNEL_LINK, GROUP_LINK, TOS_LINK
 
 from keyboards.menu import get_main_menu, get_admin_main_menu
-from utils.ui import show, answer_card
+from utils.ui import show, answer_card, update_card
 
 # Membership check
 from middleware.membership import check_user_membership, get_join_keyboard
@@ -221,19 +221,38 @@ def _build_start_welcome(
     )
 
 
-def _load_main_menu_text(
+def _load_main_menu_data(
     telegram_id: int,
     full_name: str,
     username: str | None,
     bot_username: str,
-) -> str | None:
+) -> dict | None:
     """Load home-menu data without blocking aiogram's event loop."""
     db = SessionLocal()
     try:
         user = db.query(User).filter(User.telegram_id == telegram_id).first()
         if not user:
             return None
-        return _build_start_welcome(user, full_name, telegram_id, username, bot_username)
+        return {
+            "text": _build_start_welcome(user, full_name, telegram_id, username, bot_username),
+            "chat_id": user.home_menu_chat_id,
+            "message_id": user.home_menu_message_id,
+        }
+    finally:
+        db.close()
+
+
+def _save_home_menu_location(telegram_id: int, chat_id: int, message_id: int) -> None:
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.telegram_id == telegram_id).first()
+        if user:
+            user.home_menu_chat_id = int(chat_id)
+            user.home_menu_message_id = int(message_id)
+            db.commit()
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 
@@ -282,25 +301,45 @@ async def main_menu_cb(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
     bot_username = await _get_bot_username(callback.bot)
-    text = await asyncio.to_thread(
-        _load_main_menu_text,
+    menu_data = await asyncio.to_thread(
+        _load_main_menu_data,
         callback.from_user.id,
         callback.from_user.full_name,
         callback.from_user.username,
         bot_username,
     )
-    if text is None:
+    if menu_data is None:
         await answer_card(callback, "User record not found. Send /start to register again.")
         return
 
     keyboard = get_admin_main_menu() if callback.from_user.id in ADMIN_IDS else get_main_menu()
-    await show(
-        callback,
-        text,
+    target_chat_id = int(menu_data.get("chat_id") or callback.message.chat.id)
+    target_message_id = int(menu_data.get("message_id") or callback.message.message_id)
+    menu_card = await update_card(
+        callback.message,
+        text=menu_data["text"],
         reply_markup=keyboard,
         parse_mode="HTML",
-        replace_media=bool(callback.message.photo),
+        delete_input=False,
+        chat_id=target_chat_id,
+        message_id=target_message_id,
+        owner_id=callback.from_user.id,
+        replace_media=bool(callback.message.photo and target_message_id == callback.message.message_id),
+        disable_web_page_preview=True,
     )
+    final_message_id = int(menu_card.message_id) if menu_card else target_message_id
+    final_chat_id = int(menu_card.chat.id) if menu_card else target_chat_id
+    await asyncio.to_thread(
+        _save_home_menu_location,
+        callback.from_user.id,
+        final_chat_id,
+        final_message_id,
+    )
+    if callback.message.message_id != final_message_id:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
 
 
 @router.callback_query(F.data == "my_profile")
@@ -422,6 +461,8 @@ def _get_or_create_user(telegram_id: int, username: str, full_name: str, ref_pay
                 "total_spent": user.total_spent,
                 "referral_earnings": user.referral_earnings,
                 "referral_code": user.referral_code,
+                "home_menu_chat_id": user.home_menu_chat_id,
+                "home_menu_message_id": user.home_menu_message_id,
             },
         }
 
@@ -431,11 +472,15 @@ def _get_or_create_user(telegram_id: int, username: str, full_name: str, ref_pay
 # ╚══════════════════════════════════════════════════════════════╝
 
 @router.message(CommandStart())
-async def start_cmd(message: Message, command: CommandObject):
+async def start_cmd(message: Message, command: CommandObject, state: FSMContext):
     # This bot's user flow is private-chat only. In particular, never expose
     # join-required prompts in order/stock notification groups.
     if message.chat.type != "private":
         return
+
+    # Reset only transient prompts. Any unpaid/pending invoice remains in the
+    # database and is reused/reported by the deposit flow after /start.
+    await state.clear()
 
     telegram_id = message.from_user.id
     start_payload = (command.args or "").strip() if command else ""
@@ -495,7 +540,21 @@ async def start_cmd(message: Message, command: CommandObject):
     user.full_name = full_name
     text = _build_start_welcome(user, full_name, telegram_id, username, bot_username)
     keyboard = get_admin_main_menu() if is_admin else get_main_menu()
-    await answer_card(message,
-        text, reply_markup=keyboard, parse_mode="HTML",
-        disable_web_page_preview=True
+    menu_card = await update_card(
+        message,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode="HTML",
+        delete_input=True,
+        chat_id=result["profile"].get("home_menu_chat_id"),
+        message_id=result["profile"].get("home_menu_message_id"),
+        owner_id=telegram_id,
+        disable_web_page_preview=True,
     )
+    if menu_card:
+        await asyncio.to_thread(
+            _save_home_menu_location,
+            telegram_id,
+            int(menu_card.chat.id),
+            int(menu_card.message_id),
+        )

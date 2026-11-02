@@ -47,6 +47,11 @@ class User(Base):
 
     username: Mapped[Optional[str]] = mapped_column(String(100))
 
+    # Keep one durable home-menu card per Telegram user so /start and
+    # Main Menu can edit it even after a bot restart.
+    home_menu_chat_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    home_menu_message_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+
     full_name: Mapped[str] = mapped_column(
         String(255),
         nullable=False,

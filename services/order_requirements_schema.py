@@ -18,6 +18,8 @@ def _ensure_column(connection, table: str, column: str, definition: str) -> None
 def ensure_order_requirements_schema() -> None:
     Base.metadata.create_all(bind=engine, tables=[OrderRequirementSubmission.__table__])
     with engine.begin() as connection:
+        _ensure_column(connection, "users", "home_menu_chat_id", "BIGINT NULL")
+        _ensure_column(connection, "users", "home_menu_message_id", "BIGINT NULL")
         _ensure_column(connection, "products", "required_info", "JSON NULL")
         _ensure_column(connection, "orders", "reserved_delivery", "TEXT NULL")
         _ensure_column(connection, "deposits", "invoice_code", "VARCHAR(32) NULL")
