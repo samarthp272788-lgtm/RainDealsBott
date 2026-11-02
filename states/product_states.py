@@ -48,12 +48,14 @@ class DeleteProduct(StatesGroup):
 class AddAccounts(StatesGroup):
     select_product = State()
     accounts = State()
+    confirm = State()
 
 
 class EditAccounts(StatesGroup):
     select_product = State()
     accounts = State()
     replace_accounts = State()
+    confirm_replace = State()
 
 
 class EditBulkPricing(StatesGroup):

@@ -38,6 +38,7 @@ from models.provider import Provider
 from models.custom_rate import CustomRate
 from models.rate_control import ProductRateControl, RateControlAssignment
 from models.manager_auth import ManagerLoginChallenge
+from models.admin_audit_log import AdminAuditLog
 
 from keyboards.admin_menu import get_admin_panel
 from keyboards.menu import get_admin_main_menu
@@ -458,6 +459,71 @@ async def admin_panel(callback: CallbackQuery, state: FSMContext):
         text,
         reply_markup=_get_admin_panel_with_providers(),
         parse_mode="HTML"
+    )
+
+
+def _load_admin_audit_page(page: int, page_size: int = 10) -> tuple[list, int]:
+    db = SessionLocal()
+    try:
+        query = db.query(AdminAuditLog).order_by(AdminAuditLog.created_at.desc(), AdminAuditLog.id.desc())
+        total = query.count()
+        page = max(0, min(page, max((total - 1) // page_size, 0)))
+        rows = query.offset(page * page_size).limit(page_size).all()
+        return ([{
+            "id": row.id,
+            "admin_id": row.admin_telegram_id,
+            "action": row.action,
+            "entity_type": row.entity_type,
+            "entity_id": row.entity_id,
+            "summary": row.summary,
+            "created_at": row.created_at,
+        } for row in rows], total)
+    finally:
+        db.close()
+
+
+@router.callback_query(F.data == "admin_audit")
+@router.callback_query(F.data.startswith("admin_audit_page_"))
+async def admin_audit(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    try:
+        page = int(callback.data.rsplit("_", 1)[1]) if callback.data.startswith("admin_audit_page_") else 0
+    except ValueError:
+        page = 0
+    page_size = 10
+    rows, total = await asyncio.to_thread(_load_admin_audit_page, page, page_size)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    lines = [f"🧾 <b>ADMIN ACTIVITY LOG</b> · {page + 1}/{total_pages}\n"]
+    if not rows:
+        lines.append("No tracked admin changes yet.")
+    for row in rows:
+        when = row["created_at"].strftime("%Y-%m-%d %H:%M:%S") if row["created_at"] else "time unavailable"
+        summary = html_escape(row["summary"] or "")
+        entity = html_escape(f"{row['entity_type']} #{row['entity_id']}".strip())
+        action = html_escape(row["action"])
+        lines.append(
+            f"<b>{action}</b> · {entity}\n"
+            f"Admin <code>{row['admin_id']}</code> · {when}\n"
+            f"{summary}\n"
+        )
+    keyboard = []
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton(text="⬅ Older", callback_data=f"admin_audit_page_{page - 1}"))
+    if page + 1 < total_pages:
+        navigation.append(InlineKeyboardButton(text="Newer ➡", callback_data=f"admin_audit_page_{page + 1}"))
+    if navigation:
+        keyboard.append(navigation)
+    keyboard.append([InlineKeyboardButton(text="⬅ Admin Panel", callback_data="admin_panel")])
+    await callback.answer()
+    await _safe_edit_text(
+        callback.message,
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
     )
 
 

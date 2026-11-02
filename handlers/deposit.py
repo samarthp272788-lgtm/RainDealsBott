@@ -981,6 +981,85 @@ async def select_network(callback: CallbackQuery, state: FSMContext):
     await _show_invoice(callback, state, int(invoice["id"]), network, invoice_data)
 
 
+def _load_invoice_for_resume(telegram_id: int, deposit_id: int) -> dict | None:
+    db = SessionLocal()
+    try:
+        deposit = db.query(Deposit).filter(
+            Deposit.id == deposit_id,
+            Deposit.telegram_id == telegram_id,
+            Deposit.status.in_(["waiting_hash", "pending"]),
+        ).first()
+        if not deposit:
+            return None
+        return {
+            "id": deposit.id,
+            "code": deposit.invoice_code or deposit.order_id,
+            "network": deposit.network or "",
+            "expires_at": deposit.invoice_expires_at.isoformat() if deposit.invoice_expires_at else None,
+            "amount_usdt": str(deposit.invoice_usdt_amount or 0),
+            "tx_hash": deposit.tx_hash,
+            "status": deposit.status,
+            "telegram_chat_id": deposit.telegram_chat_id,
+            "telegram_message_id": deposit.telegram_message_id,
+        }
+    finally:
+        db.close()
+
+
+@router.callback_query(F.data.startswith("resume_deposit_"))
+async def resume_deposit(callback: CallbackQuery, state: FSMContext):
+    """Resume the user's existing invoice or show its submitted payment status."""
+    try:
+        deposit_id = int(callback.data.rsplit("_", 1)[1])
+    except (TypeError, ValueError):
+        await callback.answer("Invalid invoice.", show_alert=True)
+        return
+    await callback.answer()
+
+    invoice = await asyncio.to_thread(_load_invoice_for_resume, callback.from_user.id, deposit_id)
+    if not invoice:
+        await show(
+            callback,
+            "ℹ️ <b>This invoice is no longer active.</b>\n\nOpen Wallet to create a new invoice if you still need to deposit.",
+            parse_mode="HTML",
+            reply_markup=_back_to_menu_kb(),
+        )
+        return
+
+    if invoice.get("tx_hash"):
+        await show(
+            callback,
+            _verification_pending_text(invoice),
+            parse_mode="HTML",
+            reply_markup=_verification_pending_keyboard(),
+            replace_media=bool(callback.message.photo),
+        )
+        return
+
+    if not invoice.get("expires_at") or datetime.fromisoformat(invoice["expires_at"]) <= datetime.utcnow():
+        await show(
+            callback,
+            "⏰ <b>This invoice has expired.</b>\n\nOpen Wallet to create a fresh invoice.",
+            parse_mode="HTML",
+            reply_markup=_back_to_menu_kb(),
+            replace_media=bool(callback.message.photo),
+        )
+        return
+
+    invoice_data = {
+        "deposit_id": invoice["id"],
+        "invoice_code": invoice["code"],
+        "invoice_expires_at": invoice["expires_at"],
+        "amount_usdt": invoice["amount_usdt"],
+        "network": invoice["network"],
+        "_card_chat_id": invoice.get("telegram_chat_id"),
+        "_card_message_id": invoice.get("telegram_message_id"),
+    }
+    await state.update_data(**invoice_data)
+    await state.set_state(DepositState.waiting_txid)
+    await _show_invoice(callback, state, deposit_id, invoice["network"], invoice_data)
+
+
 # ╔══════════════════════════════════════════════════════════════╗
 # ║              AMOUNT PROCESSING                              ║
 # ╚══════════════════════════════════════════════════════════════╝
@@ -1378,6 +1457,7 @@ def _save_txid(deposit_id: int, txid: str) -> str:
             db.commit()
             return "expired"
         deposit.tx_hash = txid
+        deposit.verification_started_at = datetime.utcnow()
         try:
             db.commit()
         except IntegrityError:
@@ -1394,7 +1474,6 @@ def _set_pending_if_waiting(deposit_id: int) -> None:
         dep = db.query(Deposit).filter(Deposit.id == deposit_id).first()
         if dep and dep.status not in {"completed", "failed", "expired"}:
             dep.status = "pending"
-            dep.verification_started_at = None
             db.commit()
     finally:
         db.close()

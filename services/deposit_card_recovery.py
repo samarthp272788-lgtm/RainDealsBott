@@ -28,7 +28,6 @@ def _recover_interrupted_deposits() -> list[dict]:
         recovered = []
         for deposit in deposits:
             deposit.status = "pending"
-            deposit.verification_started_at = None
             recovered.append({
                 "id": deposit.id,
                 "chat_id": deposit.telegram_chat_id or deposit.telegram_id,

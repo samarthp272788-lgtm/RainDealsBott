@@ -4,6 +4,8 @@ from sqlalchemy import text
 
 from database import Base, engine
 from models.order_requirement_submission import OrderRequirementSubmission
+from models.product_engagement import ProductEngagement
+from models.admin_audit_log import AdminAuditLog
 
 
 def _ensure_column(connection, table: str, column: str, definition: str) -> None:
@@ -16,7 +18,14 @@ def _ensure_column(connection, table: str, column: str, definition: str) -> None
 
 
 def ensure_order_requirements_schema() -> None:
-    Base.metadata.create_all(bind=engine, tables=[OrderRequirementSubmission.__table__])
+    Base.metadata.create_all(
+        bind=engine,
+        tables=[
+            OrderRequirementSubmission.__table__,
+            ProductEngagement.__table__,
+            AdminAuditLog.__table__,
+        ],
+    )
     with engine.begin() as connection:
         _ensure_column(connection, "users", "home_menu_chat_id", "BIGINT NULL")
         _ensure_column(connection, "users", "home_menu_message_id", "BIGINT NULL")

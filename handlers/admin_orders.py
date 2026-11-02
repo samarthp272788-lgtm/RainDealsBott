@@ -25,6 +25,7 @@ from models.order import Order
 from models.user import User
 from models.product import Product
 from models.order_requirement_submission import OrderRequirementSubmission
+from models.admin_audit_log import AdminAuditLog
 from states.delivery_states import DeliverOrder
 
 from handlers.products import (
@@ -361,6 +362,13 @@ def _do_refund(order_id: int, admin_id: int) -> dict:
 
         order.refunded = True
         order.status = "refunded"
+        db.add(AdminAuditLog(
+            admin_telegram_id=int(admin_id),
+            action="refund_order",
+            entity_type="order",
+            entity_id=str(order.id),
+            summary=f"Refunded ${refund_amount:.2f}; stock_restored={stock_restored}.",
+        ))
 
         logger.info(
             "Order %s refunded by admin %s | buyer=%s amount=%s stock_restored=%s",
@@ -438,6 +446,10 @@ async def delete_order(callback: CallbackQuery):
         # referral-commission bookkeeping) but hide it from the admin
         # orders list and stop offering further actions on it.
         order.status = "deleted"
+        db.add(AdminAuditLog(
+            admin_telegram_id=int(callback.from_user.id), action="soft_delete_order",
+            entity_type="order", entity_id=str(order.id), summary="Order marked deleted (soft delete).",
+        ))
         db.commit()
 
         logger.info("Order %s soft-deleted by admin %s", order_id, callback.from_user.id)
@@ -522,7 +534,7 @@ async def deliver_order_start(callback: CallbackQuery, state: FSMContext):
 
 
 @retry_on_write_conflict(max_attempts=3)
-def _do_deliver(order_id: int, delivered_text: str) -> dict:
+def _do_deliver(order_id: int, delivered_text: str, admin_id: int) -> dict:
     with transaction() as db:
         order = (
             db.query(Order)
@@ -545,6 +557,10 @@ def _do_deliver(order_id: int, delivered_text: str) -> dict:
         order.delivered_account = delivered_text
         order.status = "completed"
         order.is_preorder = False
+        db.add(AdminAuditLog(
+            admin_telegram_id=int(admin_id), action="manual_deliver_order",
+            entity_type="order", entity_id=str(order.id), summary="Order manually marked delivered.",
+        ))
 
         # Referral commission for a preorder is deliberately deferred
         # until it's actually fulfilled (see handlers/products.py) —
@@ -614,7 +630,7 @@ async def deliver_order_finish(message: Message, state: FSMContext):
         return
 
     try:
-        result = await _dispatch_blocking(_do_deliver, order_id, message.text)
+        result = await _dispatch_blocking(_do_deliver, order_id, message.text, message.from_user.id)
     except SQLAlchemyError:
         logger.exception("Database error delivering order %s", order_id)
         await answer_card(message, "❌ Database error while delivering. Please try again.")

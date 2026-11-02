@@ -64,6 +64,13 @@ def get_admin_panel():
             ],
             [
                 InlineKeyboardButton(
+                    text="🧾 Admin Activity Log",
+                    callback_data="admin_audit",
+                    style="primary",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="🛠 Maintenance Mode",
                     callback_data="maintenance_mode",
                     style="danger"

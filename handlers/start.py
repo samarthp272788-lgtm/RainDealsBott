@@ -15,6 +15,7 @@ from aiogram.fsm.context import FSMContext
 
 from database import SessionLocal, transaction, retry_on_write_conflict
 from models.user import User
+from models.deposit import Deposit
 from config import ADMIN_IDS, CHANNEL_LINK, GROUP_LINK, TOS_LINK
 
 from keyboards.menu import get_main_menu, get_admin_main_menu
@@ -253,6 +254,41 @@ def _save_home_menu_location(telegram_id: int, chat_id: int, message_id: int) ->
     except Exception:
         db.rollback()
         raise
+    finally:
+        db.close()
+
+
+def _load_start_deposit_action(telegram_id: int) -> dict | None:
+    """Return one resumable invoice/status shortcut for the /start card."""
+    db = SessionLocal()
+    try:
+        submitted = (
+            db.query(Deposit)
+            .filter(
+                Deposit.telegram_id == telegram_id,
+                Deposit.status.in_(["waiting_hash", "pending"]),
+                Deposit.tx_hash.isnot(None),
+            )
+            .order_by(Deposit.id.desc())
+            .first()
+        )
+        if submitted:
+            return {"kind": "status", "id": submitted.id, "code": submitted.invoice_code or submitted.order_id}
+
+        active = (
+            db.query(Deposit)
+            .filter(
+                Deposit.telegram_id == telegram_id,
+                Deposit.status.in_(["waiting_hash", "pending"]),
+                Deposit.tx_hash.is_(None),
+                Deposit.invoice_expires_at > datetime.utcnow(),
+            )
+            .order_by(Deposit.id.desc())
+            .first()
+        )
+        if active:
+            return {"kind": "resume", "id": active.id, "code": active.invoice_code or active.order_id}
+        return None
     finally:
         db.close()
 
@@ -540,6 +576,15 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
     user.full_name = full_name
     text = _build_start_welcome(user, full_name, telegram_id, username, bot_username)
     keyboard = get_admin_main_menu() if is_admin else get_main_menu()
+    deposit_action = await asyncio.to_thread(_load_start_deposit_action, telegram_id)
+    if deposit_action:
+        if deposit_action["kind"] == "status":
+            label = f"⏳ Payment checking · #{deposit_action['id']}"
+            callback_data = f"resume_deposit_{deposit_action['id']}"
+        else:
+            label = f"💳 Resume payment · {deposit_action['code']}"
+            callback_data = f"resume_deposit_{deposit_action['id']}"
+        keyboard.inline_keyboard.insert(0, [InlineKeyboardButton(text=label, callback_data=callback_data, style="success")])
     menu_card = await update_card(
         message,
         text=text,

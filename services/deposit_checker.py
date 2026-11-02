@@ -3,31 +3,17 @@
 """
 services/deposit_checker.py
 
-HYBRID CRYPTO DEPOSIT CHECKER
+BINANCE-RECEIPT CRYPTO DEPOSIT CHECKER
 
 Crypto:
-    RPC -> blockchain verification
-    Binance -> Binance-side deposit verification
+    Binance signed deposit-history API only
 
 Supported:
     USDT
-    BUSD
-    USDC
 
 Networks:
     BSC / BEP20
     Polygon
-
-RPC verifies:
-    - transaction exists
-    - transaction succeeded
-    - token contract
-    - Transfer event
-    - sender
-    - recipient
-    - amount
-    - block number
-    - confirmations
 
 Binance verifies:
     - txId
@@ -36,6 +22,9 @@ Binance verifies:
     - destination address
     - amount
     - status
+
+The sender is not restricted: Binance's successful deposit record is the
+source of truth for funds that Binance has actually credited.
 
 UPI:
     Existing IMAP verification
@@ -58,7 +47,7 @@ import re
 import time as time_module
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from email.header import decode_header
 from typing import Optional, Union
@@ -86,18 +75,13 @@ logger = logging.getLogger(__name__)
 BINANCE_API_KEY = getattr(config, "BINANCE_API_KEY", "")
 BINANCE_API_SECRET = getattr(config, "BINANCE_API_SECRET", "")
 
-DEPOSIT_COINS = getattr(
-    config,
-    "BINANCE_DEPOSIT_COINS",
-    ["USDT", "BUSD", "USDC"],
+DEPOSIT_COINS = {"USDT"} & {
+    str(coin).upper()
+    for coin in getattr(config, "BINANCE_DEPOSIT_COINS", ["USDT"])
+}
+BINANCE_CLAIM_WINDOW = timedelta(
+    hours=max(1, int(getattr(config, "BINANCE_DEPOSIT_CLAIM_WINDOW_HOURS", 72)))
 )
-
-try:
-    BINANCE_LOOKBACK_DAYS = int(
-        getattr(config, "BINANCE_DEPOSIT_LOOKBACK_DAYS", 7)
-    )
-except (TypeError, ValueError):
-    BINANCE_LOOKBACK_DAYS = 7
 
 # ================================================================
 # WALLET ADDRESSES
@@ -492,7 +476,7 @@ def _mark_binance_access_restricted(error, context: str) -> None:
     logger.error(
         "Binance API disabled for this process after %s: %s. "
         "The server location or account is not eligible for Binance API use; "
-        "Binance Pay deposits will remain pending for manual review.",
+        "Binance-only crypto and Binance Pay deposits will remain pending.",
         context,
         error,
     )
@@ -1079,109 +1063,48 @@ async def verify_rpc_transaction(
 # ================================================================
 
 def _fetch_binance_deposits_sync(
-        binance_network: str,
+        tx_hash: str,
+        claim_started_at: datetime,
 ) -> list[dict]:
+    """Fetch only the Binance deposit record for this transaction hash."""
     client = _get_binance_client()
 
-    if client is None:
+    if client is None or not tx_hash:
         return []
 
     end_time = int(
         time_module.time() * 1000
     )
 
-    # Keep Binance request window reasonably small.
-    start_time = (
-            end_time
-            - BINANCE_LOOKBACK_DAYS
-            * 24
-            * 60
-            * 60
-            * 1000
-    )
+    # Search from the start of the allowed claim window.
+    # Binance requires a requested history window shorter than 90 days.
+    claim_time = claim_started_at
+    if claim_time.tzinfo is not None:
+        claim_time = claim_time.astimezone(timezone.utc).replace(tzinfo=None)
+    window_start = claim_time - BINANCE_CLAIM_WINDOW
+    claim_start_time = int(window_start.replace(tzinfo=timezone.utc).timestamp() * 1000)
+    max_window_start = end_time - 89 * 24 * 60 * 60 * 1000
+    start_time = max(claim_start_time, max_window_start)
 
-    all_deposits = []
-
-    for coin in DEPOSIT_COINS:
-
-        try:
-
-            deposits = client.get_deposit_history(
-                coin=coin,
-                network=binance_network,
-                startTime=start_time,
-                endTime=end_time,
-            ) or []
-
-            for row in deposits:
-                row["_coin"] = coin
-
-            all_deposits.extend(
-                deposits
-            )
-
-        except BinanceAPIException as exc:
-
-            if _is_binance_location_restriction(exc):
-                _mark_binance_access_restricted(
-                    exc,
-                    "deposit-history request",
-                )
-
-                break
-
-            logger.warning(
-                "Binance API error %s/%s: %s",
-                coin,
-                binance_network,
-                exc,
-            )
-
-        except Exception as exc:
-
-            if _is_binance_location_restriction(exc):
-                _mark_binance_access_restricted(
-                    exc,
-                    "deposit-history request",
-                )
-
-                break
-
-            logger.warning(
-                "Binance request error %s/%s: %s",
-                coin,
-                binance_network,
-                exc,
-            )
-
-    return all_deposits
-
-
-async def _fetch_binance_matches(
-        chain: Chain,
-) -> dict[str, dict]:
-    if not chain.binance_network:
-        return {}
-
-    rows = await asyncio.to_thread(
-        _fetch_binance_deposits_sync,
-        chain.binance_network,
-    )
-
-    result = {}
-
-    for row in rows:
-
-        tx_id = (
-                row.get("txId")
-                or row.get("txid")
-                or ""
-        ).lower()
-
-        if tx_id:
-            result[tx_id] = row
-
-    return result
+    try:
+        rows = client.get_deposit_history(
+            txId=tx_hash,
+            startTime=start_time,
+            endTime=end_time,
+        ) or []
+        return rows if isinstance(rows, list) else []
+    except BinanceAPIException as exc:
+        if _is_binance_location_restriction(exc):
+            _mark_binance_access_restricted(exc, "deposit-history request")
+        else:
+            logger.warning("Binance deposit lookup failed for tx=%s: %s", tx_hash[:18], exc)
+        return []
+    except Exception as exc:
+        if _is_binance_location_restriction(exc):
+            _mark_binance_access_restricted(exc, "deposit-history request")
+        else:
+            logger.warning("Binance deposit lookup failed for tx=%s: %s", tx_hash[:18], exc)
+        return []
 
 
 # ================================================================
@@ -1191,12 +1114,13 @@ async def _fetch_binance_matches(
 def _match_binance_row(
         chain: Chain,
         tx_hash: str,
-        matches: dict[str, dict],
-        rpc_result: dict,
+        rows: list[dict],
+        requested_amount: Optional[Decimal],
+        claim_started_at: Optional[datetime] = None,
 ):
-    row = matches.get(
-        tx_hash.lower()
-    )
+    row = next((item for item in rows if str(
+        item.get("txId") or item.get("txid") or ""
+    ).lower() == tx_hash.lower()), None)
 
     if row is None:
         return None
@@ -1212,39 +1136,66 @@ def _match_binance_row(
     except Exception:
         status = -1
 
-    if status != 1:
+    if status in {0, 6, 8}:
         logger.info(
-            "[%s] Binance deposit not successful yet | tx=%s",
+            "[%s] Binance deposit is not fully successful yet | tx=%s status=%s",
+            chain.name,
+            tx_hash[:18],
+            status,
+        )
+        return None
+
+    if status != 1:
+        logger.warning("[%s] Binance rejected deposit tx=%s status=%s", chain.name, tx_hash[:18], status)
+        return False
+
+    # A recent deposit may be claimed for up to 72 hours after it was made,
+    # measured against the time this user submitted its TXID.
+    if claim_started_at is None:
+        logger.warning(
+            "[%s] Cannot verify Binance deposit without TXID submission time | tx=%s",
             chain.name,
             tx_hash[:18],
         )
-
-        return None
+        return False
+    try:
+        insert_time_ms = int(row.get("insertTime"))
+        record_time = datetime.fromtimestamp(insert_time_ms / 1000, tz=timezone.utc).replace(tzinfo=None)
+        claim_time = claim_started_at
+        if claim_time.tzinfo is not None:
+            claim_time = claim_time.astimezone(timezone.utc).replace(tzinfo=None)
+        if record_time < claim_time - BINANCE_CLAIM_WINDOW:
+            logger.warning(
+                "[%s] Binance deposit is older than the claim window | tx=%s",
+                chain.name,
+                tx_hash[:18],
+            )
+            return False
+    except (TypeError, ValueError, OverflowError, OSError):
+        logger.warning(
+            "[%s] Binance deposit record has no valid timestamp | tx=%s",
+            chain.name,
+            tx_hash[:18],
+        )
+        return False
 
     # ------------------------------------------------------------
     # Coin
     # ------------------------------------------------------------
 
     binance_coin = str(
-        row.get("_coin")
-        or row.get("coin")
+        row.get("coin")
         or row.get("asset")
         or ""
     ).upper()
-
-    rpc_coin = str(
-        rpc_result.get("coin")
-        or ""
-    ).upper()
-
-    if binance_coin != rpc_coin:
+    allowed_coins = {str(coin).upper() for coin in DEPOSIT_COINS}
+    if not binance_coin or binance_coin not in allowed_coins:
         logger.warning(
-            "[%s] COIN MISMATCH | Binance=%s RPC=%s",
+            "[%s] Binance deposit asset is not allowed | tx=%s coin=%s",
             chain.name,
-            binance_coin,
-            rpc_coin,
+            tx_hash[:18],
+            binance_coin or "missing",
         )
-
         return False
 
     # ------------------------------------------------------------
@@ -1261,11 +1212,7 @@ def _match_binance_row(
         or ""
     ).upper()
 
-    if (
-            row_network
-            and expected_network
-            and row_network != expected_network
-    ):
+    if not expected_network or row_network != expected_network:
         logger.warning(
             "[%s] NETWORK MISMATCH | Binance=%s expected=%s",
             chain.name,
@@ -1288,11 +1235,7 @@ def _match_binance_row(
             chain.address or ""
     ).lower()
 
-    if (
-            binance_address
-            and expected_address
-            and binance_address != expected_address
-    ):
+    if not expected_address or not binance_address or binance_address != expected_address:
         logger.warning(
             "[%s] ADDRESS MISMATCH",
             chain.name,
@@ -1319,23 +1262,18 @@ def _match_binance_row(
 
         return False
 
-    rpc_amount = Decimal(
-        str(
-            rpc_result["amount"]
-        )
-    )
+    if binance_amount <= 0:
+        logger.warning("[%s] Binance reported non-positive deposit amount | tx=%s", chain.name, tx_hash[:18])
+        return False
 
-    if abs(
-            binance_amount
-            - rpc_amount
-    ) > AMOUNT_TOLERANCE:
+    if requested_amount is not None and requested_amount > 0 and binance_amount < requested_amount - AMOUNT_TOLERANCE:
         logger.warning(
-            "[%s] AMOUNT MISMATCH | Binance=%s RPC=%s",
+            "[%s] Binance deposit underpaid | tx=%s received=%s requested=%s",
             chain.name,
+            tx_hash[:18],
             binance_amount,
-            rpc_amount,
+            requested_amount,
         )
-
         return False
 
     # ------------------------------------------------------------
@@ -1343,11 +1281,12 @@ def _match_binance_row(
     # ------------------------------------------------------------
 
     logger.info(
-        "[%s] BINANCE VERIFIED | tx=%s | coin=%s | amount=%s",
+        "[%s] BINANCE VERIFIED | tx=%s | coin=%s | amount=%s | status=%s",
         chain.name,
         tx_hash[:18],
-        rpc_coin,
-        rpc_amount,
+        binance_coin,
+        binance_amount,
+        status,
     )
 
     return {
@@ -1358,86 +1297,57 @@ def _match_binance_row(
         "binance_network": row_network,
         "binance_address": binance_address,
         "insert_time": row.get("insertTime"),
+        "source_address": row.get("sourceAddress"),
     }
 
 
 # ================================================================
-# HYBRID VERIFICATION
+# BINANCE-ONLY VERIFICATION
 # ================================================================
 
 async def verify_transaction(
         chain: Chain,
         tx_hash: str,
         requested_amount: Optional[Decimal] = None,
+        claim_started_at: Optional[datetime] = None,
 ):
-    """
-    HYBRID:
+    """Verify an exchange deposit using Binance's signed history record only.
 
-        RPC
-          +
-        Binance
-
-    RPC must first prove the transaction exists and is valid.
-
-    Binance must then confirm the deposit.
-
-    Confirmations are ALWAYS calculated from RPC.
+    A success record means Binance has recognized and credited the deposit.
+    This intentionally does not query BSC/Polygon RPCs. It therefore only
+    works for receiving addresses whose deposits appear in this Binance
+    account's history.
     """
 
     if not valid_hash(tx_hash):
         return False
 
     # ------------------------------------------------------------
-    # STEP 1 - RPC
-    # ------------------------------------------------------------
-
-    rpc_result = await verify_rpc_transaction(
-        chain,
-        tx_hash,
-        requested_amount,
-    )
-
-    if rpc_result is None:
-        return None
-
-    if rpc_result is False:
+    if claim_started_at is None:
+        logger.warning(
+            "[%s] Cannot query Binance deposit without TXID submission time | tx=%s",
+            chain.name,
+            tx_hash[:18],
+        )
         return False
 
-    # ------------------------------------------------------------
-    # STEP 2 - Confirmation
-    # ------------------------------------------------------------
-
-    if not rpc_result["confirmed"]:
-        logger.info(
-            "[%s] Waiting confirmations | %s/%s",
-            chain.name,
-            rpc_result["confirmations"],
-            rpc_result[
-                "required_confirmations"
-            ],
-        )
-
-        return None
-
-    # ------------------------------------------------------------
-    # STEP 3 - Binance
-    # ------------------------------------------------------------
-
-    matches = await _fetch_binance_matches(
-        chain
+    rows = await asyncio.to_thread(
+        _fetch_binance_deposits_sync,
+        tx_hash,
+        claim_started_at,
     )
 
     binance_result = _match_binance_row(
         chain,
         tx_hash,
-        matches,
-        rpc_result,
+        rows,
+        requested_amount,
+        claim_started_at,
     )
 
     if binance_result is None:
         logger.info(
-            "[%s] RPC valid but Binance deposit "
-            "not available yet | tx=%s",
+            "[%s] Binance deposit not indexed as successful yet | tx=%s",
             chain.name,
             tx_hash[:18],
         )
@@ -1452,29 +1362,22 @@ async def verify_transaction(
     # ------------------------------------------------------------
 
     return {
-        "sender": rpc_result["sender"],
-        "receiver": rpc_result["receiver"],
-        "amount": rpc_result["amount"],
-        "coin": rpc_result["coin"],
-        "network": rpc_result["network"],
-        "contract": rpc_result["contract"],
-        "block_number": rpc_result["block_number"],
-        "confirmations": rpc_result["confirmations"],
-        "required_confirmations": (
-            rpc_result[
-                "required_confirmations"
-            ]
-        ),
-        "rpc_verified": True,
+        "sender": binance_result.get("source_address"),
+        "receiver": binance_result["binance_address"],
+        "amount": binance_result["binance_amount"],
+        "coin": binance_result["binance_coin"],
+        "network": binance_result["binance_network"],
+        "contract": None,
+        "confirmations": None,
+        "required_confirmations": None,
+        "rpc_verified": False,
         "binance_verified": True,
         "verified_by": [
-            "RPC_TRANSACTION",
-            "RPC_TOKEN_CONTRACT",
-            "RPC_RECIPIENT",
-            "RPC_AMOUNT",
-            "RPC_CONFIRMATIONS",
-            "BINANCE_DEPOSIT",
+            "BINANCE_DEPOSIT_HISTORY_TXID",
+            "BINANCE_ASSET_NETWORK_ADDRESS_AMOUNT",
+            "BINANCE_STATUS_SUCCESS",
         ],
+        "binance_status": binance_result["binance_status"],
     }
 
 
@@ -2822,8 +2725,16 @@ async def verify_deposit(
 
         chain = CHAINS[network]
 
+        # Persist when this TXID was first accepted. This is the anchor for
+        # the three-day Binance-history claim window, including after restart.
+        claim_started_at = deposit.verification_started_at
+        if claim_started_at is None:
+            claim_started_at = datetime.utcnow()
+            deposit.verification_started_at = claim_started_at
+            db.commit()
+
         # --------------------------------------------------------
-        # RPC + Binance
+        # Binance signed deposit-history lookup only
         # --------------------------------------------------------
 
         db.close()
@@ -2834,6 +2745,7 @@ async def verify_deposit(
                 chain,
                 deposit.tx_hash,
                 requested_amount,
+                claim_started_at,
             )
         )
 
@@ -2851,11 +2763,13 @@ async def verify_deposit(
         # --------------------------------------------------------
 
         if verification is None:
-            if _keep_pending_or_cancel(db, deposit, result_info):
-                if result_info is not None:
-                    result_info["reason"] = "pending"
-                return None
-            return False
+            # Binance may index a deposit late, or its API may be temporarily
+            # unavailable. Never expire/decline a crypto deposit just because
+            # a retry counter ran out; keep it pending until Binance confirms
+            # it or an administrator reviews it.
+            if result_info is not None:
+                result_info["reason"] = "pending"
+            return None
 
         # --------------------------------------------------------
         # Permanently invalid
@@ -2871,7 +2785,7 @@ async def verify_deposit(
             _finalize_failed(
                 db,
                 deposit,
-                "RPC/Binance verification failed",
+                "Binance deposit record rejected or did not match",
             )
 
             return False
@@ -2948,18 +2862,12 @@ async def verify_deposit(
             logger.info(
                 "[%s] DEPOSIT VERIFIED + CREDITED | "
                 "tx=%s | coin=%s | amount=%s | "
-                "confirmations=%s/%s | "
-                "RPC=YES | BINANCE=YES",
+                "Binance status=%s",
                 network,
                 deposit.tx_hash[:18],
                 verification["coin"],
                 received_amount,
-                verification[
-                    "confirmations"
-                ],
-                verification[
-                    "required_confirmations"
-                ],
+                verification["binance_status"],
             )
 
         return success
@@ -3045,15 +2953,14 @@ async def check_pending_deposits(bot=None):
         len(upi_ids),
     )
 
-    if (
-            _binance_access_restricted
-            and pay_ids
-            and not _binance_pending_skip_logged
-    ):
+    binance_credentials_missing = not BINANCE_API_KEY or not BINANCE_API_SECRET
+    binance_unavailable = _binance_access_restricted or binance_credentials_missing
+    if binance_unavailable and (crypto_ids or pay_ids) and not _binance_pending_skip_logged:
         logger.warning(
-            "Skipping %s Binance Pay deposit(s): Binance API access is "
-            "restricted for this server. Keep these deposits pending for "
-            "manual review or use a compliant verification provider.",
+            "Skipping Binance-only verification for %s crypto and %s Pay deposits: "
+            "Binance credentials/API access are unavailable. Deposits remain pending; "
+            "no alternate chain RPC verification is configured.",
+            len(crypto_ids),
             len(pay_ids),
         )
 
@@ -3063,7 +2970,9 @@ async def check_pending_deposits(bot=None):
     # CRYPTO
     # ------------------------------------------------------------
 
-    for deposit_id in crypto_ids:
+    for deposit_id in ([] if binance_credentials_missing or _binance_access_restricted else crypto_ids):
+        if _binance_access_restricted:
+            break
 
         try:
             result_info: dict = {}
@@ -3084,7 +2993,9 @@ async def check_pending_deposits(bot=None):
     # BINANCE PAY
     # ------------------------------------------------------------
 
-    for deposit_id in ([] if _binance_access_restricted else pay_ids):
+    for deposit_id in ([] if binance_credentials_missing or _binance_access_restricted else pay_ids):
+        if _binance_access_restricted:
+            break
 
         try:
             result_info: dict = {}
@@ -3144,31 +3055,11 @@ async def deposit_checker_loop(bot=None):
     logger.info("=" * 65)
 
     logger.info(
-        "HYBRID DEPOSIT CHECKER STARTED"
+        "DEPOSIT CHECKER STARTED"
     )
 
     logger.info(
-        "Crypto verification: RPC + Binance"
-    )
-
-    logger.info(
-        "BSC confirmations: %s",
-        RPC_CONFIRMATIONS["BEP20"],
-    )
-
-    logger.info(
-        "Polygon confirmations: %s",
-        RPC_CONFIRMATIONS["POLYGON"],
-    )
-
-    logger.info(
-        "BSC RPCs: %s",
-        len(BSC_RPC_URLS),
-    )
-
-    logger.info(
-        "Polygon RPCs: %s",
-        len(POLYGON_RPC_URLS),
+        "Crypto verification: Binance signed deposit-history only (USDT)"
     )
 
     logger.info(

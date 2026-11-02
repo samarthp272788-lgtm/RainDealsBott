@@ -23,8 +23,14 @@ from aiogram.exceptions import TelegramBadRequest
 from config import ADMIN_IDS
 from database import SessionLocal
 from models.product import Product
+from models.admin_audit_log import AdminAuditLog
 from states.product_states import AddAccounts, EditAccounts, EditBulkPricing, EditProduct
-from handlers.products import _real_stock, _send_stock_channel_message, invalidate_products_cache
+from handlers.products import (
+    _real_stock,
+    _send_stock_channel_message,
+    _notify_restock_subscribers,
+    invalidate_products_cache,
+)
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -292,6 +298,8 @@ async def _notify_stock_change(bot, pid: int):
     text = _build_stockctl_sync_text(product)
     stock = _real_stock(product)
     await _send_stock_channel_message(bot, text, product_id=product.id, can_buy=stock > 0)
+    if stock > 0:
+        await _notify_restock_subscribers(bot, product, stock)
 
 
 def _load_product(pid: int):
@@ -722,50 +730,146 @@ async def save_accounts(message: Message, state: FSMContext):
         return
 
     data = await state.get_data()
-    pid = data["product_id"]
+    pid = int(data["product_id"])
+    raw_lines = [line.strip() for line in account_text.splitlines()]
+    blank_count = sum(1 for line in raw_lines if not line)
+    submitted = [line for line in raw_lines if line]
+    deduplicated = list(dict.fromkeys(submitted))
+    duplicate_input_count = len(submitted) - len(deduplicated)
+
+    preview = await asyncio.to_thread(_preview_account_import, pid, deduplicated)
+    if preview is None:
+        await state.clear()
+        await answer_card(message, "❌ Product not found.")
+        return
+
+    existing_duplicates = preview["existing_duplicates"]
+    fresh_lines = preview["new_lines"]
+    await state.update_data(
+        pending_account_lines=fresh_lines,
+        pending_account_product_id=pid,
+        pending_account_input_count=len(submitted),
+        pending_account_blank_count=blank_count,
+        pending_account_duplicate_count=duplicate_input_count + existing_duplicates,
+    )
+    await state.set_state(AddAccounts.confirm)
+
+    prompt = (
+        f"📦 <b>STOCK IMPORT PREVIEW</b>\n\n"
+        f"Product: <b>{html_escape(preview['product_name'])}</b> (#{pid})\n"
+        f"Current stock: <b>{preview['current_stock']}</b>\n\n"
+        f"Rows received: <b>{len(submitted)}</b>\n"
+        f"Blank rows ignored: <b>{blank_count}</b>\n"
+        f"Duplicates skipped: <b>{duplicate_input_count + existing_duplicates}</b>\n"
+        f"New accounts to add: <b>{len(fresh_lines)}</b>\n"
+        f"Projected stock: <b>{preview['current_stock'] + len(fresh_lines)}</b>\n\n"
+        "Review the counts, then confirm. Account contents are not repeated in this preview."
+    )
+    await answer_card(
+        message,
+        prompt,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"✅ Add {len(fresh_lines)} accounts", callback_data="accounts_apply_import")],
+            [InlineKeyboardButton(text="❌ Cancel import", callback_data="accounts_cancel_import")],
+        ]),
+    )
+
+
+def _preview_account_import(product_id: int, lines: list[str]) -> dict | None:
     db = SessionLocal()
     try:
-        product = db.query(Product).filter(Product.id == pid).first()
+        product = db.query(Product).filter(Product.id == product_id).first()
         if not product:
-            await answer_card(message, "❌ Product not found.")
-            return
-
-        old_accounts = product.file_content or ""
-        new_accounts = account_text.strip()
-
-        if old_accounts:
-            product.file_content = old_accounts + "\n" + new_accounts
-        else:
-            product.file_content = new_accounts
-
-        product.stock = len(
-            [line for line in product.file_content.splitlines() if line.strip()]
-        )
-        db.commit()
-        invalidate_products_cache()
-        db.refresh(product)
+            return None
+        existing = {line.strip() for line in (product.file_content or "").splitlines() if line.strip()}
+        new_lines = [line for line in lines if line not in existing]
+        return {
+            "product_name": product.name,
+            "current_stock": int(product.stock or 0),
+            "new_lines": new_lines,
+            "existing_duplicates": len(lines) - len(new_lines),
+        }
     finally:
         db.close()
 
-    await state.clear()
 
+def _commit_account_import(product_id: int, lines: list[str], admin_id: int) -> dict:
+    db = SessionLocal()
     try:
-        await _notify_stock_change(message.bot, pid)
+        product = db.query(Product).filter(Product.id == product_id).with_for_update().first()
+        if not product:
+            return {"error": "Product not found."}
+        existing_lines = [line.strip() for line in (product.file_content or "").splitlines() if line.strip()]
+        existing = set(existing_lines)
+        fresh = [line for line in lines if line and line not in existing]
+        product.file_content = "\n".join(existing_lines + fresh)
+        product.stock = len(existing_lines) + len(fresh)
+        db.add(AdminAuditLog(
+            admin_telegram_id=int(admin_id),
+            action="add_stock_accounts",
+            entity_type="product",
+            entity_id=str(product.id),
+            summary=f"Added {len(fresh)} account(s); stock is now {product.stock}.",
+        ))
+        db.commit()
+        return {"added": len(fresh), "stock": product.stock}
     except Exception:
-        logger.exception("Failed to send stock notification after adding accounts")
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
-    await answer_card(message,
-        "✅ Accounts added.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="📦 Product Manager",
-                        callback_data="admin_products"
-                    )
-                ]
-            ]
-        )
+
+@router.callback_query(F.data == "accounts_apply_import")
+async def accounts_apply_import(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    data = await state.get_data()
+    pid = int(data.get("pending_account_product_id") or 0)
+    lines = data.get("pending_account_lines") or []
+    if not pid or not lines:
+        await callback.answer("No new account rows to import.", show_alert=True)
+        return
+    try:
+        result = await asyncio.to_thread(_commit_account_import, pid, lines, callback.from_user.id)
+    except Exception:
+        logger.exception("Bulk account import failed for product %s", pid)
+        await callback.answer("Import failed. No changes were saved.", show_alert=True)
+        return
+    if result.get("error"):
+        await callback.answer(result["error"], show_alert=True)
+        return
+    await state.clear()
+    invalidate_products_cache()
+    await callback.answer("Stock updated.")
+    try:
+        await _notify_stock_change(callback.bot, pid)
+    except Exception:
+        logger.exception("Failed to notify after stock import")
+    await callback.message.edit_text(
+        f"✅ <b>STOCK UPDATED</b>\n\nAdded: <b>{result['added']}</b>\nCurrent stock: <b>{result['stock']}</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📦 Product Manager", callback_data="admin_products")],
+        ]),
+    )
+
+
+@router.callback_query(F.data == "accounts_cancel_import")
+async def accounts_cancel_import(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    await state.clear()
+    await callback.answer("Import cancelled.")
+    await callback.message.edit_text(
+        "❌ <b>Stock import cancelled.</b> No accounts were added.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📦 Product Manager", callback_data="admin_products")],
+        ]),
     )
 
 
@@ -866,43 +970,115 @@ async def replace_accounts_save(message: Message, state: FSMContext):
         return
 
     data = await state.get_data()
-    pid = data["product_id"]
+    pid = int(data["product_id"])
+    raw_lines = [line.strip() for line in account_text.splitlines()]
+    blank_count = sum(1 for line in raw_lines if not line)
+    submitted = [line for line in raw_lines if line]
+    unique_lines = list(dict.fromkeys(submitted))
+    preview = await asyncio.to_thread(_preview_account_import, pid, unique_lines)
+    if preview is None:
+        await state.clear()
+        await answer_card(message, "❌ Product not found.")
+        return
+
+    await state.update_data(
+        pending_replace_lines=unique_lines,
+        pending_replace_product_id=pid,
+        pending_replace_input_count=len(submitted),
+        pending_replace_blank_count=blank_count,
+        pending_replace_duplicate_count=len(submitted) - len(unique_lines),
+        pending_replace_old_stock=preview["current_stock"],
+    )
+    await state.set_state(EditAccounts.confirm_replace)
+    await answer_card(
+        message,
+        f"⚠️ <b>REPLACE STOCK PREVIEW</b>\n\n"
+        f"Product: <b>{html_escape(preview['product_name'])}</b> (#{pid})\n"
+        f"Current stock that will be removed: <b>{preview['current_stock']}</b>\n"
+        f"New unique accounts: <b>{len(unique_lines)}</b>\n"
+        f"Blank rows ignored: <b>{blank_count}</b>\n"
+        f"Duplicate rows skipped: <b>{len(submitted) - len(unique_lines)}</b>\n\n"
+        "This replaces the current account pool. Account contents are hidden from this preview. Confirm to continue.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"⚠️ Replace with {len(unique_lines)} accounts", callback_data="accounts_apply_replace")],
+            [InlineKeyboardButton(text="❌ Cancel", callback_data="accounts_cancel_replace")],
+        ]),
+    )
+
+
+@router.callback_query(F.data == "accounts_apply_replace")
+async def accounts_apply_replace(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    data = await state.get_data()
+    pid = int(data.get("pending_replace_product_id") or 0)
+    lines = data.get("pending_replace_lines") or []
+    if not pid or not lines:
+        await callback.answer("Replacement data expired or empty.", show_alert=True)
+        return
+    try:
+        result = await asyncio.to_thread(_commit_account_replacement, pid, lines, callback.from_user.id)
+    except Exception:
+        logger.exception("Account replacement failed for product %s", pid)
+        await callback.answer("Replacement failed. No changes were saved.", show_alert=True)
+        return
+    if result.get("error"):
+        await callback.answer(result["error"], show_alert=True)
+        return
+    await state.clear()
+    invalidate_products_cache()
+    await callback.answer("Account pool replaced.")
+    try:
+        await _notify_stock_change(callback.bot, pid)
+    except Exception:
+        logger.exception("Failed to send stock notification after replacing accounts")
+    await callback.message.edit_text(
+        f"✅ <b>ACCOUNT POOL REPLACED</b>\n\nNew stock: <b>{result['stock']}</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📦 Back to Product", callback_data=f"manage_{pid}")],
+        ]),
+    )
+
+
+def _commit_account_replacement(product_id: int, lines: list[str], admin_id: int) -> dict:
     db = SessionLocal()
     try:
-        product = db.query(Product).filter(Product.id == pid).first()
+        product = db.query(Product).filter(Product.id == product_id).with_for_update().first()
         if not product:
-            await answer_card(message, "❌ Product not found.")
-            return
-
-        product.file_content = account_text.strip()
-        product.stock = len(
-            [line for line in product.file_content.splitlines() if line.strip()]
-        )
+            return {"error": "Product not found."}
+        previous_count = len([line for line in (product.file_content or "").splitlines() if line.strip()])
+        product.file_content = "\n".join(lines)
+        product.stock = len(lines)
+        db.add(AdminAuditLog(
+            admin_telegram_id=int(admin_id), action="replace_stock_accounts",
+            entity_type="product", entity_id=str(product.id),
+            summary=f"Replaced {previous_count} account(s) with {product.stock}.",
+        ))
         db.commit()
-        invalidate_products_cache()
-        db.refresh(product)
+        return {"stock": product.stock}
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 
+
+@router.callback_query(F.data == "accounts_cancel_replace")
+async def accounts_cancel_replace(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
     await state.clear()
-
-    try:
-        await _notify_stock_change(message.bot, pid)
-    except Exception:
-        logger.exception("Failed to send stock notification after replacing accounts")
-
-    await answer_card(message,
-        "✅ Accounts replaced successfully.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="📦 Back to Product",
-                        callback_data=f"manage_{pid}"
-                    )
-                ]
-            ]
-        )
+    await callback.answer("Replacement cancelled.")
+    await callback.message.edit_text(
+        "❌ <b>Replacement cancelled.</b> Existing stock was unchanged.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📦 Product Manager", callback_data="admin_products")],
+        ]),
     )
 
 
@@ -1519,7 +1695,13 @@ async def set_price(message: Message):
         if not product:
             await answer_card(message, "❌ Product not found.")
             return
+        previous_price = str(product.price)
         product.price = Decimal(str(price))
+        db.add(AdminAuditLog(
+            admin_telegram_id=int(message.from_user.id), action="set_product_price",
+            entity_type="product", entity_id=str(product.id),
+            summary=f"Price changed from ${previous_price} to ${price:.2f}.",
+        ))
         db.commit()
         invalidate_products_cache()
         await answer_card(message, f"✅ Price updated to <b>${price:.2f}</b>.", parse_mode="HTML")
@@ -1563,7 +1745,13 @@ async def set_stock(message: Message):
                 "so stock is derived from the account list. Setting manual stock "
                 "won't persist across automated sales or uploads."
             )
+        previous_stock = int(product.stock or 0)
         product.stock = stock
+        db.add(AdminAuditLog(
+            admin_telegram_id=int(message.from_user.id), action="set_product_stock",
+            entity_type="product", entity_id=str(product.id),
+            summary=f"Stock changed from {previous_stock} to {stock}.",
+        ))
         db.commit()
         invalidate_products_cache()
         db.refresh(product)
@@ -1606,7 +1794,13 @@ async def set_threshold(message: Message):
         if not product:
             await answer_card(message, "❌ Product not found.")
             return
+        previous_threshold = product.low_stock_threshold
         product.low_stock_threshold = threshold
+        db.add(AdminAuditLog(
+            admin_telegram_id=int(message.from_user.id), action="set_low_stock_threshold",
+            entity_type="product", entity_id=str(product.id),
+            summary=f"Low-stock threshold changed from {previous_threshold} to {threshold}.",
+        ))
         db.commit()
         invalidate_products_cache()
         await answer_card(message, f"✅ Low stock alert threshold set to <b>{threshold}</b>.", parse_mode="HTML")

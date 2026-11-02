@@ -187,12 +187,13 @@ POLYGON_ADDRESS = (
 )
 
 
-# Supported deposit coins
+# Crypto deposits are credited as USDT. Do not treat other assets as USDT.
 BINANCE_DEPOSIT_COINS = [
     "USDT",
-    "BUSD",
-    "USDC",
 ]
+
+# A submitted TXID may refer to a Binance deposit made during the prior 72 hours.
+BINANCE_DEPOSIT_CLAIM_WINDOW_HOURS = 72
 
 
 # ==========================================================
@@ -390,9 +391,6 @@ BINANCE_API_SECRET = os.getenv(
 BINANCE_PAY_ID = "45829163"
 
 BINANCE_PAY_LOOKBACK_DAYS = 7
-
-BINANCE_DEPOSIT_LOOKBACK_DAYS = 7
-
 
 # ==========================================================
 # BINANCE API USAGE CONTROL

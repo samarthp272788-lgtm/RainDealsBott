@@ -27,6 +27,7 @@ from database import SessionLocal, transaction, retry_on_write_conflict
 from models.product import Product
 from models.user import User
 from models.order import Order
+from models.product_engagement import ProductEngagement
 from models.custom_rate import CustomRate
 from models.rate_control import ProductRateControl, RateControlAssignment
 
@@ -563,55 +564,146 @@ class SearchStates(StatesGroup):
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║          IN-MEMORY STORES                                    ║
+# ║       DURABLE FAVORITES AND RESTOCK SUBSCRIPTIONS            ║
 # ╚══════════════════════════════════════════════════════════════╝
 
-_notify_subscribers: dict[int, list[int]] = {}
-_favorites: dict[int, list[int]] = {}
-
-_notify_lock = asyncio.Lock()
-_favorites_lock = asyncio.Lock()
-
-
-async def _add_notify_subscriber(product_id: int, user_id: int) -> bool:
-    async with _notify_lock:
-        if product_id not in _notify_subscribers:
-            _notify_subscribers[product_id] = []
-        if user_id not in _notify_subscribers[product_id]:
-            _notify_subscribers[product_id].append(user_id)
-            return True
-        return False
-
-
-async def _remove_notify_subscriber(product_id: int, user_id: int) -> bool:
-    async with _notify_lock:
-        if product_id in _notify_subscribers and user_id in _notify_subscribers[product_id]:
-            _notify_subscribers[product_id].remove(user_id)
-            return True
-        return False
+def _engagement_row(db, user_id: int, product_id: int, *, create: bool = False):
+    # Locking the existing user serializes first-time favorites/subscriptions
+    # for that user and avoids duplicate composite-key inserts on rapid taps.
+    user = db.query(User).filter(User.telegram_id == user_id).with_for_update().first()
+    if not user:
+        return None
+    row = (
+        db.query(ProductEngagement)
+        .filter_by(telegram_id=user_id, product_id=product_id)
+        .with_for_update()
+        .first()
+    )
+    if row is None and create:
+        row = ProductEngagement(telegram_id=user_id, product_id=product_id)
+        db.add(row)
+        db.flush()
+    return row
 
 
-async def _toggle_favorite(user_id: int, product_id: int) -> bool:
-    """Returns True if added, False if removed."""
-    async with _favorites_lock:
-        if user_id not in _favorites:
-            _favorites[user_id] = []
-        if product_id in _favorites[user_id]:
-            _favorites[user_id].remove(product_id)
+def _toggle_favorite(user_id: int, product_id: int) -> bool:
+    db = SessionLocal()
+    try:
+        row = _engagement_row(db, user_id, product_id, create=True)
+        if row is None:
             return False
-        else:
-            _favorites[user_id].append(product_id)
-            return True
+        row.is_favorite = not bool(row.is_favorite)
+        added = bool(row.is_favorite)
+        if not row.is_favorite and not row.restock_enabled:
+            db.delete(row)
+        db.commit()
+        return added
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
-async def _is_favorite(user_id: int, product_id: int) -> bool:
-    async with _favorites_lock:
-        return user_id in _favorites and product_id in _favorites[user_id]
+def _is_favorite(user_id: int, product_id: int) -> bool:
+    db = SessionLocal()
+    try:
+        return db.query(ProductEngagement.id).filter_by(
+            telegram_id=user_id, product_id=product_id, is_favorite=True
+        ).first() is not None
+    finally:
+        db.close()
 
 
-async def _get_favorites(user_id: int) -> list[int]:
-    async with _favorites_lock:
-        return _favorites.get(user_id, [])[:]
+def _get_favorites(user_id: int) -> list[int]:
+    db = SessionLocal()
+    try:
+        return [row[0] for row in db.query(ProductEngagement.product_id).filter_by(
+            telegram_id=user_id, is_favorite=True
+        ).order_by(ProductEngagement.created_at.desc()).all()]
+    finally:
+        db.close()
+
+
+def _set_restock_subscription(user_id: int, product_id: int, enabled: bool) -> bool:
+    db = SessionLocal()
+    try:
+        row = _engagement_row(db, user_id, product_id, create=enabled)
+        if row is None:
+            return False
+        was_enabled = bool(row.restock_enabled)
+        row.restock_enabled = enabled
+        if not row.is_favorite and not row.restock_enabled:
+            db.delete(row)
+        db.commit()
+        return (not was_enabled) if enabled else was_enabled
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _restock_subscribers(product_id: int) -> list[int]:
+    db = SessionLocal()
+    try:
+        return [row[0] for row in db.query(ProductEngagement.telegram_id).filter_by(
+            product_id=product_id, restock_enabled=True
+        ).all()]
+    finally:
+        db.close()
+
+
+def _claim_restock_subscription(user_id: int, product_id: int) -> bool:
+    db = SessionLocal()
+    try:
+        row = _engagement_row(db, user_id, product_id)
+        if not row or not row.restock_enabled:
+            return False
+        row.restock_enabled = False
+        if not row.is_favorite:
+            db.delete(row)
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+async def _notify_restock_subscribers(bot, product, stock: int) -> None:
+    subscribers = await asyncio.to_thread(_restock_subscribers, product.id)
+    if not subscribers:
+        return
+    text = (
+        f"🔔 <b>BACK IN STOCK</b>\n\n"
+        f"{_esc(product.icon or '📦')} <b>{_esc(product.name)}</b>\n"
+        f"💰 Price: <b>${_money(product.price):.2f}</b>\n"
+        f"📦 Available now: <b>{stock}</b>\n\n"
+        "You asked to be notified. Open the product to see the latest stock and order."
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛍 View product", callback_data=f"product_{product.id}")],
+        [InlineKeyboardButton(text="🔕 Keep browsing", callback_data="products_menu")],
+    ])
+    for user_id in subscribers:
+        try:
+            claimed = await asyncio.to_thread(_claim_restock_subscription, user_id, product.id)
+        except Exception:
+            logger.exception("Could not claim restock alert for user %s product %s", user_id, product.id)
+            continue
+        if not claimed:
+            continue
+        try:
+            await bot.send_message(user_id, text, parse_mode="HTML", reply_markup=keyboard)
+        except Exception:
+            # Restore the one-shot alert if Telegram did not accept the send.
+            try:
+                await asyncio.to_thread(_set_restock_subscription, user_id, product.id, True)
+            except Exception:
+                logger.exception("Could not restore failed restock alert for user %s product %s", user_id, product.id)
+            logger.info("Could not send restock alert to user %s for product %s", user_id, product.id)
 
 
 async def _search_products(query: str) -> list:
@@ -983,6 +1075,8 @@ async def _scan_stock_changes(bot, products: list):
             product_id=product.id,
             can_buy=kwargs.get("stock", 0) > 0,
         )
+        if kind == "restock":
+            await _notify_restock_subscribers(bot, product, int(kwargs.get("stock", 0)))
 
 
 def _fire_stock_scan(bot, products: list):
@@ -1177,6 +1271,9 @@ async def _show_product_categories(callback: CallbackQuery, products: list):
             )])
     rows.extend([
         [InlineKeyboardButton(text=f"🛍 All Products ({len(products)})", callback_data="products_all", style="primary")],
+        [InlineKeyboardButton(text="⭐ Favorites", callback_data="favorites_menu", style="success"),
+         InlineKeyboardButton(text="🔔 Restock alerts", callback_data="restock_alerts_menu", style="primary")],
+        [InlineKeyboardButton(text="🔍 Search products", callback_data="search_start", style="primary")],
         [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")],
     ])
     await show(
@@ -1289,18 +1386,19 @@ async def toggle_favorite(callback: CallbackQuery):
     product_id = int(callback.data.split("_")[2])
     user_id = callback.from_user.id
 
-    added = await _toggle_favorite(user_id, product_id)
+    added = await asyncio.to_thread(_toggle_favorite, user_id, product_id)
     await callback.answer(
         "⭐ Added to favorites!" if added else "💔 Removed from favorites",
         show_alert=True
     )
+    await product_info(callback, linked_product_id=product_id, acknowledge_callback=False)
 
 
 @router.callback_query(F.data == "favorites_menu")
 async def favorites_menu(callback: CallbackQuery):
     await callback.answer()
     user_id = callback.from_user.id
-    fav_ids = await _get_favorites(user_id)
+    fav_ids = await asyncio.to_thread(_get_favorites, user_id)
 
     if not fav_ids:
         await show(
@@ -1392,15 +1490,21 @@ async def favorites_menu(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("notify_available_"))
 async def notify_when_available(callback: CallbackQuery):
-    await callback.answer()
     product_id = int(callback.data.split("_")[2])
     product = await asyncio.to_thread(_fetch_product, product_id)
     user_id = callback.from_user.id
 
     if not product:
+        await callback.answer("Product is no longer available.", show_alert=True)
         return
 
-    is_new = await _add_notify_subscriber(product_id, user_id)
+    if _real_stock(product) > 0:
+        await callback.answer("This product is already in stock.", show_alert=True)
+        await product_info(callback, linked_product_id=product_id, acknowledge_callback=False)
+        return
+
+    is_new = await asyncio.to_thread(_set_restock_subscription, user_id, product_id, True)
+    await callback.answer("Restock alert saved." if is_new else "You already have a restock alert.")
     cat_config = _get_category_config(product.category)
 
     if is_new:
@@ -1439,14 +1543,57 @@ async def notify_when_available(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("notify_remove_"))
 async def notify_remove(callback: CallbackQuery):
-    await callback.answer()
     product_id = int(callback.data.split("_")[2])
     user_id = callback.from_user.id
-    removed = await _remove_notify_subscriber(product_id, user_id)
+    removed = await asyncio.to_thread(_set_restock_subscription, user_id, product_id, False)
     await callback.answer(
         "🔕 Unsubscribed from notifications" if removed else "You weren't subscribed to this product",
         show_alert=True
     )
+    # Refresh the alert card immediately so the removed item does not remain
+    # visible as an active subscription until the next navigation.
+    await restock_alerts_menu(callback, acknowledge_callback=False)
+
+
+def _restock_subscribed_product_ids(user_id: int) -> list[int]:
+    db = SessionLocal()
+    try:
+        return [row[0] for row in db.query(ProductEngagement.product_id).filter_by(
+            telegram_id=user_id, restock_enabled=True
+        ).order_by(ProductEngagement.created_at.desc()).all()]
+    finally:
+        db.close()
+
+
+@router.callback_query(F.data == "restock_alerts_menu")
+async def restock_alerts_menu(callback: CallbackQuery, acknowledge_callback: bool = True):
+    if acknowledge_callback:
+        await callback.answer()
+    product_ids = await asyncio.to_thread(_restock_subscribed_product_ids, callback.from_user.id)
+    products = await asyncio.to_thread(_fetch_products_by_ids, product_ids) if product_ids else []
+    if not products:
+        await show(
+            callback,
+            "🔔 <b>RESTOCK ALERTS</b>\n\nYou have no active alerts. Open an out-of-stock product and tap <b>Notify When Available</b>.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🛍 Browse products", callback_data="products_menu", style="success")],
+                [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")],
+            ]),
+        )
+        return
+
+    keyboard = []
+    lines = ["🔔 <b>YOUR RESTOCK ALERTS</b>\n", "We’ll message you when any of these products are restocked:\n"]
+    for product in products[:40]:
+        lines.append(f"• {_esc(product.icon or '📦')} <b>{_esc(product.name)}</b> · ${_money(product.price):.2f}")
+        keyboard.append([
+            InlineKeyboardButton(text=f"🛍 {product.name[:30]}", callback_data=f"product_{product.id}"),
+            InlineKeyboardButton(text="🔕 Remove", callback_data=f"notify_remove_{product.id}", style="danger"),
+        ])
+    keyboard.append([InlineKeyboardButton(text="⬅ Shop", callback_data="products_menu", style="primary"),
+                     InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")])
+    await show(callback, "\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -1614,9 +1761,13 @@ async def search_results(message: Message, state: FSMContext):
 # ╚══════════════════════════════════════════════════════════════╝
 
 @router.callback_query(F.data.startswith("product_"))
-async def product_info(callback: CallbackQuery | Message, linked_product_id: int | None = None):
+async def product_info(
+    callback: CallbackQuery | Message,
+    linked_product_id: int | None = None,
+    acknowledge_callback: bool = True,
+):
     is_callback = isinstance(callback, CallbackQuery)
-    if is_callback:
+    if is_callback and acknowledge_callback:
         await callback.answer()
     product_id = linked_product_id if linked_product_id is not None else int(callback.data.split("_")[1])
 
@@ -1651,7 +1802,7 @@ async def product_info(callback: CallbackQuery | Message, linked_product_id: int
     real_stock_available = _real_stock(product) > 0
     stock_count = _real_stock(product)
     cat_config = _get_category_config(product.category)
-    is_fav = await _is_favorite(user_id, product_id)
+    is_fav = await asyncio.to_thread(_is_favorite, user_id, product_id)
 
     delivery_type = (product.delivery_type or "automatic").lower()
     delivery_config = {
@@ -1733,6 +1884,14 @@ async def product_info(callback: CallbackQuery | Message, linked_product_id: int
         buttons.append([
             InlineKeyboardButton(text=button_text, callback_data=f"select_qty_{product_id}", style=button_style)
         ])
+        if not real_stock_available:
+            buttons.append([
+                InlineKeyboardButton(
+                    text="🔔 Notify When Available",
+                    callback_data=f"notify_available_{product_id}",
+                    style="primary",
+                )
+            ])
         if real_stock_available and max_qty >= 1 and not is_free:
             quick_buy_qty = f"{max_qty}" if max_qty < 999999 else "available"
             text += f"\n💡 <b>Quick Buy:</b> You can buy {quick_buy_qty} units."
