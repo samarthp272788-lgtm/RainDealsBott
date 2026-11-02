@@ -1117,32 +1117,38 @@ async def _show_invoice(target, state: FSMContext, deposit_id: int, network: str
         except Exception:
             pass
 
+    invoice_message = None
     if qr:
         try:
             path = Path(qr)
             photo = FSInputFile(path) if path.is_file() else qr
-            photo_message = await bot.send_photo(
+            invoice_message = await bot.send_photo(
                 chat_id=chat_id,
                 photo=photo,
-                caption=f"{_get_network_info(network)['icon']} {_get_network_info(network)['label']} · "
-                        f"Invoice {data.get('invoice_code')}",
+                caption=body,
+                parse_mode="HTML",
+                reply_markup=_invoice_keyboard(),
             )
-            await state.update_data(invoice_photo_message_id=photo_message.message_id)
         except Exception:
             logger.exception("Could not send configured %s QR image", network)
 
-    if isinstance(target, CallbackQuery):
-        invoice_message = await target.message.answer(
-            body, parse_mode="HTML", reply_markup=_invoice_keyboard()
-        )
-    else:
-        invoice_message = await target.answer(
-            body, parse_mode="HTML", reply_markup=_invoice_keyboard()
-        )
+    # A configured QR image and its invoice details are a single Telegram
+    # photo message (image with caption), matching the previous payment card.
+    # Methods without a QR (for example Binance Pay) use one text card.
+    if invoice_message is None:
+        if isinstance(target, CallbackQuery):
+            invoice_message = await target.message.answer(
+                body, parse_mode="HTML", reply_markup=_invoice_keyboard()
+            )
+        else:
+            invoice_message = await target.answer(
+                body, parse_mode="HTML", reply_markup=_invoice_keyboard()
+            )
     await state.update_data(
         _card_chat_id=invoice_message.chat.id,
         _card_message_id=invoice_message.message_id,
         invoice_card_message_id=invoice_message.message_id,
+        invoice_photo_message_id=invoice_message.message_id if qr and invoice_message.photo else None,
     )
 
 
