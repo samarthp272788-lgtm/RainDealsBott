@@ -660,7 +660,17 @@ async def deposit_menu(callback: CallbackQuery, state: FSMContext):
     started = time.perf_counter()
     try:
         await callback.answer()
-        await state.clear()
+        active = await asyncio.to_thread(_active_invoice, callback.from_user.id)
+        if active:
+            await state.update_data(
+                deposit_id=active["id"],
+                invoice_code=active["code"],
+                invoice_expires_at=active["expires_at"],
+                amount_usdt=active["amount_usdt"],
+                network=active["network"],
+            )
+        else:
+            await state.clear()
 
         text = (
             f"💰 <b>DEPOSIT FUNDS</b>\n\n"
@@ -684,7 +694,8 @@ async def deposit_menu(callback: CallbackQuery, state: FSMContext):
             callback,
             text,
             parse_mode="HTML",
-            reply_markup=get_deposit_menu()
+            reply_markup=get_deposit_menu(),
+            state=state,
         )
     finally:
         logger.info(
@@ -1049,11 +1060,7 @@ def _switch_invoice_network(deposit_id: int, network: str) -> bool:
 
 def _invoice_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🟡 BEP20", callback_data="deposit_bep20"),
-         InlineKeyboardButton(text="🟣 Polygon", callback_data="deposit_polygon")],
-        [InlineKeyboardButton(text="🟢 UPI", callback_data="deposit_upi"),
-         InlineKeyboardButton(text="🔴 Binance Pay", callback_data="deposit_binance")],
-        [InlineKeyboardButton(text="❌ Cancel", callback_data="deposit_start")],
+        [InlineKeyboardButton(text="↩️ Change payment method", callback_data="deposit_start")],
     ])
 
 
@@ -1085,34 +1092,58 @@ def _invoice_payload(network: str, data: dict) -> tuple[str, str | None]:
                 f"Pay ID: <code>{BINANCE_PAY_ID}</code>\n\n"
                 "Pay the amount you choose, then submit the Binance Pay transaction/order reference. The verified amount is credited.")
         reference = "Binance Pay reference"
-    body += f"\n\n📋 After paying, send your <b>{reference}</b>.\nYou can switch methods above; the invoice code and expiry stay the same."
+    body += f"\n\n📋 After paying, send your <b>{reference}</b>.\nTo use another method, return to payment options; this invoice code and expiry stay the same."
     return body, qr
 
 
 async def _show_invoice(target, state: FSMContext, deposit_id: int, network: str, data: dict):
     body, qr = _invoice_payload(network, data)
-    if isinstance(target, CallbackQuery):
-        await show(target, body, parse_mode="HTML", reply_markup=_invoice_keyboard(), state=state)
-        bot = target.bot
-        chat_id = target.message.chat.id
-    else:
-        await update_card(target, state, body, parse_mode="HTML", reply_markup=_invoice_keyboard())
-        bot = target.bot
-        chat_id = target.chat.id
+    bot = target.bot
+    chat_id = target.message.chat.id if isinstance(target, CallbackQuery) else target.chat.id
     previous_photo = data.get("invoice_photo_message_id")
-    if previous_photo:
+    previous_card = data.get("_card_message_id")
+    previous_chat = data.get("_card_chat_id") or chat_id
+
+    # Remove the previous invoice view before recreating it, so a switched
+    # payment method always appears as QR first and invoice/buttons below.
+    if previous_card:
         try:
-            await bot.delete_message(chat_id, int(previous_photo))
+            await bot.delete_message(chat_id=int(previous_chat), message_id=int(previous_card))
         except Exception:
             pass
+    if previous_photo:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=int(previous_photo))
+        except Exception:
+            pass
+
     if qr:
         try:
             path = Path(qr)
             photo = FSInputFile(path) if path.is_file() else qr
-            sent = await bot.send_photo(chat_id=chat_id, photo=photo, caption=f"Invoice {data.get('invoice_code')} · {_get_network_info(network)['label']}")
-            await state.update_data(invoice_photo_message_id=sent.message_id)
+            photo_message = await bot.send_photo(
+                chat_id=chat_id,
+                photo=photo,
+                caption=f"{_get_network_info(network)['icon']} {_get_network_info(network)['label']} · "
+                        f"Invoice {data.get('invoice_code')}",
+            )
+            await state.update_data(invoice_photo_message_id=photo_message.message_id)
         except Exception:
             logger.exception("Could not send configured %s QR image", network)
+
+    if isinstance(target, CallbackQuery):
+        invoice_message = await target.message.answer(
+            body, parse_mode="HTML", reply_markup=_invoice_keyboard()
+        )
+    else:
+        invoice_message = await target.answer(
+            body, parse_mode="HTML", reply_markup=_invoice_keyboard()
+        )
+    await state.update_data(
+        _card_chat_id=invoice_message.chat.id,
+        _card_message_id=invoice_message.message_id,
+        invoice_card_message_id=invoice_message.message_id,
+    )
 
 
 # ╔══════════════════════════════════════════════════════════════╗
