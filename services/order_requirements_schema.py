@@ -23,6 +23,9 @@ def ensure_order_requirements_schema() -> None:
         _ensure_column(connection, "deposits", "invoice_code", "VARCHAR(32) NULL")
         _ensure_column(connection, "deposits", "invoice_expires_at", "DATETIME NULL")
         _ensure_column(connection, "deposits", "invoice_usdt_amount", "DECIMAL(20,8) NULL")
+        _ensure_column(connection, "deposits", "telegram_chat_id", "BIGINT NULL")
+        _ensure_column(connection, "deposits", "telegram_message_id", "BIGINT NULL")
+        _ensure_column(connection, "deposits", "verification_started_at", "DATETIME NULL")
         index_exists = connection.execute(text(
             "SELECT 1 FROM information_schema.STATISTICS "
             "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='deposits' "

@@ -22,7 +22,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 import config
 from config import ADMIN_IDS
-from utils.ui import show, update_card, answer_card
+from utils.ui import schedule_delete_card, show, update_card, answer_card
 from database import SessionLocal, transaction, retry_on_write_conflict
 from models.product import Product
 from models.user import User
@@ -2532,6 +2532,29 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
                 )
             else:
                 result = await asyncio.to_thread(_do_purchase, telegram_id, product_id, quantity)
+        except asyncio.CancelledError:
+            logger.warning(
+                "Order request interrupted for user=%s product=%s; result may need review",
+                telegram_id,
+                product_id,
+            )
+            try:
+                await show(
+                    callback,
+                    (
+                        "⚠️ <b>ORDER STATUS NEEDS A CHECK</b>\n\n"
+                        "The order request was interrupted before the bot could show its result. "
+                        "Open <b>My Orders</b> before trying again so you can confirm whether it completed."
+                    ),
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="📜 My Orders", callback_data="orders_menu", style="primary")],
+                        [InlineKeyboardButton(text="🆘 Support", callback_data="support_menu", style="danger")],
+                    ]),
+                )
+            except Exception:
+                logger.exception("Could not replace interrupted order progress card")
+            raise
         except SQLAlchemyError:
             logger.exception("Database error during purchase")
             await show(callback, f"❌ <b>Database Error</b>\n\nSomething went wrong. Please try again.",
@@ -2844,6 +2867,7 @@ async def _fetch_and_show_reseller_products(callback: CallbackQuery, reseller_id
 
         if not api_key or not base_url:
             await loading_message.edit_text("❌ Provider credentials not configured properly.")
+            schedule_delete_card(loading_message, owner_id=user_id, delay_seconds=900)
             return
 
         manager = ResellerManager(
@@ -2875,6 +2899,7 @@ async def _fetch_and_show_reseller_products(callback: CallbackQuery, reseller_id
 
         if not services:
             await loading_message.edit_text("📭 No in-stock products found from this provider.")
+            schedule_delete_card(loading_message, owner_id=user_id, delay_seconds=900)
             return
 
         text = (
@@ -2910,6 +2935,7 @@ async def _fetch_and_show_reseller_products(callback: CallbackQuery, reseller_id
         logger.exception("Error fetching reseller products for provider %s", reseller_id)
         try:
             await loading_message.edit_text(f"❌ Error fetching products: {str(e)}")
+            schedule_delete_card(loading_message, owner_id=user_id, delay_seconds=900)
         except Exception:
             pass
     finally:

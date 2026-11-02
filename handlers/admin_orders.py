@@ -1,5 +1,5 @@
 
-from utils.ui import answer_card
+from utils.ui import answer_card, schedule_success_notice
 import asyncio
 import logging
 from html import escape
@@ -445,7 +445,7 @@ async def delete_order(callback: CallbackQuery):
     finally:
         db.close()
 
-    await callback.message.edit_text(
+    deleted_notice = await callback.message.edit_text(
         "✅ Order deleted.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
@@ -453,6 +453,7 @@ async def delete_order(callback: CallbackQuery):
             ]
         )
     )
+    schedule_success_notice(deleted_notice, "✅ Order deleted.", owner_id=callback.from_user.id)
     await callback.answer()
 
 

@@ -32,7 +32,13 @@ from services.deposit_checker import verify_deposit
 from keyboards.deposit import get_deposit_menu
 import config
 from config import BEP20_ADDRESS, POLYGON_ADDRESS, BINANCE_PAY_ID
-from utils.ui import show, update_card, answer_card
+from utils.ui import (
+    show,
+    update_card,
+    answer_card,
+    schedule_card_transition,
+    schedule_delete_card,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -209,61 +215,34 @@ def _status_label(status: str) -> str:
 # ║           AUTO-CLOSE SUCCESS MESSAGE HELPER                ║
 # ╚══════════════════════════════════════════════════════════════╝
 
-async def _auto_close_success_message(
-    bot,
-    chat_id: int,
-    message_id: int,
-    delay_seconds: int = 60,
-):
-    """
-    After a delay, automatically edit the success/thank-you message
-    to transition back to the main menu.
-    This prevents the "thank you" message from staying open forever.
-    """
-    await asyncio.sleep(delay_seconds)
-    try:
-        await bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=(
-                "🏠 <b>Main Menu</b>\n\n"
-                "Welcome back! What would you like to do?\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "💡 <i>Your deposit was confirmed successfully.</i>\n\n"
-                "Use the buttons below to navigate:"
-            ),
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="🛍 Shop Now",
-                            callback_data="products_menu",
-                        ),
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            text="💰 Make a Deposit",
-                            callback_data="deposit_start",
-                        ),
-                        InlineKeyboardButton(
-                            text="📜 My Orders",
-                            callback_data="orders_menu",
-                        ),
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            text="🏠 Main Menu",
-                            callback_data="main_menu",
-                        ),
-                    ],
-                ]
-            ),
-        )
-    except Exception:
-        # Message might have been deleted, already edited by user action,
-        # or the user clicked a button before the timer fired.
-        pass
+def _schedule_auto_close_success_message(bot, chat_id: int, message_id: int, delay_seconds: int = 60):
+    """Return a completed deposit card to its menu unless the user navigates first."""
+    menu_text = (
+        "🏠 <b>Main Menu</b>\n\n"
+        "Welcome back! What would you like to do?\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "💡 <i>Your deposit was confirmed successfully.</i>\n\n"
+        "Use the buttons below to navigate:"
+    )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🛍 Shop Now", callback_data="products_menu")],
+            [
+                InlineKeyboardButton(text="💰 Make a Deposit", callback_data="deposit_start"),
+                InlineKeyboardButton(text="📜 My Orders", callback_data="orders_menu"),
+            ],
+            [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu")],
+        ]
+    )
+    return schedule_card_transition(
+        bot,
+        chat_id=chat_id,
+        message_id=message_id,
+        delay_seconds=delay_seconds,
+        text=menu_text,
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -271,13 +250,13 @@ async def _auto_close_success_message(
 # ╚══════════════════════════════════════════════════════════════╝
 
 def _cancel_kb() -> InlineKeyboardMarkup:
-    """Cancel button - returns to deposit method selection."""
+    """Cancel the active unpaid invoice or navigate to the main menu."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text="❌ Cancel Deposit",
-                    callback_data="deposit_start",
+                    callback_data="deposit_cancel",
                 )
             ],
             [
@@ -517,7 +496,7 @@ async def _show_deposits_page(callback: CallbackQuery, page: int = 0):
     nav_buttons.append([InlineKeyboardButton(text="💰 Make a Deposit", callback_data="deposit_start")])
     nav_buttons.append([InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu")])
 
-    await show(
+    result_card = await show(
         callback,
         text,
         parse_mode="HTML",
@@ -896,13 +875,11 @@ async def process_promo_code(message: Message, state: FSMContext):
     # ║  AUTO-CLOSE: After 60 sec, transition back to main menu    ║
     # ╚══════════════════════════════════════════════════════════════╝
     if card_chat_id and card_message_id:
-        asyncio.create_task(
-            _auto_close_success_message(
-                bot=message.bot,
-                chat_id=card_chat_id,
-                message_id=card_message_id,
-                delay_seconds=60,
-            )
+        _schedule_auto_close_success_message(
+            bot=message.bot,
+            chat_id=card_chat_id,
+            message_id=card_message_id,
+            delay_seconds=60,
         )
 
 
@@ -1059,6 +1036,96 @@ def _switch_invoice_network(deposit_id: int, network: str) -> bool:
         db.close()
 
 
+def _cancel_invoice(deposit_id: int, telegram_id: int) -> str:
+    """Expire an unpaid invoice; never cancel one with a submitted reference."""
+    db = SessionLocal()
+    try:
+        deposit = (
+            db.query(Deposit)
+            .filter(Deposit.id == deposit_id, Deposit.telegram_id == telegram_id)
+            .first()
+        )
+        if not deposit:
+            return "not_found"
+        if deposit.tx_hash or deposit.status == "pending":
+            return "submitted"
+        if deposit.status != "waiting_hash":
+            return "inactive"
+        deposit.status = "expired"
+        db.commit()
+        return "cancelled"
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+@router.callback_query(F.data == "deposit_cancel")
+async def cancel_deposit(callback: CallbackQuery, state: FSMContext):
+    """Cancel the current unpaid invoice and replace its QR card cleanly."""
+    await callback.answer()
+    data = await state.get_data()
+    deposit_id = data.get("deposit_id")
+    if not deposit_id:
+        active = await asyncio.to_thread(_active_invoice, callback.from_user.id)
+        deposit_id = active.get("id") if active else None
+
+    if deposit_id:
+        try:
+            result = await asyncio.to_thread(
+                _cancel_invoice, int(deposit_id), callback.from_user.id
+            )
+        except Exception:
+            logger.exception("Could not cancel deposit invoice %s", deposit_id)
+            result = "error"
+    else:
+        result = "not_found"
+
+    await state.clear()
+    if result == "cancelled":
+        text = (
+            "❌ <b>Deposit cancelled</b>\n\n"
+            "This unpaid invoice is closed. No payment was verified."
+        )
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💰 New Deposit", callback_data="deposit_start")],
+            [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu")],
+        ])
+    elif result == "submitted":
+        text = (
+            "⏳ <b>Payment reference already submitted</b>\n\n"
+            "This invoice cannot be cancelled while verification is in progress. "
+            "Check your deposit status or contact support if needed."
+        )
+        keyboard = _status_kb("pending", str(data.get("network") or "BEP20"))
+    elif result == "error":
+        text = "⚠️ Could not cancel this invoice. Please try again."
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu")]
+        ])
+    else:
+        text = "ℹ️ <b>No active deposit to cancel.</b>"
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💰 New Deposit", callback_data="deposit_start")],
+            [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu")],
+        ])
+
+    await show(
+        callback,
+        text,
+        parse_mode="HTML",
+        reply_markup=keyboard,
+        replace_media=bool(callback.message.photo),
+    )
+    if result == "cancelled" and result_card:
+        schedule_delete_card(
+            result_card,
+            owner_id=callback.from_user.id,
+            delay_seconds=900,
+        )
+
+
 def _invoice_keyboard() -> InlineKeyboardMarkup:
     # Keep the controls from the original deposit card.
     return _cancel_kb()
@@ -1179,6 +1246,12 @@ async def _show_invoice(target, state: FSMContext, deposit_id: int, network: str
         invoice_card_message_id=invoice_message.message_id,
         invoice_photo_message_id=invoice_message.message_id if qr and invoice_message.photo else None,
     )
+    await asyncio.to_thread(
+        _save_deposit_card,
+        deposit_id,
+        invoice_message.chat.id,
+        invoice_message.message_id,
+    )
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -1218,9 +1291,28 @@ def _set_pending_if_waiting(deposit_id: int) -> None:
     db = SessionLocal()
     try:
         dep = db.query(Deposit).filter(Deposit.id == deposit_id).first()
-        if dep and dep.status == "waiting_hash":
+        if dep and dep.status not in {"completed", "failed", "expired"}:
             dep.status = "pending"
+            dep.verification_started_at = None
             db.commit()
+    finally:
+        db.close()
+
+
+def _save_deposit_card(deposit_id: int, chat_id: int, message_id: int, *, verifying: bool = False) -> None:
+    db = SessionLocal()
+    try:
+        deposit = db.query(Deposit).filter(Deposit.id == deposit_id).first()
+        if not deposit:
+            return
+        deposit.telegram_chat_id = int(chat_id)
+        deposit.telegram_message_id = int(message_id)
+        deposit.verification_started_at = datetime.utcnow() if verifying else None
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Could not persist Telegram card for deposit %s", deposit_id)
+        raise
     finally:
         db.close()
 
@@ -1335,7 +1427,7 @@ async def process_txid(message: Message, state: FSMContext):
         return
 
     # Verification loading
-    await update_card(
+    verifying_card = await update_card(
         message, state,
         (
             f"🔍 <b>Verifying Your Payment...</b>\n\n"
@@ -1349,8 +1441,46 @@ async def process_txid(message: Message, state: FSMContext):
         parse_mode="HTML"
     )
 
+    # Persist the current card before awaiting the payment network. If the
+    # process stops, startup recovery can requeue the deposit and replace this
+    # spinner on the same Telegram card.
+    if verifying_card:
+        try:
+            await asyncio.to_thread(
+                _save_deposit_card,
+                int(deposit_id),
+                verifying_card.chat.id,
+                verifying_card.message_id,
+                verifying=True,
+            )
+        except Exception:
+            logger.exception("Could not save verification card for deposit %s", deposit_id)
+
     result_info: dict = {}
-    success = await verify_deposit(deposit_id, result_info=result_info)
+    try:
+        success = await verify_deposit(deposit_id, result_info=result_info)
+    except Exception:
+        logger.exception("Immediate verification failed for deposit %s; leaving it for the checker", deposit_id)
+        try:
+            await asyncio.to_thread(_set_pending_if_waiting, int(deposit_id))
+        except Exception:
+            logger.exception("Could not queue deposit %s for automatic verification", deposit_id)
+        await state.clear()
+        await update_card(
+            message,
+            None,
+            (
+                "⏳ <b>VERIFICATION CONTINUES</b>\n\n"
+                f"🆔 Deposit: <code>#{deposit_id}</code>\n"
+                "Your reference is saved. Automatic verification will continue in the background.\n\n"
+                "You do not need to submit it again."
+            ),
+            chat_id=card_chat_id,
+            message_id=card_message_id,
+            parse_mode="HTML",
+            reply_markup=_status_kb("pending", network),
+        )
+        return
     await state.clear()
 
     # ═══════════════════════════════════════════════════════════════
@@ -1420,13 +1550,11 @@ async def process_txid(message: Message, state: FSMContext):
         # ║  AUTO-CLOSE: After 60 sec, transition back to main menu    ║
         # ╚══════════════════════════════════════════════════════════════╝
         if card_chat_id and card_message_id:
-            asyncio.create_task(
-                _auto_close_success_message(
-                    bot=message.bot,
-                    chat_id=card_chat_id,
-                    message_id=card_message_id,
-                    delay_seconds=60,
-                )
+            _schedule_auto_close_success_message(
+                bot=message.bot,
+                chat_id=card_chat_id,
+                message_id=card_message_id,
+                delay_seconds=60,
             )
 
         return

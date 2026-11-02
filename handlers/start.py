@@ -294,7 +294,13 @@ async def main_menu_cb(callback: CallbackQuery, state: FSMContext):
         return
 
     keyboard = get_admin_main_menu() if callback.from_user.id in ADMIN_IDS else get_main_menu()
-    await show(callback, text, reply_markup=keyboard, parse_mode="HTML")
+    await show(
+        callback,
+        text,
+        reply_markup=keyboard,
+        parse_mode="HTML",
+        replace_media=bool(callback.message.photo),
+    )
 
 
 @router.callback_query(F.data == "my_profile")

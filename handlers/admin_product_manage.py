@@ -1,5 +1,5 @@
 
-from utils.ui import answer_card
+from utils.ui import answer_card, schedule_success_notice
 from utils.uploads import text_from_message
 # handlers/admin_product_manage.py — FULLY WORKING ADMIN PRODUCT MANAGEMENT
 
@@ -227,7 +227,9 @@ def _divider(char: str = "━", length: int = 30) -> str:
 async def _safe_edit_text(message: Message, text: str, reply_markup=None, parse_mode: str = "HTML"):
     """Safely edit message text, ignoring Telegram 'message is not modified' errors."""
     try:
-        return await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        edited = await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        schedule_success_notice(edited, text)
+        return edited
     except TelegramBadRequest as e:
         if "message is not modified" in str(e).lower():
             return None

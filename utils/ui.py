@@ -26,7 +26,9 @@ ever silently fails to respond.
 """
 
 import asyncio
+import html
 import logging
+import re
 from collections import OrderedDict
 from html.parser import HTMLParser
 
@@ -52,6 +54,7 @@ _CARD_MESSAGE_ID_KEY = "_card_message_id"
 _CARD_LOCATIONS: OrderedDict[tuple[int, int], tuple[int, int]] = OrderedDict()
 _CARD_CACHE_LIMIT = 10_000
 _CARD_DELETE_TASKS: dict[tuple[int, int], asyncio.Task] = {}
+_CARD_TRANSITION_TASKS: dict[tuple[int, int], asyncio.Task] = {}
 
 
 def _remember_card(user_id: int, chat_id: int, message_id: int) -> None:
@@ -73,12 +76,62 @@ def _cancel_scheduled_card_delete(chat_id: int, message_id: int) -> None:
         task.cancel()
 
 
+def _cancel_scheduled_card_transition(chat_id: int, message_id: int) -> None:
+    key = (int(chat_id), int(message_id))
+    task = _CARD_TRANSITION_TASKS.pop(key, None)
+    if task and not task.done():
+        task.cancel()
+
+
+def schedule_card_transition(
+    bot,
+    *,
+    chat_id: int,
+    message_id: int,
+    delay_seconds: int,
+    text: str,
+    reply_markup=None,
+    parse_mode: str | None = "HTML",
+):
+    """Schedule a card update that is cancelled if the user navigates first."""
+    key = (int(chat_id), int(message_id))
+    _cancel_scheduled_card_transition(*key)
+    _cancel_scheduled_card_delete(*key)
+
+    async def _transition_later():
+        try:
+            await asyncio.sleep(max(1, int(delay_seconds)))
+            try:
+                await bot.edit_message_caption(
+                    chat_id=key[0], message_id=key[1], caption=text,
+                    parse_mode=parse_mode, reply_markup=reply_markup,
+                )
+            except Exception:
+                await bot.edit_message_text(
+                    chat_id=key[0], message_id=key[1], text=text,
+                    parse_mode=parse_mode, reply_markup=reply_markup,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.info("Scheduled Telegram card transition failed (%s)", type(exc).__name__)
+        finally:
+            current = _CARD_TRANSITION_TASKS.get(key)
+            if current is asyncio.current_task():
+                _CARD_TRANSITION_TASKS.pop(key, None)
+
+    task = asyncio.create_task(_transition_later())
+    _CARD_TRANSITION_TASKS[key] = task
+    return task
+
+
 def schedule_delete_card(message: Message, *, owner_id: int, delay_seconds: int = 900):
     """Delete a temporary card later, unless the conversation updates it first."""
     chat_id = int(message.chat.id)
     message_id = int(message.message_id)
     owner_id = int(owner_id)
     key = (chat_id, message_id)
+    _cancel_scheduled_card_transition(chat_id, message_id)
     _cancel_scheduled_card_delete(chat_id, message_id)
 
     async def _delete_later():
@@ -99,6 +152,41 @@ def schedule_delete_card(message: Message, *, owner_id: int, delay_seconds: int 
     task = asyncio.create_task(_delete_later())
     _CARD_DELETE_TASKS[key] = task
     return task
+
+
+_SUCCESS_WORDING = re.compile(
+    r"\b(?:updated|saved|added|deleted|created|replaced|set|enabled|disabled|"
+    r"cleared|cancelled|canceled|revoked|imported|uploaded|removed)\b",
+    re.IGNORECASE,
+)
+_PERSISTENT_NOTICE_WORDS = re.compile(
+    r"\b(?:deposit|payment|invoice|order|purchase|delivery|delivered|refund|"
+    r"credited|transaction|ticket|balance|verification|txid|utr)\b",
+    re.IGNORECASE,
+)
+
+
+def schedule_success_notice(
+    message: Message | None,
+    text: str,
+    *,
+    owner_id: int | None = None,
+) -> None:
+    """Auto-remove short action confirmations, while retaining financial records."""
+    if message is None:
+        return
+    _cancel_scheduled_card_delete(message.chat.id, message.message_id)
+    owner_id = int(owner_id if owner_id is not None else message.chat.id)
+    if len(text) > 650:
+        return
+    plain = html.unescape(re.sub(r"<[^>]*>", " ", text)).strip()
+    if not plain.startswith("✅"):
+        return
+    protected = _PERSISTENT_NOTICE_WORDS.search(plain)
+    is_order_delete_ack = bool(re.search(r"\border deleted\b", plain, re.IGNORECASE))
+    if (protected and not is_order_delete_ack) or not _SUCCESS_WORDING.search(plain):
+        return
+    schedule_delete_card(message, owner_id=owner_id, delay_seconds=900)
 
 
 class _HTMLTruncator(HTMLParser):
@@ -210,6 +298,7 @@ async def show(
     reply_markup=None,
     parse_mode: str | None = None,
     state=None,
+    replace_media: bool = False,
     **extra,
 ):
     """
@@ -221,9 +310,19 @@ async def show(
     follow-up message handler knows which card to keep editing.
     """
     kwargs = _kwargs(reply_markup, parse_mode, extra)
+    _cancel_scheduled_card_transition(callback.message.chat.id, callback.message.message_id)
+    _cancel_scheduled_card_delete(callback.message.chat.id, callback.message.message_id)
 
     try:
-        msg = await callback.message.edit_text(text, **kwargs)
+        if replace_media and callback.message.photo:
+            # Telegram cannot turn a photo message into a text message via edit.
+            try:
+                await callback.message.delete()
+            except Exception:
+                pass
+            msg = await callback.message.answer(text, **kwargs)
+        else:
+            msg = await callback.message.edit_text(text, **kwargs)
     except TelegramBadRequest as e:
         err = str(e).lower()
         if "message is not modified" in err:
@@ -242,14 +341,25 @@ async def show(
                 logger.info("show(): edit_text failed after truncation (%s), sending a new message", e2)
                 msg = await callback.message.answer(safe_text, **safe_kwargs)
         else:
-            # Card can no longer be edited (too old, deleted, or the
-            # very first message in the chat isn't text) -- fall back
-            # to sending a fresh one rather than losing the response.
-            logger.info("show(): edit_text failed (%s), sending a new message", e)
-            msg = await callback.message.answer(text, **kwargs)
+            # Photo-based cards (such as deposit QR cards) have a caption,
+            # not text. Edit that caption in place before creating a second
+            # message, so navigation and status updates stay on one card.
+            try:
+                msg = await callback.message.edit_caption(caption=text, **kwargs)
+            except TelegramBadRequest as caption_error:
+                if "message is not modified" in str(caption_error).lower():
+                    msg = callback.message
+                else:
+                    logger.info(
+                        "show(): text/caption edit failed (%s / %s), sending a new message",
+                        e,
+                        caption_error,
+                    )
+                    msg = await callback.message.answer(text, **kwargs)
 
     _remember_card(callback.from_user.id, msg.chat.id, msg.message_id)
     _cancel_scheduled_card_delete(msg.chat.id, msg.message_id)
+    schedule_success_notice(msg, text, owner_id=callback.from_user.id)
     if state is not None:
         await state.update_data(
             **{_CARD_CHAT_ID_KEY: msg.chat.id, _CARD_MESSAGE_ID_KEY: msg.message_id}
@@ -303,6 +413,9 @@ async def update_card(
             chat_id = chat_id or remembered[0]
             message_id = message_id or remembered[1]
 
+    if chat_id and message_id:
+        _cancel_scheduled_card_transition(chat_id, message_id)
+
     kwargs = _kwargs(reply_markup, parse_mode, extra)
     if chat_id and message_id:
         try:
@@ -324,8 +437,24 @@ async def update_card(
                     logger.info("update_card(): edit failed after truncation (%s)", retry_exc)
                     msg = None
             else:
-                logger.info("update_card(): edit failed (%s), sending a new card", exc)
-                msg = None
+                # A photo card uses its caption as the editable text.
+                try:
+                    msg = await message.bot.edit_message_caption(
+                        caption=text,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        **kwargs,
+                    )
+                except TelegramBadRequest as caption_exc:
+                    if "message is not modified" in str(caption_exc).lower():
+                        _cancel_scheduled_card_delete(chat_id, message_id)
+                        return None
+                    logger.info(
+                        "update_card(): text/caption edit failed (%s / %s)",
+                        exc,
+                        caption_exc,
+                    )
+                    msg = None
         if msg is not None:
             _cancel_scheduled_card_delete(msg.chat.id, msg.message_id)
             if state is not None:
@@ -334,6 +463,7 @@ async def update_card(
                 )
             if message.from_user:
                 _remember_card(message.from_user.id, msg.chat.id, msg.message_id)
+                schedule_success_notice(msg, text, owner_id=message.from_user.id)
             return msg
 
     msg = await message.answer(text, **kwargs)
@@ -343,6 +473,7 @@ async def update_card(
         )
     if message.from_user:
         _remember_card(message.from_user.id, msg.chat.id, msg.message_id)
+        schedule_success_notice(msg, text, owner_id=message.from_user.id)
     return msg
 
 

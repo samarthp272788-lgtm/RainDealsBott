@@ -1,5 +1,5 @@
 
-from utils.ui import answer_card
+from utils.ui import answer_card, schedule_delete_card
 from utils.uploads import text_from_message
 import json
 import logging
@@ -1827,4 +1827,6 @@ async def save_product(message: Message, state: FSMContext):
         ]
     )
 
-    await answer_card(message, text, parse_mode="HTML", reply_markup=keyboard)
+    created_card = await answer_card(message, text, parse_mode="HTML", reply_markup=keyboard)
+    if created_card:
+        schedule_delete_card(created_card, owner_id=message.from_user.id, delay_seconds=900)

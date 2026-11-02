@@ -1,5 +1,5 @@
 
-from utils.ui import answer_card, schedule_delete_card
+from utils.ui import answer_card, schedule_delete_card, schedule_success_notice
 # handlers/admin.py — FIXED ADMIN PANEL WITH DASHBOARD, BROADCAST & FULL PROVIDER MANAGEMENT
 import asyncio
 import hashlib
@@ -175,7 +175,9 @@ def _custom_rate_menu_markup() -> InlineKeyboardMarkup:
 async def _safe_edit_text(message: Message, text: str, reply_markup=None, parse_mode: str = "HTML"):
     """Safely edit message text ignoring Telegram 'message is not modified' errors."""
     try:
-        return await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        edited = await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        schedule_success_notice(edited, text)
+        return edited
     except TelegramBadRequest as e:
         if "message is not modified" in str(e).lower():
             return None
@@ -283,7 +285,8 @@ async def maintenance_mode_confirm(callback: CallbackQuery):
         await callback.answer("Could not save the setting. Please try again.", show_alert=True)
         return
     status = "enabled. Users will only see the maintenance notice." if enabled else "disabled. The store is available again."
-    await callback.message.edit_text(f"✅ Maintenance mode {status}")
+    updated = await callback.message.edit_text(f"✅ Maintenance mode {status}")
+    schedule_success_notice(updated, f"✅ Maintenance mode {status}", owner_id=callback.from_user.id)
     await callback.answer("Maintenance setting saved.")
 
 
@@ -490,7 +493,9 @@ async def manager_web_cancel(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Access denied.", show_alert=True)
         return
     if callback.message:
-        await answer_card(callback, "Manager Web link generation cancelled.", state=state)
+        cancelled_card = await answer_card(callback, "Manager Web link generation cancelled.", state=state)
+        if cancelled_card:
+            schedule_delete_card(cancelled_card, owner_id=callback.from_user.id, delay_seconds=900)
     await state.clear()
     await callback.answer()
 
@@ -512,11 +517,13 @@ async def manager_web_password(message: Message, state: FSMContext):
 
     submitted_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
     if not hmac.compare_digest(submitted_hash, MAINTENANCE_PASSWORD_HASH):
-        await answer_card(
+        error_card = await answer_card(
             message,
             "❌ Incorrect password. No Manager Web link was created.",
             state=state,
         )
+        if error_card:
+            schedule_delete_card(error_card, owner_id=message.from_user.id, delay_seconds=900)
         await state.clear()
         return
 
@@ -564,6 +571,7 @@ async def manager_web_password(message: Message, state: FSMContext):
         state=state,
     )
     if link_card is not None:
+        schedule_delete_card(link_card, owner_id=message.from_user.id, delay_seconds=900)
         try:
             await asyncio.to_thread(
                 _update_manager_web_link_card,

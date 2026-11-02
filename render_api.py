@@ -26,6 +26,10 @@ from fastapi.responses import JSONResponse
 from api.reseller_v1 import router as reseller_router
 from bot_app import bot, dp
 from services.deposit_checker import deposit_checker_loop
+from services.deposit_card_recovery import (
+    deposit_invoice_expiry_loop,
+    recover_interrupted_deposit_cards,
+)
 from services.order_notifications import order_notification_loop
 from services.product_api_access import ensure_product_api_access_schema
 from services.provider_schema import ensure_provider_schema
@@ -74,6 +78,7 @@ if not INTERNAL_SECRET:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     deposit_task: asyncio.Task | None = None
+    deposit_card_task: asyncio.Task | None = None
     order_notification_task: asyncio.Task | None = None
     polling_task: asyncio.Task | None = None
 
@@ -104,6 +109,15 @@ async def lifespan(app: FastAPI):
         logger.info(
             "Main Telegram bot connected: @%s",
             me.username,
+        )
+
+        # Requeue submitted deposits left in an in-flight state by a prior
+        # shutdown, then replace any stale verification spinner in place.
+        await recover_interrupted_deposit_cards(bot)
+
+        deposit_card_task = asyncio.create_task(
+            deposit_invoice_expiry_loop(bot),
+            name="deposit-invoice-card-expiry",
         )
 
         # ----------------------------------------------------
@@ -151,6 +165,7 @@ async def lifespan(app: FastAPI):
         tasks = (
             polling_task,
             deposit_task,
+            deposit_card_task,
             order_notification_task,
         )
 

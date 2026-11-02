@@ -11,11 +11,16 @@ from aiohttp import web
 from bot_app import bot, dp
 
 from services.deposit_checker import deposit_checker_loop
+from services.deposit_card_recovery import (
+    deposit_invoice_expiry_loop,
+    recover_interrupted_deposit_cards,
+)
 from services.order_notifications import order_notification_loop
 from services.product_api_access import ensure_product_api_access_schema
 from services.provider_schema import ensure_provider_schema
 from services.maintenance_mode import ensure_maintenance_schema
 from services.order_rating_schema import ensure_order_rating_schema
+from services.order_requirements_schema import ensure_order_requirements_schema
 
 
 # ============================================================
@@ -92,6 +97,7 @@ async def main():
     runner = None
 
     deposit_task = None
+    deposit_card_task = None
     order_notification_task = None
 
     # --------------------------------------------------------
@@ -104,6 +110,7 @@ async def main():
     await asyncio.to_thread(ensure_provider_schema)
     await asyncio.to_thread(ensure_maintenance_schema)
     await asyncio.to_thread(ensure_order_rating_schema)
+    await asyncio.to_thread(ensure_order_requirements_schema)
 
     # --------------------------------------------------------
     # DEPOSIT CHECKER
@@ -131,6 +138,13 @@ async def main():
 
     me = await bot.get_me()
 
+    await recover_interrupted_deposit_cards(bot)
+
+    deposit_card_task = asyncio.create_task(
+        deposit_invoice_expiry_loop(bot),
+        name="deposit-invoice-card-expiry",
+    )
+
     logger.info(
         "Logged in as @%s",
         me.username,
@@ -155,6 +169,18 @@ async def main():
         )
 
     finally:
+
+        if deposit_card_task and not deposit_card_task.done():
+
+            deposit_card_task.cancel()
+
+            try:
+
+                await deposit_card_task
+
+            except asyncio.CancelledError:
+
+                pass
 
         if deposit_task and not deposit_task.done():
 

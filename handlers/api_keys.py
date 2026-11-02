@@ -12,7 +12,7 @@ from services.api_keys import (
     create_api_key,
     revoke_api_key,
 )
-from utils.ui import show
+from utils.ui import schedule_delete_card, show
 
 
 router = Router()
@@ -88,7 +88,7 @@ async def api_key_menu(callback: CallbackQuery):
     else:
         status = "❌ No active API key"
 
-    await show(
+    key_card = await show(
         callback,
         "🔑 <b>RESELLER API ACCESS</b>\n\n"
         f"{status}\n\n"
@@ -103,6 +103,8 @@ async def api_key_menu(callback: CallbackQuery):
         parse_mode="HTML",
         reply_markup=_api_menu(),
     )
+    if raw_key and key_card:
+        schedule_delete_card(key_card, owner_id=callback.from_user.id, delay_seconds=900)
 
 
 @router.callback_query(F.data == "api_key_generate")
@@ -125,7 +127,7 @@ async def api_key_generate(callback: CallbackQuery):
         )
         return
 
-    await show(
+    key_card = await show(
         callback,
         "✅ <b>NEW API KEY CREATED</b>\n\n"
         "You can open API Access anytime to view this active key again.\n\n"
@@ -137,6 +139,8 @@ async def api_key_generate(callback: CallbackQuery):
         parse_mode="HTML",
         reply_markup=_api_menu(),
     )
+    if key_card:
+        schedule_delete_card(key_card, owner_id=callback.from_user.id, delay_seconds=900)
 
 
 @router.callback_query(F.data == "api_key_revoke")
