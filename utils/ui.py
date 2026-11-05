@@ -69,6 +69,10 @@ def _forget_card(user_id: int, chat_id: int) -> None:
     _CARD_LOCATIONS.pop((int(user_id), int(chat_id)), None)
 
 
+def get_card_location(user_id: int, chat_id: int):
+    return _CARD_LOCATIONS.get((int(user_id), int(chat_id)))
+
+
 def _cancel_scheduled_card_delete(chat_id: int, message_id: int) -> None:
     key = (int(chat_id), int(message_id))
     task = _CARD_DELETE_TASKS.pop(key, None)

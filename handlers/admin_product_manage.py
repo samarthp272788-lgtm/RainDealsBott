@@ -23,6 +23,7 @@ from aiogram.exceptions import TelegramBadRequest
 from config import ADMIN_IDS
 from database import SessionLocal
 from models.product import Product
+from services.fulfillment_policy import manual_allowed
 from models.admin_audit_log import AdminAuditLog
 from states.product_states import AddAccounts, EditAccounts, EditBulkPricing, EditProduct
 from handlers.products import (
@@ -582,6 +583,9 @@ ${float(product.price or 0):.2f}
                     callback_data=f"edit_stock_{product.id}"
                 )
             ],
+            [InlineKeyboardButton(
+                text="Manual fallback: ON" if product.manual_fallback else "Manual fallback: OFF",
+                callback_data=f"toggle_fallback_{product.id}")],
             [
                 InlineKeyboardButton(
                     text=f"🚚 Delivery: {DELIVERY_LABELS.get(delivery_type, delivery_type)}",
@@ -804,7 +808,7 @@ def _commit_account_import(product_id: int, lines: list[str], admin_id: int) -> 
         existing = set(existing_lines)
         fresh = [line for line in lines if line and line not in existing]
         product.file_content = "\n".join(existing_lines + fresh)
-        product.stock = len(existing_lines) + len(fresh)
+        product.stock = max(product.stock or 0, len(existing_lines) + len(fresh)) if manual_allowed(product) else len(existing_lines) + len(fresh)
         db.add(AdminAuditLog(
             admin_telegram_id=int(admin_id),
             action="add_stock_accounts",
@@ -1051,7 +1055,7 @@ def _commit_account_replacement(product_id: int, lines: list[str], admin_id: int
             return {"error": "Product not found."}
         previous_count = len([line for line in (product.file_content or "").splitlines() if line.strip()])
         product.file_content = "\n".join(lines)
-        product.stock = len(lines)
+        product.stock = max(product.stock or 0, len(lines)) if manual_allowed(product) else len(lines)
         db.add(AdminAuditLog(
             admin_telegram_id=int(admin_id), action="replace_stock_accounts",
             entity_type="product", entity_id=str(product.id),
@@ -1098,7 +1102,7 @@ async def clear_accounts(callback: CallbackQuery):
             return
 
         product.file_content = None
-        product.stock = 0
+        product.stock = product.stock if manual_allowed(product) else 0
         db.commit()
         invalidate_products_cache()
         db.refresh(product)
@@ -1200,6 +1204,31 @@ async def cycle_delivery_type(callback: CallbackQuery):
         db.close()
 
     await callback.answer(f"🚚 Delivery set to {new_label}")
+    await _refresh_manage_panel(callback, pid)
+
+
+@router.callback_query(F.data.startswith("toggle_fallback_"))
+async def toggle_manual_fallback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    pid = int(callback.data.rsplit("_", 1)[1])
+    def save():
+        db = SessionLocal()
+        try:
+            product = db.query(Product).filter(Product.id == pid).with_for_update().first()
+            if not product or product.source != "own":
+                return False
+            product.manual_fallback = not product.manual_fallback
+            db.commit()
+            return True
+        finally:
+            db.close()
+    if not await asyncio.to_thread(save):
+        await callback.answer("Local product not found.", show_alert=True)
+        return
+    invalidate_products_cache()
+    await callback.answer("Manual fallback updated.")
     await _refresh_manage_panel(callback, pid)
 
 
@@ -1739,12 +1768,13 @@ async def set_stock(message: Message):
             await answer_card(message, "❌ Product not found.")
             return
         delivery_type = (product.delivery_type or "automatic").lower()
-        if delivery_type == "automatic" and not getattr(product, "reseller_service_id", None):
+        if not manual_allowed(product) and not getattr(product, "reseller_service_id", None):
             await answer_card(message,
                 "ℹ️ This product delivers automatically from loaded accounts, "
                 "so stock is derived from the account list. Setting manual stock "
-                "won't persist across automated sales or uploads."
+                "requires enabling Manual fallback in the product first."
             )
+            return
         previous_stock = int(product.stock or 0)
         product.stock = stock
         db.add(AdminAuditLog(

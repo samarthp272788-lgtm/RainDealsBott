@@ -16,6 +16,7 @@ from aiogram.fsm.context import FSMContext
 from database import SessionLocal, transaction, retry_on_write_conflict
 from models.user import User
 from models.deposit import Deposit
+from services.session_resume import save_resume
 from config import ADMIN_IDS, CHANNEL_LINK, GROUP_LINK, TOS_LINK
 
 from keyboards.menu import get_main_menu, get_admin_main_menu
@@ -334,6 +335,7 @@ async def clear_start_menu(callback: CallbackQuery):
 async def main_menu_cb(callback: CallbackQuery, state: FSMContext):
     """Back to main menu — edits the current message."""
     await state.clear()
+    save_resume((callback.from_user.id, callback.message.chat.id), None)
     await callback.answer()
 
     bot_username = await _get_bot_username(callback.bot)
@@ -517,6 +519,7 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
     # Reset only transient prompts. Any unpaid/pending invoice remains in the
     # database and is reused/reported by the deposit flow after /start.
     await state.clear()
+    save_resume((message.from_user.id, message.chat.id), None)
 
     telegram_id = message.from_user.id
     start_payload = (command.args or "").strip() if command else ""

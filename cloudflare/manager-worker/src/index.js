@@ -3,7 +3,7 @@ import { loginPage } from './login_v2.js';
 
 const enc = new TextEncoder();
 const tables = {
-  products: {fields:'name,icon,description,category,price,delivery_instruction,delivery_type,preorder,low_stock_threshold,bulk_pricing,is_active,api_enabled,source,provider_id,reseller_service_id,reseller_cost,reseller_name', required:['name','price'], defaults:{icon:'📦',category:'General',stock:0,is_active:1,api_enabled:1,source:'own',delivery_type:'automatic',preorder:0,low_stock_threshold:3}},
+  products: {fields:'name,icon,description,category,price,delivery_instruction,delivery_type,manual_fallback,preorder,low_stock_threshold,bulk_pricing,is_active,api_enabled,source,provider_id,reseller_service_id,reseller_cost,reseller_name', required:['name','price'], defaults:{icon:'📦',category:'General',stock:0,is_active:1,api_enabled:1,source:'own',delivery_type:'automatic',manual_fallback:0,preorder:0,low_stock_threshold:3}},
   providers: {fields:'name,provider_key,base_url,api_type,auth_type,api_key,api_secret,configuration,is_active',required:['name','provider_key','base_url'],defaults:{api_type:'generic',auth_type:'header',is_active:1}},
   promocodes: {fields:'code,amount,max_uses,is_active',required:['code','amount'],defaults:{max_uses:1,used_count:0,is_active:1}},
   custom_rates: {fields:'telegram_id,product_id,price,is_active',required:['telegram_id','price'],read:true},
@@ -14,12 +14,12 @@ const tables = {
   product_rate_controls:{fields:'is_active',read:true}, rate_control_assignments:{fields:'is_active',read:true}
 };
 const responseFields={
- products:'id,name,icon,description,category,price,stock,delivery_instruction,delivery_type,preorder,low_stock_threshold,bulk_pricing,is_active,api_enabled,source,provider_id,reseller_service_id,reseller_cost,reseller_name,created_at,updated_at',
+ products:'id,name,icon,description,category,price,stock,delivery_instruction,delivery_type,manual_fallback,preorder,low_stock_threshold,bulk_pricing,is_active,api_enabled,source,provider_id,reseller_service_id,reseller_cost,reseller_name,created_at,updated_at',
  providers:'id,name,provider_key,base_url,api_type,auth_type,configuration,is_active,created_at,updated_at',
  promocodes:'id,code,amount,max_uses,used_count,is_active,expires_at,created_at',
   custom_rates:'id,telegram_id,product_id,price,is_active,created_at,stopped_at',
  users:'id,telegram_id,username,full_name,balance,total_spent,membership,is_banned,created_at',
- orders:'id,telegram_id,user_id,product_id,product_name,service,quantity,amount,status,delivery_type,created_at,updated_at,delivered_at',
+ orders:'id,telegram_id,user_id,product_id,product_name,service,quantity,amount,status,delivery_type,automatic_quantity,manual_pending_quantity,created_at,updated_at,delivered_at',
  deposits:'id,telegram_id,user_id,amount,currency,network,status,txid,payment_method,created_at,updated_at,verified_at',
  tickets:'id,telegram_id,user_id,subject,status,priority,admin_response,created_at,updated_at',
  api_keys:'id,telegram_id,name,key_prefix,is_active,created_at,last_used_at',
@@ -30,8 +30,8 @@ const responseFields={
  manager_audit:'id,admin_id,action,target_type,target_id,details,created_at'
 };
 const secretFields = /password|token|secret|key_hash|encrypted|api_key/i;
-const numeric = new Set('price,amount,max_uses,stock,preorder,low_stock_threshold,is_active,api_enabled,provider_id,reseller_cost,telegram_id,product_id,is_banned'.split(','));
-const bools = new Set('preorder,is_active,api_enabled,is_banned'.split(','));
+const numeric = new Set('price,amount,max_uses,stock,manual_fallback,preorder,low_stock_threshold,is_active,api_enabled,provider_id,reseller_cost,telegram_id,product_id,is_banned'.split(','));
+const bools = new Set('manual_fallback,preorder,is_active,api_enabled,is_banned'.split(','));
 const sensitive = new Set(['api_key','api_secret']);
 const reply=(data,status=200)=>new Response(JSON.stringify(data),{status,headers:{'content-type':'application/json','cache-control':'no-store'}});
 function error(message,status=400){const e=new Error(message);e.status=status;throw e;}
@@ -85,8 +85,10 @@ async function assertLoginUnlocked(env){const row=(await rows(env,'SELECT locked
 async function assertLoginUnlockedTx(t){const row=(await t.execute('SELECT lock_id FROM raindeals_web_manager_login_lockouts WHERE lock_id=1 AND locked_until>UTC_TIMESTAMP() FOR UPDATE')).rows?.[0];if(row)error('Manager login is locked by /kill. Try again after the five-minute lock expires.',423)}
 const ownerIds=env=>new Set(String(env.MANAGER_ADMIN_IDS||'').split(',').map(x=>x.trim()).filter(x=>/^\d{1,20}$/.test(x)));
 const managerSections=['dashboard','products','orders','deposits','users','tickets','promocodes','custom_rates','api_keys','api_orders','referrals','product_rate_controls','rate_control_assignments','manager_audit','settings'];
-const writableSections=['products','tickets','promocodes','custom_rates','api_keys','product_rate_controls','rate_control_assignments','settings'];
-const managerCapabilities=[...writableSections.map(x=>x+'_write'),'orders_export','orders_alerts','delivery_ids'];
+const writableSections=['products','orders','tickets','promocodes','custom_rates','api_keys','product_rate_controls','rate_control_assignments','settings'];
+const managerCapabilities=[...writableSections.map(x=>x+'_write'),'orders_export','orders_alerts','delivery_ids','delivery_secrets'];
+function jsonValue(value,fallback){if(typeof value==='string'){try{return JSON.parse(value)}catch{return fallback}}return value??fallback}
+async function optionalRows(env,sql,args=[]){try{return await rows(env,sql,args)}catch(e){if(/1146|doesn't exist/i.test(String(e?.message||e)))return[];throw e}}
 async function managerAdmin(env,id){
   if(ownerIds(env).has(String(id)))return{telegram_id:String(id),display_name:'Owner',role_key:'owner',permissions:['*'],is_owner:1,is_active:1};
   const r=(await rows(env,'SELECT telegram_id,display_name,role_key,permissions_json,is_owner,is_active FROM raindeals_web_manager_admins WHERE telegram_id=? AND is_active=1 LIMIT 1',[id]))[0];
@@ -253,6 +255,15 @@ function providerCatalogItems(provider,payload){
 }
 function parseImportBulk(value){if(!String(value||'').trim())return null;const source=String(value).trim();let incoming;if(source.startsWith('{')||source.startsWith('[')){try{incoming=JSON.parse(source)}catch{error('Bulk pricing must be valid JSON or MIN-MAX=PRICE lines.')}}else{incoming={};for(const raw of source.split(/\r?\n/)){const line=raw.trim();if(!line)continue;const parts=line.split('=');if(parts.length!==2)error('Bulk pricing lines must use MIN-MAX=PRICE or MIN+=PRICE.');const range=parts[0].trim(),price=parts[1].trim();let min,max=null;if(range.includes('-'))[min,max]=range.split('-').map(x=>Number(x.trim()));else if(range.includes('+'))min=Number(range.replace('+','').trim());else error('Bulk pricing lines must use MIN-MAX=PRICE or MIN+=PRICE.');incoming[String(min)]={min,max,price}}}if(Array.isArray(incoming))incoming=Object.fromEntries(incoming.filter(x=>x&&typeof x==='object').map(x=>[String(x.min),x]));if(!incoming||typeof incoming!=='object'||Array.isArray(incoming))error('Bulk pricing must be a JSON object or list of tiers.');const tiers=[];for(const t of Object.values(incoming)){const min=Number(t?.min),max=t?.max==null||t.max===''?null:Number(t.max),price=Number(t?.price);if(!Number.isInteger(min)||min<1||(max!==null&&(!Number.isInteger(max)||max<=min))||!Number.isFinite(price)||price<0)error('Bulk pricing has an invalid tier.');tiers.push({min,max,price})}tiers.sort((a,b)=>a.min-b.min);for(let i=0;i<tiers.length-1;i++)if(tiers[i].max===null||tiers[i].max>=tiers[i+1].min)error('Bulk pricing tiers must not overlap.');return JSON.stringify(Object.fromEntries(tiers.map(t=>[String(t.min),t])))}
 async function status(env){const result={database_connected:false,render_required:false,main_bot_settings_integrated:false,delivery_configured:false,admin_verify_configured:false};const [database,api,maintenance]=await Promise.allSettled([db(env,'SELECT 1'),env.API.fetch('https://internal/healthz'),rows(env,'SELECT enabled FROM maintenance_settings WHERE id=1 LIMIT 1')]);if(database.status==='rejected')throw database.reason;result.database_connected=true;result.main_bot_settings_integrated=maintenance.status==='fulfilled';if(api.status==='fulfilled'){try{const j=await api.value.json();result.delivery_configured=!!j.delivery_webhook_configured;result.admin_verify_configured=!!j.admin_verify_webhook_configured;}catch{}}return result;}
+async function notifyCompletedOrder(env,orderId,recipientId,adminId){
+  if(!env.DELIVERY_BRIDGE_SECRET)return{status:'not_configured',message:'Delivery notification is not configured on the Manager Worker. Set the same DELIVERY_BRIDGE_SECRET used by the API Worker, then retry.'};
+  try{
+    const response=await env.API.fetch(new Request('https://internal/internal/delivery',{method:'POST',headers:{'content-type':'application/json','x-delivery-bridge-secret':env.DELIVERY_BRIDGE_SECRET},body:JSON.stringify({order_id:Number(orderId),recipient_id:String(recipientId),admin_id:String(adminId)})}));
+    const payload=await response.json().catch(()=>({}));
+    if(!response.ok||payload.success!==true)return{status:'failed',message:String(payload.message||payload.detail?.message||payload.error||`Delivery Worker returned HTTP ${response.status}.`)};
+    return{status:String(payload.status||'queued'),message:payload.status==='waiting_for_start'?'Order is fulfilled. The recipient must start the Delivery Bot; it will send the queued delivery then.':payload.status==='already_sent'?'Delivery was already sent; no duplicate message was sent.':payload.status==='sent'?'Order fulfilled and delivery sent through Telegram.':'Order fulfilled and delivery queued.'};
+  }catch(e){return{status:'failed',message:String(e?.message||'Could not reach the delivery service.')}}
+}
 async function route(request,env){
   const url=new URL(request.url),path=url.pathname;
   const forced=await forceKillState(env);
@@ -318,7 +329,7 @@ async function route(request,env){
     if(!/^[a-z][a-z0-9_-]{1,31}$/.test(role))error('Role name must be 2–32 letters, numbers, _ or -.');
     if(!Array.isArray(b.permissions)||!b.permissions.length)error('Select at least one permission.');
     const permissions=[...new Set(b.permissions.map(String))];for(const p of permissions)if(!managerSections.includes(p)&&!managerCapabilities.includes(p))error('Unknown permission: '+p);
-    for(const p of permissions){if(p.endsWith('_write')&&!permissions.includes(p.slice(0,-6)))error('Grant the section before its edit permission.');if(['orders_export','orders_alerts','delivery_ids'].includes(p)&&!permissions.includes('orders'))error('Grant Orders before its special actions.');}
+    for(const p of permissions){if(p.endsWith('_write')&&!permissions.includes(p.slice(0,-6)))error('Grant the section before its edit permission.');if(['orders_export','orders_alerts','delivery_ids','delivery_secrets'].includes(p)&&!permissions.includes('orders'))error('Grant Orders before its special actions.');}
     await db(env,'INSERT INTO raindeals_web_manager_admins (telegram_id,display_name,role_key,permissions_json,is_active,is_owner,added_by,created_at,updated_at) VALUES (?,?,?,?,1,0,?,UTC_TIMESTAMP(6),UTC_TIMESTAMP(6)) ON DUPLICATE KEY UPDATE display_name=VALUES(display_name),role_key=VALUES(role_key),permissions_json=VALUES(permissions_json),is_active=1,updated_at=UTC_TIMESTAMP(6)',[telegramId,displayName,role,JSON.stringify(permissions),auth.admin_id]);
     await audit(env,auth.admin_id,target?'update':'create','manager_admin',telegramId,{role_key:role,permissions});return reply({success:true,message:'Admin role saved. The Telegram ID can now verify sign-ins.'});
   }
@@ -335,6 +346,126 @@ async function route(request,env){
     const available=(await rows(env,'SHOW COLUMNS FROM orders')).map(c=>c.Field),visible=['id','telegram_id','product_name','quantity','amount','status','created_at'].filter(c=>available.includes(c));
     const found=await rows(env,'SELECT '+visible.map(c=>'`'+c+'`').join(',')+' FROM orders WHERE id>? ORDER BY id ASC LIMIT 201',[after]);
     return reply({rows:found.slice(0,200),has_more:found.length>200,next_after_id:found.length>200?String(found[199].id):after});
+  }
+  const orderDetails=path.match(/^\/manage\/orders\/(\d+)\/details$/);
+  if(orderDetails&&request.method==='GET'){
+    const id=orderDetails[1],available=await columnsFor(env,'orders');
+    const visible=[...responseFields.orders.split(','),'delivery_telegram_id','refunded','automatic_quantity','manual_pending_quantity'].filter(c=>available.includes(c));
+    const order=(await rows(env,'SELECT '+visible.map(c=>'`'+c+'`').join(',')+",IF(delivered_account IS NOT NULL AND delivered_account<>'',1,0) AS has_delivery FROM orders WHERE id=?",[id]))[0];
+    if(!order)error('Order not found.',404);
+    const [submissions,jobs,webHistory,botHistory,sessionInfo]=await Promise.all([
+      optionalRows(env,'SELECT telegram_id,`values`,submitted_at FROM order_requirement_submissions WHERE order_id=? LIMIT 1',[id]),
+      optionalRows(env,'SELECT recipient_id,admin_id,status,attempts,created_at,updated_at,completed_at,last_error FROM raindeals_delivery_bot_jobs WHERE order_id=? LIMIT 1',[id]),
+      rows(env,"SELECT a.admin_id,a.action,a.details,a.created_at,m.display_name FROM raindeals_web_manager_audit a LEFT JOIN raindeals_web_manager_admins m ON m.telegram_id=a.admin_id WHERE a.target_type='order' AND a.target_id=? ORDER BY a.id DESC LIMIT 50",[id]),
+      optionalRows(env,"SELECT admin_telegram_id,action,summary,created_at FROM admin_audit_logs WHERE entity_type='order' AND entity_id=? ORDER BY id DESC LIMIT 50",[id]),
+      rows(env,'SELECT admin_id,created_at,expires_at FROM raindeals_web_manager_sessions WHERE token_hash=?',[auth.token_hash])
+    ]);
+    let requirements=[];
+    if(order.product_id&&(await columnsFor(env,'products')).includes('required_info')){const p=(await rows(env,'SELECT required_info FROM products WHERE id=?',[order.product_id]))[0];requirements=jsonValue(p?.required_info,[])}
+    const submission=submissions[0],job=jobs[0]||null;
+    let deliveredIdentifiers=[];
+    if(hasPermission(currentAdmin,'delivery_ids')){const content=(await rows(env,'SELECT delivered_account FROM orders WHERE id=?',[id]))[0]?.delivered_account;deliveredIdentifiers=String(content||'').split(/\r?\n/).map(x=>x.trim()).filter(x=>/^[^:\s]{1,256}:.+$/.test(x)).map(x=>x.slice(0,x.indexOf(':')))}
+    const history=webHistory.map(r=>{const detail=jsonValue(r.details,{});return{admin_id:String(r.admin_id),admin_name:r.display_name||'',action:r.action,at:r.created_at,source:'Manager Web',session_started_at:detail.session_started_at||null,summary:r.action==='fulfill'?'Order fulfilled using '+(detail.mode==='inventory'?'uploaded stock':'entered delivery details'):r.action==='edit_delivery'?'Saved delivery details corrected; no Telegram resend':r.action==='retry_delivery'?'Delivery checked / retried':''}}).concat(botHistory.map(r=>({admin_id:String(r.admin_telegram_id),action:r.action,at:r.created_at,source:'Telegram bot',summary:r.summary}))).sort((a,b)=>String(b.at).localeCompare(String(a.at)));
+    const canWrite=hasPermission(currentAdmin,'orders_write'),completed=String(order.status).toLowerCase()==='completed';
+    return reply({order,submitted_details:{status:submission?'submitted':Array.isArray(requirements)&&requirements.length?'awaiting_customer':'not_required',submitted_by:submission?String(submission.telegram_id):null,submitted_at:submission?.submitted_at||null,fields:jsonValue(submission?.values,{}),requirements},delivery:job,delivered_identifiers:deliveredIdentifiers,history,operator_session:sessionInfo[0]||null,can_edit_delivery:canWrite&&hasPermission(currentAdmin,'delivery_secrets')&&completed&&!Number(order.refunded)&&!['queued','sending','uncertain'].includes(job?.status),can_retry_delivery:canWrite&&completed&&Number(order.has_delivery)===1&&!Number(order.refunded)&&['manual','hybrid'].includes(order.delivery_type)&&(!job||['failed','queued'].includes(job.status))});
+  }
+  const orderContent=path.match(/^\/manage\/orders\/(\d+)\/delivery-content$/);
+  if(orderContent){
+    if(!hasPermission(currentAdmin,'orders_write')||!hasPermission(currentAdmin,'delivery_secrets'))error('Your role cannot view or edit delivery credentials.',403);
+    const id=orderContent[1];
+    if(request.method==='GET'){const order=(await rows(env,"SELECT delivered_account FROM orders WHERE id=? AND status='completed' AND refunded=0",[id]))[0];if(!order)error('Completed order not found.',404);await audit(env,auth.admin_id,'view_delivery','order',id,{});return reply({delivery_text:order.delivered_account||''})}
+    if(request.method==='POST'){
+      const b=await body(request),text=String(b.delivery_text||'').trim();if(!text||text.length>3000||b.confirm!==true)error('Confirm the correction and enter delivery details (maximum 3,000 characters).');
+      const hasJobs=(await rows(env,"SELECT 1 FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='raindeals_delivery_bot_jobs' LIMIT 1")).length;
+      const timestamp=(await columnsFor(env,'orders')).includes('updated_at')?',updated_at=UTC_TIMESTAMP()':'';
+      await tx(env,async t=>{const order=(await t.execute('SELECT status,refunded FROM orders WHERE id=? FOR UPDATE',[id])).rows?.[0];if(!order||order.status!=='completed'||Number(order.refunded))error('Only completed, non-refunded orders may be corrected.',409);const job=hasJobs?(await t.execute('SELECT status FROM raindeals_delivery_bot_jobs WHERE order_id=? FOR UPDATE',[id])).rows?.[0]:null;if(['queued','sending','uncertain'].includes(job?.status))error('Delivery is queued, in progress, or uncertain. Its content cannot be changed.',409);await t.execute('UPDATE orders SET delivered_account=?'+timestamp+' WHERE id=?',[text,id]);await t.execute("INSERT INTO raindeals_web_manager_audit (admin_id,action,target_type,target_id,details,created_at) VALUES (?,'edit_delivery','order',?,'{}',UTC_TIMESTAMP(6))",[auth.admin_id,id])});
+      return reply({success:true,message:'Saved delivery details corrected. Previously sent Telegram messages were not changed or resent.'});
+    }
+    error('Method not allowed.',405);
+  }
+  const fulfillOrder=path.match(/^\/manage\/orders\/(\d+)\/fulfill$/);
+  if(fulfillOrder&&request.method==='POST'){
+    if(!env.DELIVERY_BRIDGE_SECRET)error('Delivery is not configured on the Manager Worker. Set the same DELIVERY_BRIDGE_SECRET used by the API Worker before fulfilling orders.',503);
+    const orderId=fulfillOrder[1],b=await body(request),mode=String(b.mode||'manual');
+    if(!['manual','inventory'].includes(mode))error('Choose manual delivery details or uploaded account inventory.');
+    const suppliedText=String(b.delivery_text||'').trim();
+    if(mode==='manual'&&(!suppliedText||suppliedText.length>3000))error('Enter delivery details (maximum 3,000 characters).');
+    const suppliedRecipient=String(b.customer_telegram_id||'').trim();
+    if(suppliedRecipient&&!/^\d{1,20}$/.test(suppliedRecipient))error('Customer Telegram ID must be a positive numeric ID.');
+    const orderColumns=await columnsFor(env,'orders');
+    const splitSelect=['automatic_quantity','manual_pending_quantity','stock_deducted_quantity'].filter(c=>orderColumns.includes(c)).map(c=>','+c).join('');
+    const orderTimestamp=orderColumns.includes('updated_at')?',updated_at=UTC_TIMESTAMP()':'';
+    const completed=await tx(env,async t=>{
+      const order=(await t.execute('SELECT id,telegram_id,product_id,product_name,amount,quantity,status,delivery_type,is_preorder,refunded,delivery_telegram_id,delivered_account'+splitSelect+' FROM orders WHERE id=? FOR UPDATE',[orderId])).rows?.[0];
+      if(!order)error('Order not found.',404);
+      const state=String(order.status||'').toLowerCase(),deliveryType=String(order.delivery_type||'').toLowerCase();
+      const canFulfill=!Number(order.refunded)&&['manual','hybrid'].includes(deliveryType)&&(state==='preorder'||['pending_manual','processing'].includes(state));
+      if(!canFulfill)error('This order is not waiting for manual fulfillment, or it has been refunded.',409);
+      const apiOrder=Boolean((await t.execute('SELECT order_id FROM api_orders WHERE order_id=? LIMIT 1',[orderId])).rows?.length);
+      let recipient=String(order.delivery_telegram_id||'');
+      if(apiOrder){
+        if(!recipient)recipient=suppliedRecipient;
+        else if(suppliedRecipient&&suppliedRecipient!==recipient)error('Customer Telegram ID does not match the API order destination.',409);
+        if(!recipient)error('Enter the customer Telegram ID for this API order before fulfillment.');
+      }else{
+        recipient=recipient||String(order.telegram_id||'');
+        if(suppliedRecipient&&suppliedRecipient!==recipient)error('The recipient must match the order customer.',409);
+      }
+      if(!/^\d{1,20}$/.test(recipient)||BigInt(recipient)<=0n)error('This order does not have a valid Telegram delivery destination.',409);
+      let deliveryText=suppliedText,stockUsed=0,newlyDeducted=0;
+      if(mode==='inventory'){
+        if(!order.product_id)error('This order has no linked product inventory.',409);
+        const product=(await t.execute('SELECT source,file_content,stock,delivery_type,manual_fallback FROM products WHERE id=? FOR UPDATE',[order.product_id])).rows?.[0];
+        if(!product)error('Linked product was not found.',404);
+        if(String(product.source||'own')!=='own')error('Supplier stock is managed by its provider; use manual delivery details here.',409);
+        const available=String(product.file_content||'').split(/\r?\n/).map(x=>x.trim()).filter(Boolean),quantity=Math.max(1,Number(order.manual_pending_quantity)||Number(order.quantity)-Number(order.automatic_quantity||0)||1);
+        if(available.length<quantity)error(`Not enough uploaded accounts: ${available.length} available for quantity ${quantity}.`,409);
+        deliveryText=available.slice(0,quantity).join('\n');stockUsed=quantity;
+        const remaining=available.slice(quantity);
+        const capacityManaged=Number(product.manual_fallback)||product.delivery_type==='manual';
+        const reserved=Number(order.stock_deducted_quantity)>0||(order.stock_deducted_quantity==null&&!Number(order.is_preorder)&&capacityManaged);
+        const stockAfter=reserved?Number(product.stock||0):capacityManaged?Math.max(Number(product.stock||0),available.length)-quantity:remaining.length;
+        if(!reserved)newlyDeducted=quantity;
+        await t.execute('UPDATE products SET file_content=?,stock=?,updated_at=UTC_TIMESTAMP() WHERE id=?',[remaining.join('\n'),stockAfter,order.product_id]);
+      }
+      deliveryText=[order.delivered_account,deliveryText].filter(Boolean).join('\n');
+      const splitUpdate=orderColumns.includes('manual_pending_quantity')?',manual_pending_quantity=0,automatic_quantity=COALESCE(automatic_quantity,0)+'+stockUsed+((order.stock_deducted_quantity!=null||newlyDeducted)?',stock_deducted_quantity=COALESCE(stock_deducted_quantity,0)+'+newlyDeducted:''):'';
+      let preorderCommission=null;
+      if(Number(order.is_preorder)){
+        const buyer=(await t.execute('SELECT referred_by FROM users WHERE telegram_id=? FOR UPDATE',[order.telegram_id])).rows?.[0];
+        const referrerId=String(buyer?.referred_by||'');
+        const rateText=String(env.REFERRAL_COMMISSION_RATE||'0.05');
+        const rate=Number(rateText);
+        const referrer=referrerId?(await t.execute('SELECT telegram_id FROM users WHERE telegram_id=? FOR UPDATE',[referrerId])).rows?.[0]:null;
+        if(referrer&&Number.isFinite(rate)&&rate>0&&rate<=1){
+          const creditToBalance=!['0','false','no','off'].includes(String(env.REFERRAL_CREDIT_TO_BALANCE??'true').toLowerCase());
+          const commission=(await t.execute('SELECT CAST(ROUND(? * ?,8) AS CHAR) AS amount',[String(order.amount||'0'),rateText])).rows?.[0]?.amount||'0';
+          if(creditToBalance){
+            await t.execute('UPDATE users SET referral_earnings=ROUND(COALESCE(referral_earnings,0)+?,8),balance=ROUND(COALESCE(balance,0)+?,8) WHERE telegram_id=?',[commission,commission,referrerId]);
+          }else{
+            await t.execute('UPDATE users SET referral_earnings=ROUND(COALESCE(referral_earnings,0)+?,8) WHERE telegram_id=?',[commission,referrerId]);
+          }
+          preorderCommission={referrer_telegram_id:referrerId,amount:String(commission),credited_to_balance:creditToBalance};
+        }
+      }
+      await t.execute("UPDATE orders SET delivered_account=?,status='completed',is_preorder=0,delivery_telegram_id=?"+splitUpdate+orderTimestamp+' WHERE id=?',[deliveryText,recipient,orderId]);
+      const sessionInfo=(await t.execute('SELECT created_at FROM raindeals_web_manager_sessions WHERE token_hash=?',[auth.token_hash])).rows?.[0];
+      await t.execute('INSERT INTO raindeals_web_manager_audit (admin_id,action,target_type,target_id,details,created_at) VALUES (?,?,?,?,?,UTC_TIMESTAMP(6))',[auth.admin_id,'fulfill','order',String(orderId),JSON.stringify({mode,stock_used:stockUsed,recipient_id:recipient,preorder_commission:preorderCommission,session_started_at:sessionInfo?.created_at||null})]);
+      return{recipient,stock_used:stockUsed,product_id:order.product_id,preorder_commission:preorderCommission};
+    });
+    const notification=await notifyCompletedOrder(env,orderId,completed.recipient,auth.admin_id);
+    if(completed.stock_used)await audit(env,auth.admin_id,'consume','product_inventory',completed.product_id,{order_id:String(orderId),count:completed.stock_used});
+    return reply({success:true,order_id:String(orderId),stock_used:completed.stock_used,notification,message:notification.message});
+  }
+  const retryOrderDelivery=path.match(/^\/manage\/orders\/(\d+)\/notify$/);
+  if(retryOrderDelivery&&request.method==='POST'){
+    const orderId=retryOrderDelivery[1],order=(await rows(env,"SELECT id,telegram_id,delivery_telegram_id,status,delivery_type,refunded,delivered_account FROM orders WHERE id=? LIMIT 1",[orderId]))[0];
+    if(!order)error('Order not found.',404);
+    if(String(order.status||'').toLowerCase()!=='completed'||Number(order.refunded)||!String(order.delivered_account||'').trim()||!['manual','hybrid'].includes(String(order.delivery_type||'').toLowerCase()))error('Only completed, non-refunded manual or hybrid deliveries can be retried.',409);
+    const recipient=String(order.delivery_telegram_id||order.telegram_id||'');if(!/^\d{1,20}$/.test(recipient))error('This order has no valid Telegram delivery destination.',409);
+    const notification=await notifyCompletedOrder(env,orderId,recipient,auth.admin_id);
+    await audit(env,auth.admin_id,'retry_delivery','order',orderId,{notification_status:notification.status});
+    return reply({success:notification.status!=='failed',order_id:String(orderId),notification,message:notification.message},notification.status==='failed'?502:200);
   }
   const orderIds=path.match(/^\/manage\/orders\/(\d+)\/delivery-ids$/);
   if(orderIds&&request.method==='GET'){
@@ -418,7 +549,7 @@ async function route(request,env){
   if(apiKeyRevoke&&request.method==='POST'){
     const id=apiKeyRevoke[1];await db(env,'UPDATE api_keys SET is_active=0,revoked_at=UTC_TIMESTAMP() WHERE id=? AND is_active=1',[id]);await audit(env,auth.admin_id,'revoke','api_key',id,{});return reply({success:true,message:'API key revoked. Existing API requests using it will be rejected.'});
   }
-  const match=path.match(/^\/manage\/([a-z_]+)(?:\/(\d+)(?:\/(accounts|link|disable|stock|catalog|test|import|delete))?)?$/);if(!match||!tables[match[1]])error('Endpoint not found.',404);
+  const match=path.match(/^\/manage\/([a-z_]+)(?:\/(\d+)(?:\/(accounts|link|disable|stock|catalog|test|import|delete|fulfill|notify))?)?$/);if(!match||!tables[match[1]])error('Endpoint not found.',404);
   const [,name,id,action]=match,meta=tables[name],dbTable=meta.table||name;
   if(name==='providers'&&id&&action==='delete'&&request.method==='POST'){
     const b=await body(request);if(b.confirm!==true)error('Explicit confirmation is required to remove a provider.',403);
@@ -450,17 +581,17 @@ async function route(request,env){
     const maxAffordable=Math.floor(balance/item.cost),maxQuantity=Math.min(item.stock,maxAffordable);if(quantity>maxQuantity)error(`Quantity exceeds the live stock or wallet limit (${maxQuantity}).`);
     const name=String(b.name||item.name).trim().slice(0,255),category=String(b.category||item.category).trim().slice(0,255),description=String(b.description||item.description).trim().slice(0,4000),icon=String(b.icon||item.icon||'📦').slice(0,50),instruction=String(b.delivery_instruction||'').trim().slice(0,5000);if(name.length<2||!category)error('Product name and category are required.');
     const delivery=['automatic','manual','hybrid'].includes(b.delivery_type)?b.delivery_type:'automatic',preorder=String(b.preorder??'0')==='1'?1:0,isActive=String(b.is_active??'1')==='0'?0:1,apiEnabled=String(b.api_enabled??'1')==='0'?0:1,low=Number(b.low_stock_threshold??3);if(!Number.isInteger(low)||low<0||low>1000000)error('Low-stock threshold must be a nonnegative whole number.');const bulk=parseImportBulk(b.bulk_pricing);
-    const result=await db(env,"INSERT INTO products (name,icon,description,category,price,stock,delivery_instruction,is_active,api_enabled,delivery_type,preorder,low_stock_threshold,bulk_pricing,source,provider_id,reseller_service_id,reseller_cost,reseller_name,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'reseller',?,?,?,?,UTC_TIMESTAMP(),UTC_TIMESTAMP())",[name,icon,description,category,listingPrice,quantity,instruction||null,isActive,apiEnabled,delivery,preorder,low,bulk,provider.id,serviceId,item.cost,provider.name]);
+    const result=await db(env,"INSERT INTO products (name,icon,description,category,price,stock,delivery_instruction,is_active,api_enabled,delivery_type,manual_fallback,preorder,low_stock_threshold,bulk_pricing,source,provider_id,reseller_service_id,reseller_cost,reseller_name,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,0,?,?,?,'reseller',?,?,?,?,UTC_TIMESTAMP(),UTC_TIMESTAMP())",[name,icon,description,category,listingPrice,quantity,instruction||null,isActive,apiEnabled,delivery,preorder,low,bulk,provider.id,serviceId,item.cost,provider.name]);
     const productId=result?.insertId||result?.lastInsertId||null;await audit(env,auth.admin_id,'import','reseller_product',productId,{provider_id:Number(id),service_id:serviceId,quantity,provider_cost:item.cost,listing_price:listingPrice});return reply({success:true,product_id:productId,message:`Imported ${name} as a live reseller product.`});
   }
   if(action==='stock'&&name==='products'&&request.method==='POST'){
     const b=await body(request);if(!/^\d{1,9}$/.test(String(b.stock)))error('Stock must be a nonnegative whole number.');
-    await tx(env,async t=>{const p=(await t.execute('SELECT source,delivery_type FROM products WHERE id=? FOR UPDATE',[id])).rows?.[0];if(!p)error('Product not found.',404);if(p.source!=='own'||p.delivery_type==='automatic')error('Use account upload for automatic stock; supplier stock comes from the provider.');await t.execute('UPDATE products SET stock=?,updated_at=UTC_TIMESTAMP() WHERE id=?',[Number(b.stock),id]);});await audit(env,auth.admin_id,'update','product_stock',id,{stock:Number(b.stock)});return reply({success:true,message:'Manual stock updated.'});
+    await tx(env,async t=>{const p=(await t.execute('SELECT source,delivery_type,manual_fallback FROM products WHERE id=? FOR UPDATE',[id])).rows?.[0];if(!p)error('Product not found.',404);if(p.source!=='own'||(p.delivery_type==='automatic'&&!Number(p.manual_fallback)))error('Use account upload for automatic stock; supplier stock comes from the provider.');await t.execute('UPDATE products SET stock=?,updated_at=UTC_TIMESTAMP() WHERE id=?',[Number(b.stock),id]);});await audit(env,auth.admin_id,'update','product_stock',id,{stock:Number(b.stock)});return reply({success:true,message:'Manual stock updated.'});
   }
   if(action==='link'&&name==='products'&&request.method==='GET')return reply({url:env.BOT_USERNAME?`https://t.me/${env.BOT_USERNAME}?start=product_${id}`:null,message:env.BOT_USERNAME?'Product link':'Main bot username is not configured.'});
   if(action==='accounts'&&name==='products'){
     if(request.method==='GET'){const p=(await rows(env,'SELECT id,source,stock,file_content FROM products WHERE id=?',[id]))[0];if(!p)error('Product not found.',404);return reply({id:p.id,source:p.source,stock:p.stock,account_count:String(p.file_content||'').split(/\r?\n/).filter(x=>x.trim()).length});}
-    if(request.method==='POST'){const b=await body(request);if(!['append','replace','clear'].includes(b.mode))error('Invalid accounts action.');if(b.mode!=='append'&&b.confirm!==true)error('Explicit confirmation is required for replace or clear.',403);const content=String(b.content||'').split(/\r?\n/).map(x=>x.trim()).filter(Boolean).join('\n');await tx(env,async t=>{const p=(await t.execute('SELECT source,file_content FROM products WHERE id=? FOR UPDATE',[id])).rows?.[0];if(!p)error('Product not found.',404);if(p.source!=='own')error('Supplier inventory is managed by the provider.');const value=b.mode==='clear'?'':b.mode==='replace'?content:[p.file_content,content].filter(Boolean).join('\n');await t.execute('UPDATE products SET file_content=?,stock=?,updated_at=UTC_TIMESTAMP() WHERE id=?',[value,value?value.split(/\r?\n/).filter(x=>x.trim()).length:0,id]);});await audit(env,auth.admin_id,b.mode,'product_inventory',id,{mode:b.mode,line_count:b.mode==='clear'?0:content.split(/\r?\n/).filter(Boolean).length});return reply({success:true});}
+    if(request.method==='POST'){const b=await body(request);if(!['append','replace','clear'].includes(b.mode))error('Invalid accounts action.');if(b.mode!=='append'&&b.confirm!==true)error('Explicit confirmation is required for replace or clear.',403);const content=String(b.content||'').split(/\r?\n/).map(x=>x.trim()).filter(Boolean).join('\n');await tx(env,async t=>{const p=(await t.execute('SELECT source,file_content,stock,delivery_type,manual_fallback FROM products WHERE id=? FOR UPDATE',[id])).rows?.[0];if(!p)error('Product not found.',404);if(p.source!=='own')error('Supplier inventory is managed by the provider.');const value=b.mode==='clear'?'':b.mode==='replace'?content:[p.file_content,content].filter(Boolean).join('\n');await t.execute('UPDATE products SET file_content=?,stock=?,updated_at=UTC_TIMESTAMP() WHERE id=?',[value,(Number(p.manual_fallback)||p.delivery_type==='manual')?Math.max(Number(p.stock||0),value?value.split(/\r?\n/).filter(x=>x.trim()).length:0):(value?value.split(/\r?\n/).filter(x=>x.trim()).length:0),id]);});await audit(env,auth.admin_id,b.mode,'product_inventory',id,{mode:b.mode,line_count:b.mode==='clear'?0:content.split(/\r?\n/).filter(Boolean).length});return reply({success:true});}
   }
   if(action==='disable'&&name==='products'&&request.method==='POST'){const b=await body(request);if(b.confirm!==true)error('Explicit confirmation is required to disable this product.',403);await db(env,'UPDATE products SET is_active=0,api_enabled=0 WHERE id=?',[id]);await audit(env,auth.admin_id,'disable','product',id,{});return reply({success:true,message:'Product archived; order history is preserved.'});}
   if(request.method==='GET'){
@@ -470,7 +601,8 @@ async function route(request,env){
     const search=(url.searchParams.get('search')||'').slice(0,100);const searchable=visible.filter(c=>['id','telegram_id','name','code','status','product_name','username','full_name','key_prefix'].includes(c));
     const where=id?' WHERE id=?':search&&searchable.length?' WHERE '+searchable.map(c=>`CAST(\`${c}\` AS CHAR) LIKE ?`).join(' OR '):'';
     const params=id?[id]:where?searchable.map(()=>`%${search}%`):[];
-    const pageRows=await rows(env,`SELECT ${visible.map(c=>'`'+c+'`').join(',')} FROM \`${dbTable}\`${where} ORDER BY id DESC LIMIT 31 OFFSET ${offset}`,params);
+    const extra=name==='orders'?",IF(COALESCE(refunded,0)=0 AND LOWER(COALESCE(delivery_type,'')) IN ('manual','hybrid') AND (LOWER(COALESCE(status,''))='preorder' OR LOWER(COALESCE(status,'')) IN ('pending_manual','processing')),1,0) AS can_fulfill,IF(LOWER(COALESCE(status,''))='completed' AND COALESCE(refunded,0)=0 AND LOWER(COALESCE(delivery_type,'')) IN ('manual','hybrid') AND delivered_account IS NOT NULL AND delivered_account<>'',1,0) AS has_delivery":'';
+    const pageRows=await rows(env,`SELECT ${visible.map(c=>'`'+c+'`').join(',')}${extra} FROM \`${dbTable}\`${where} ORDER BY id DESC LIMIT 31 OFFSET ${offset}`,params);
     let outputRows=pageRows.slice(0,30);
     if(name==='providers'&&outputRows.length){
       const ids=outputRows.map(row=>row.id),placeholders=ids.map(()=>'?').join(',');

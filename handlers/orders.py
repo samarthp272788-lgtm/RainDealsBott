@@ -631,7 +631,7 @@ def _save_order_requirement_submission(order_id: int, telegram_id: int, values: 
         elif order.reserved_delivery:
             order.delivered_account = order.reserved_delivery
             order.reserved_delivery = None
-            order.status = "completed"
+            order.status = "pending_manual" if order.manual_pending_quantity else "completed"
         else:
             order.status = "pending_manual"
         db.commit()
@@ -739,7 +739,8 @@ async def order_requirement_input(message: Message, state: FSMContext):
     elif result["status"] == "preorder":
         await answer_card(message, f"✅ Information saved for Order #{order_id}. It will be fulfilled when stock is available.")
     else:
-        await answer_card(message, f"✅ Information saved for Order #{order_id}. The team can now fulfill it.")
+        await answer_card(message, f"✅ Information saved for Order #{order_id}. The team will complete delivery."
+                          + (f"\n\nDelivered now:\n<code>{_esc(result['delivery'])}</code>" if result.get("delivery") else ""), parse_mode="HTML")
         channel = getattr(config, "ADMIN_ORDER_NOTIFICATION_CHANNEL_ID", "")
         if channel:
             try:
@@ -850,6 +851,11 @@ async def order_detail(callback: CallbackQuery):
     }
 
     text += f"\n{status_messages.get(order.status, '')}"
+    if order.status == "pending_manual" and order.manual_pending_quantity:
+        text += f"\n✅ Automatic: {order.automatic_quantity} · ⏳ Pending: {order.manual_pending_quantity}"
+        if order.delivered_account:
+            text += f"\n<code>{_esc(order.delivered_account)}</code>"
+
 
     # Check if product has delivery instructions
     has_instruction = False

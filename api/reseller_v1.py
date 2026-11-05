@@ -717,6 +717,8 @@ def _order_payload(
         "service": order.product_name,
 
         "quantity": order.quantity,
+        "automatic_quantity": order.automatic_quantity,
+        "manual_pending_quantity": order.manual_pending_quantity,
 
         "amount": _decimal_text(
             order.amount

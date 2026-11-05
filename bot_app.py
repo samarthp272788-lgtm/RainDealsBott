@@ -21,6 +21,7 @@ from middleware.session_timeout import CallbackSessionTimeoutMiddleware
 # ============================================================
 
 from handlers.start import router as start_router
+from handlers.restart import router as restart_router
 from handlers.products import _fetch_active_products, router as products_router
 from handlers.orders import router as orders_router
 from handlers.deposit import router as deposit_router
@@ -93,6 +94,7 @@ async def _register_bot_commands(bot: Bot):
         await bot.set_my_commands(
             [
                 BotCommand(command="start", description="Open the home menu"),
+                BotCommand(command="restart", description="Continue your last step"),
                 BotCommand(command="shop", description="Browse the shop"),
                 BotCommand(command="wallet", description="View your wallet and balance"),
                 BotCommand(command="orders", description="View your orders"),
@@ -106,6 +108,9 @@ async def _register_bot_commands(bot: Bot):
 
 async def _warm_product_catalog(bot: Bot):
     try:
+        from services.order_requirements_schema import ensure_order_requirements_schema
+        import asyncio
+        await asyncio.to_thread(ensure_order_requirements_schema)
         await _fetch_active_products()
         logger.info("Product catalog cache warmed")
     except Exception:
@@ -114,6 +119,14 @@ async def _warm_product_catalog(bot: Bot):
 
 dp.startup.register(_register_bot_commands)
 dp.startup.register(_warm_product_catalog)
+
+
+async def _flush_customer_drafts(bot: Bot):
+    from services.session_resume import flush_pending_resume
+    await flush_pending_resume()
+
+
+dp.shutdown.register(_flush_customer_drafts)
 
 
 # ============================================================
@@ -139,6 +152,7 @@ logger.info(
 dp.include_router(
     start_router
 )
+dp.include_router(restart_router)
 
 dp.include_router(
     products_router

@@ -1453,6 +1453,29 @@ async def product_delivery(message: Message, state: FSMContext):
         return
 
     await state.update_data(delivery_type=dt)
+    if dt != "manual":
+        await state.set_state(AddProduct.manual_fallback)
+        await answer_card(message, "Allow manual delivery if uploaded accounts run out?\n"
+                          "Send yes or no. Hybrid orders deliver ready accounts first.")
+        return
+    await state.update_data(manual_fallback=True)
+    await _ask_delivery_instruction(message, state, dt)
+
+
+@router.message(AddProduct.manual_fallback)
+async def product_manual_fallback(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    raw = (message.text or "").strip().lower()
+    if raw not in {"yes", "no"}:
+        await answer_card(message, "Send yes or no.")
+        return
+    await state.update_data(manual_fallback=raw == "yes")
+    data = await state.get_data()
+    await _ask_delivery_instruction(message, state, data["delivery_type"])
+
+
+async def _ask_delivery_instruction(message, state, dt):
     await state.set_state(AddProduct.delivery_instruction)
 
     delivery_labels = {
@@ -1562,6 +1585,10 @@ async def product_preorder(message: Message, state: FSMContext):
 
     raw = message.text.strip().lower()
     preorder = raw in ("yes", "y", "true", "1", "enable", "on")
+    data = await state.get_data()
+    if preorder and data.get('delivery_type') != 'manual' and not data.get('manual_fallback'):
+        await answer_card(message, 'Preorders require manual fallback. Send no to keep strict automatic delivery.')
+        return
 
     await state.update_data(preorder=preorder)
     await state.set_state(AddProduct.bulk_pricing)
@@ -1713,6 +1740,51 @@ async def save_product(message: Message, state: FSMContext):
         accounts = [x.strip() for x in raw_text.splitlines() if x.strip()]
         file_content = "\n".join(accounts)
 
+    await state.update_data(draft_accounts=accounts)
+    await _finish_own_product(message, state)
+
+
+@router.message(AddProduct.empty_inventory)
+async def product_empty_inventory(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    raw = (message.text or "").strip().lower()
+    if raw not in {"yes", "no"}:
+        await answer_card(message, "Switch to manual delivery? Send yes or no.")
+        return
+    await state.update_data(empty_inventory_decided=True)
+    if raw == "yes":
+        await state.update_data(delivery_type="manual", manual_fallback=True)
+    await _finish_own_product(message, state)
+
+
+@router.message(AddProduct.stock_capacity)
+async def product_stock_capacity(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    raw = (message.text or "").strip()
+    data = await state.get_data()
+    if not raw.isdigit() or not len(data.get("draft_accounts", [])) <= int(raw) <= 1000000:
+        await answer_card(message, "Enter an order capacity between your uploaded account count and 1,000,000.")
+        return
+    await state.update_data(stock_capacity=int(raw))
+    await _finish_own_product(message, state)
+
+
+async def _finish_own_product(message, state):
+    data = await state.get_data()
+    accounts = data.get("draft_accounts", [])
+    file_content = "\n".join(accounts)
+    if not accounts and data.get("delivery_type") in {"automatic", "hybrid"} and not data.get("manual_fallback") and not data.get("empty_inventory_decided"):
+        await state.set_state(AddProduct.empty_inventory)
+        await answer_card(message, "No accounts uploaded. Switch to manual delivery?\n"
+                          "Send yes, or no to keep this product blocked until accounts are added.")
+        return
+    if (data.get("manual_fallback") or data.get("delivery_type") == "manual") and "stock_capacity" not in data:
+        await state.set_state(AddProduct.stock_capacity)
+        await answer_card(message, f"Uploaded accounts: {len(accounts)}\nEnter order capacity, e.g. 1000.\n"
+                          "Accounts deliver first; the team completes the rest.")
+        return
     # Save to database
     db = SessionLocal()
     try:
@@ -1726,7 +1798,8 @@ async def save_product(message: Message, state: FSMContext):
             category=data.get("category", "general"),
             description=data.get("description", ""),
             price=data["price"],
-            stock=len(accounts),
+            stock=data.get("stock_capacity", len(accounts)),
+            manual_fallback=bool(data.get("manual_fallback")),
             file_content=file_content if file_content else None,
             is_active=True,
             delivery_type=data.get("delivery_type", "automatic"),
@@ -1768,6 +1841,7 @@ async def save_product(message: Message, state: FSMContext):
         f"💰 <b>Base Price:</b> ${float(product.price):.2f}",
         f"📊 <b>Stock:</b> {product.stock}",
         f"🚚 <b>Delivery:</b> {product.delivery_type}",
+        f"Manual fallback: {'Yes' if product.manual_fallback else 'No'}",
         f"🧾 <b>Buyer details required:</b> {len(product.required_info or [])}",
         f"📦 <b>Preorder:</b> {'🟢 Yes' if product.preorder else '🔴 No'}",
     ]

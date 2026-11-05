@@ -117,6 +117,10 @@ class Product(Base):
         server_default="automatic",
     )
 
+    manual_fallback: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0",
+    )
+
     # If True, customers can still order at 0 stock.
     preorder: Mapped[bool] = mapped_column(
         Boolean,
@@ -223,6 +227,7 @@ class Product(Base):
             "is_active": self.is_active,
             "api_enabled": self.api_enabled,
             "delivery_type": self.delivery_type,
+            "manual_fallback": self.manual_fallback,
             "preorder": self.preorder,
             "low_stock_threshold": self.low_stock_threshold,
             "bulk_pricing": self.bulk_pricing,

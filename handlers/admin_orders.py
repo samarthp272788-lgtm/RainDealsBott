@@ -294,7 +294,14 @@ def _do_refund(order_id: int, admin_id: int) -> dict:
         )
 
         stock_restored = False
-        if product is not None and not order.is_preorder:
+        if product is not None and order.stock_deducted_quantity is not None:
+            restored = (order.reserved_delivery or order.delivered_account or "").splitlines()[:order.automatic_quantity]
+            existing = [line.strip() for line in (product.file_content or "").splitlines() if line.strip()]
+            product.file_content = "\n".join(restored + existing) or None
+            product.stock = (product.stock or 0) + order.stock_deducted_quantity
+            order.reserved_delivery = None
+            stock_restored = bool(order.stock_deducted_quantity)
+        elif product is not None and not order.is_preorder:
             if order.reserved_delivery and order.status == "pending_info":
                 restored_accounts = [
                     account.strip() for account in order.reserved_delivery.splitlines() if account.strip()
@@ -523,6 +530,8 @@ async def deliver_order_start(callback: CallbackQuery, state: FSMContext):
     finally:
         db.close()
 
+    if order and order.manual_pending_quantity:
+        destination_note += f"\n\nDeliver remaining units only: {order.manual_pending_quantity}. Automatic: {order.automatic_quantity}."
     await answer_card(callback,
         "📤 Send the content to deliver to the buyer "
         "(account, key, or any message).\n\n"
@@ -552,9 +561,12 @@ def _do_deliver(order_id: int, delivered_text: str, admin_id: int) -> dict:
         if order.status == "completed":
             return {"error": "This order has already been delivered."}
 
+        if order.status not in {"pending_manual", "preorder", "processing"}:
+            return {"error": "This order is not ready for manual delivery."}
         was_preorder = order.is_preorder
 
-        order.delivered_account = delivered_text
+        order.delivered_account = "\n".join(filter(None, [order.delivered_account, delivered_text]))
+        order.manual_pending_quantity = 0
         order.status = "completed"
         order.is_preorder = False
         db.add(AdminAuditLog(

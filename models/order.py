@@ -104,6 +104,9 @@ class Order(Base):
 
     # Reserved stock withheld until the buyer submits required order details.
     reserved_delivery: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    automatic_quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    manual_pending_quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    stock_deducted_quantity: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     # For a manual reseller API order, this is the reseller's end customer.
     # The separate DELIVERY_BOT_TOKEN bot receives the completed delivery.

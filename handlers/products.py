@@ -30,6 +30,7 @@ from models.order import Order
 from models.product_engagement import ProductEngagement
 from models.custom_rate import CustomRate
 from models.rate_control import ProductRateControl, RateControlAssignment
+from services.fulfillment_policy import order_capacity, manual_allowed, plan_delivery
 
 # Reseller Manager & Reseller Config imports
 try:
@@ -907,21 +908,15 @@ def _real_stock(product) -> int:
 
         return fallback_stock
 
-    delivery_type = (product.delivery_type or "automatic").lower()
-    if delivery_type == "manual":
-        return product.stock or 0
-    accounts_available = len(_accounts(product)) if product.file_content else 0
-    if delivery_type == "automatic":
-        return accounts_available
-    return max(accounts_available, product.stock or 0)
+    return order_capacity(product)
 
 
 def _get_max_qty(product) -> int:
-    if float(product.price) == 0:
-        return 1
     cap = _real_stock(product)
+    if float(product.price) == 0:
+        return 1 if cap > 0 or (product.preorder and manual_allowed(product)) else 0
     source = getattr(product, "source", "own") or "own"
-    if cap <= 0 and product.preorder and source != "reseller":
+    if cap <= 0 and product.preorder and source != "reseller" and manual_allowed(product):
         return PREORDER_MAX_QTY
     return max(cap, 0)
 
@@ -1882,6 +1877,8 @@ async def product_info(
     if delivery_info['desc']:
         text += f"  └ <i>{delivery_info['desc']}</i>\n"
 
+    if (getattr(product, "source", "own") or "own") == "own" and manual_allowed(product):
+        text += "  👨‍💼 Unavailable accounts are delivered by our team.\n"
     if product.preorder:
         text += f"  📦 <b>Preorder:</b> ✅ Available\n"
 
@@ -1962,6 +1959,13 @@ async def product_info(
 
 def _qty_text(product, qty: int, real_stock_available: bool, custom_price: Decimal | None = None) -> str:
     is_free = float(product.price) == 0
+    delivery_note = ""
+    if (getattr(product, "source", "own") or "own") == "own":
+        try:
+            plan = plan_delivery(product, qty)
+            delivery_note = f"✅ Ready now: {len(plan.automatic)} · ⏳ Team delivery: {plan.manual_quantity}\n\n"
+        except ValueError:
+            delivery_note = "Stock will be checked again before purchase.\n\n"
 
     if is_free:
         cat_config = _get_category_config(product.category)
@@ -1977,7 +1981,7 @@ def _qty_text(product, qty: int, real_stock_available: bool, custom_price: Decim
             f"  ━━━━━━━━━━━━━━━━━━\n"
             f"  💵 <b>Total:</b> <code>$0.00</code>\n\n"
             f"{_divider('─', 28)}\n\n"
-            f"🎉 <b>No payment needed!</b>\n\n"
+            f"{delivery_note}🎉 <b>No payment needed!</b>\n\n"
             f"<i>Confirm below to claim your free product.</i>"
         )
 
@@ -2011,7 +2015,7 @@ def _qty_text(product, qty: int, real_stock_available: bool, custom_price: Decim
         f"  ━━━━━━━━━━━━━━━━━━\n"
         f"  💵 <b>Total:</b> <code>${total:.2f}</code>\n\n"
         f"{_divider('─', 28)}\n\n"
-        f"<i>Please confirm your order below.</i>"
+        f"{delivery_note}<i>Please confirm your order below.</i>"
     )
 
 
@@ -2230,7 +2234,7 @@ def _do_purchase(
                                       .filter(
                                           Order.telegram_id == telegram_id,
                                           Order.product_id == product.id,
-                                          Order.status.in_(["completed", "pending_manual", "preorder"]),
+                                          Order.status.in_(["completed", "pending_info", "pending_manual", "preorder"]),
                                           Order.refunded == False
                                       )
                                       .count()
@@ -2271,50 +2275,33 @@ def _do_purchase(
             }
 
         delivery_type = (product.delivery_type or "automatic").lower()
-        if delivery_telegram_id is not None and delivery_type != "manual":
+        if delivery_telegram_id is not None and not manual_allowed(product):
             return {
                 "error": (
                     "delivery_telegram_id can be used only with a product "
-                    "whose delivery type is manual."
+                    "with manual delivery or manual fallback enabled."
                 )
             }
         threshold = product.low_stock_threshold if product.low_stock_threshold is not None else DEFAULT_LOW_STOCK_THRESHOLD
 
-        accounts = _accounts(product)
-        available = len(accounts)
-        stock_before = product.stock or 0
-
-        delivered_accounts: list[str] = []
-        reserved_delivery: list[str] = []
+        try:
+            plan = plan_delivery(product, quantity)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        stock_before = order_capacity(product)
+        delivered_accounts = list(plan.automatic)
+        reserved_delivery = []
         required_info = product.required_info if isinstance(product.required_info, list) else []
-        is_preorder_order = False
-        new_stock = stock_before
-
-        can_auto_deliver = delivery_type in ("automatic", "hybrid") and available >= quantity
-        can_manual_fulfill = delivery_type in ("manual", "hybrid") and stock_before >= quantity
-
-        if can_auto_deliver:
-            delivered_accounts = accounts[:quantity]
-            product.file_content = "\n".join(accounts[quantity:])
-            new_stock = len(accounts) - quantity
+        is_preorder_order = plan.preorder
+        new_stock = plan.stock_after
+        if not plan.preorder:
+            product.file_content = "\n".join(plan.remaining) or None
             product.stock = new_stock
-            if required_info:
-                reserved_delivery = delivered_accounts
-                delivered_accounts = []
-        elif can_manual_fulfill:
-            new_stock = stock_before - quantity
-            product.stock = new_stock
-        elif product.preorder:
-            is_preorder_order = True
-        else:
-            shortfall = available if delivery_type == "automatic" else stock_before
-            return {"error": f"Only {shortfall} left in stock."}
-
-        if new_stock < 0:
-            return {"error": "Stock changed while processing your order. Please try again."}
-
+        if required_info:
+            reserved_delivery = delivered_accounts
+            delivered_accounts = []
         status = "pending_info" if required_info else (
-            "completed" if delivered_accounts else ("preorder" if is_preorder_order else "pending_manual")
+            "preorder" if plan.preorder else "pending_manual" if plan.manual_quantity else "completed"
         )
 
         user.balance = user_balance - total_amount
@@ -2325,7 +2312,9 @@ def _do_purchase(
             telegram_id=user.telegram_id, product_id=product.id, product_name=product.name,
             delivered_account="\n".join(delivered_accounts) if delivered_accounts else None,
             reserved_delivery="\n".join(reserved_delivery) if reserved_delivery else None,
-            amount=total_amount, quantity=quantity, delivery_type=delivery_type,
+            amount=total_amount, quantity=quantity, delivery_type=plan.order_mode,
+            automatic_quantity=len(plan.automatic), manual_pending_quantity=plan.manual_quantity,
+            stock_deducted_quantity=0 if plan.preorder else quantity,
             is_preorder=is_preorder_order, status=status, refunded=False,
             delivery_telegram_id=delivery_telegram_id,
         )
@@ -2356,6 +2345,7 @@ def _do_purchase(
             "low_stock_alert": low_stock_alert, "referral_commission_paid": referral_commission_paid,
             "delivery_instruction": product.delivery_instruction,
             "required_info": required_info,
+            "automatic_quantity": len(plan.automatic), "manual_pending_quantity": plan.manual_quantity,
         }
     invalidate_products_cache()
     return result
@@ -3018,6 +3008,12 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
                 [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")])
             reply_markup = InlineKeyboardMarkup(inline_keyboard=pending_buttons)
 
+        if result.get("status") == "pending_manual" and result.get("delivered_accounts"):
+            accounts_text = "\n".join(f"<code>{_esc(str(account))}</code>" for account in result["delivered_accounts"])
+            text = (f"📦 <b>Order #{result['order_id']} received</b>\n\n"
+                    f"✅ Delivered now: {len(result['delivered_accounts'])}\n"
+                    f"⏳ Team delivery pending: {result['manual_pending_quantity']}\n\n"
+                    f"{accounts_text}\n\nTrack the remaining delivery in My Orders.")
         await show(callback, text, parse_mode="HTML", reply_markup=reply_markup)
 
         if result.get("low_stock_alert"):

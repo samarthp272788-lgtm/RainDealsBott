@@ -1443,7 +1443,8 @@ def _complete_order(order_id: int, delivery_text: str, customer_telegram_id: int
                         if REFERRAL_CREDIT_TO_BALANCE:
                             referrer.balance = _money(referrer.balance) + commission
 
-        order.delivered_account = delivery_text
+        order.delivered_account = "\n".join(filter(None, [order.delivered_account, delivery_text]))
+        order.manual_pending_quantity = 0
         order.status = "completed"
         order.is_preorder = False
         db.add(ManagerDeliveryOutbox(
