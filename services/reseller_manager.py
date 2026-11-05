@@ -455,15 +455,17 @@ class ResellerManager:
                 provider_id=self.provider_id,
             ) from None
         except aiohttp.ClientError as e:
-            logger.error("Reseller Network Client Error | provider_id=%s | error=%s", self.provider_id, str(e))
+            logger.error("Reseller Network Client Error | provider_id=%s | error_type=%s | error=%s",
+                         self.provider_id, type(e).__name__, self._sanitize_text(str(e)))
             raise ResellerAPIError(
-                message=f"Provider Connection Error: Unable to reach target service.",
+                message=f"Provider Connection Error ({type(e).__name__}): Unable to reach target service.",
                 provider_id=self.provider_id,
             )
         except Exception as e:
-            logger.error("Reseller System Error | provider_id=%s | error=%s", self.provider_id, str(e))
+            logger.error("Reseller System Error | provider_id=%s | error_type=%s | error=%s",
+                         self.provider_id, type(e).__name__, self._sanitize_text(str(e)))
             raise ResellerAPIError(
-                message=f"System Error: Request processing failed.",
+                message=f"System Error ({type(e).__name__}): Request processing failed.",
                 provider_id=self.provider_id,
             )
         finally:

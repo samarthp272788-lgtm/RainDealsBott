@@ -28,7 +28,7 @@ class CatalogRefreshTests(unittest.IsolatedAsyncioTestCase):
                        RESELLER_STOCK_TIMEOUT_SECONDS=0.01,
                        _load_stock_refresh_providers=Mock(return_value=[
                            {'id': 1, 'name': 'test', 'api_key': 'fixture', 'base_url': 'https://example.invalid'}]))
-        load_functions({'_refresh_reseller_stock_cache_if_needed', '_schedule_reseller_stock_refresh'}, self.ns)
+        load_functions({'_stock_refresh_error_detail', '_refresh_reseller_stock_cache_if_needed', '_schedule_reseller_stock_refresh'}, self.ns)
 
     async def asyncTearDown(self):
         task = self.ns['_reseller_refresh_task']
@@ -63,6 +63,17 @@ class CatalogRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.ns['_reseller_stock_cache'], {})
         self.ns['_schedule_reseller_stock_refresh']()
         self.assertIsNone(self.ns['_reseller_refresh_task'])
+
+    async def test_supplier_failure_reports_status_and_redacts_credentials(self):
+        class ProviderFailure(RuntimeError):
+            status_code = 403
+        self.ns['_call_reseller_get_products'] = AsyncMock(side_effect=ProviderFailure('API key fixture rejected'))
+        await self.ns['_refresh_reseller_stock_cache_if_needed']()
+        args = self.ns['logger'].warning.call_args.args
+        message = args[0] % args[1:]
+        self.assertIn('http_status=403', message)
+        self.assertIn('reason=API key [redacted] rejected', message)
+        self.assertNotIn('fixture', message)
 
     async def test_timeout_preserves_previous_stock(self):
         self.ns['_reseller_stock_cache']['existing'] = 3

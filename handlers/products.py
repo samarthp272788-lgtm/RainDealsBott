@@ -83,7 +83,7 @@ _reseller_stock_cache_time: float = 0.0
 _reseller_cache_lock = asyncio.Lock()
 _reseller_refresh_task: asyncio.Task | None = None
 RESELLER_CACHE_TTL = 30  # Includes empty/failed refreshes, preventing retry storms.
-RESELLER_STOCK_TIMEOUT_SECONDS = 6
+RESELLER_STOCK_TIMEOUT_SECONDS = 20  # Background work does not delay browsing.
 
 # Per-user per-provider in-flight import locks
 _reseller_import_locks: set[tuple[int, str]] = set()
@@ -222,6 +222,15 @@ def _load_stock_refresh_providers():
     return providers
 
 
+def _stock_refresh_error_detail(provider: dict, exc: Exception) -> str:
+    detail = str(exc).strip() or type(exc).__name__
+    for key in ('api_key', 'api_secret'):
+        secret = str(provider.get(key) or '')
+        if secret:
+            detail = detail.replace(secret, '[redacted]')
+    return detail.replace('\r', ' ').replace('\n', ' ')[:300]
+
+
 async def _refresh_reseller_stock_cache_if_needed():
     """Bounded shared refresh; browsing schedules this without waiting for it."""
     global _reseller_stock_cache_time
@@ -266,17 +275,19 @@ async def _refresh_reseller_stock_cache_if_needed():
                                 _reseller_stock_cache[sid] = stock
                     except Exception as exc:
                         logger.warning(
-                            "Supplier stock refresh failed provider_id=%s name=%s error_type=%s; "
+                            "Supplier stock refresh failed provider_id=%s name=%s error_type=%s "
+                            "http_status=%s reason=%s; "
                             "keeping previous/database stock and retrying after %ss",
                             prov.get("id") or prov.get("provider_id"), prov.get("name", "Reseller"),
-                            type(exc).__name__, RESELLER_CACHE_TTL,
+                            type(exc).__name__, getattr(exc, 'status_code', None),
+                            _stock_refresh_error_detail(prov, exc), RESELLER_CACHE_TTL,
                         )
 
             await asyncio.gather(*(refresh_provider(prov) for prov in providers))
         except Exception:
             logger.exception("Could not refresh supplier stock; keeping previous/database stock")
         finally:
-            # Timestamp completion, including empty data and failures. A 6s timeout
+            # Timestamp completion, including empty data and failures. A timeout
             # must not immediately trigger a second request for waiting callbacks.
             _reseller_stock_cache_time = loop.time()
         return _reseller_stock_cache
