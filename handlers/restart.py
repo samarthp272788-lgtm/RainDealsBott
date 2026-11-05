@@ -7,13 +7,15 @@ from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.fsm.context import FSMContext
 from services.session_resume import load_resume, make_snapshot, save_resume
-from utils.ui import answer_card
+from utils.ui import answer_card, begin_resumed_card, finish_resumed_card, get_card_location
 
 router = Router()
 logger = logging.getLogger(__name__)
 
 
 class ResumeCallback(CallbackQuery):
+    resume_wipe_in: bool = True
+
     async def answer(self, *args, **kwargs):
         # /restart is a message, so there is no Telegram callback ID to answer.
         return True
@@ -31,17 +33,26 @@ async def restart_cmd(message: Message, state: FSMContext):
         await answer_card(message, 'Could not load your last step. Try /restart again or /start for Home.')
         return
     if not snapshot:
-        await answer_card(message, 'No saved step. Send /start to open Home.')
+        from handlers.start import start_cmd
+        await start_cmd(message, None, state)
         return
     # Revalidate persisted state against the current allowlist.
     snapshot = make_snapshot(snapshot.get('state'), snapshot.get('data', {}), snapshot.get('navigation'))
     if not snapshot:
         await answer_card(message, 'This step cannot be resumed. Send /start.')
         return
+    try:
+        await _restore_snapshot(message, state, snapshot)
+    except Exception:
+        logger.exception('Could not render resumed session for %s', key[0])
+        await answer_card(message, 'Could not resume this step. Try /restart again or /start for Home.', state=state)
+
+
+async def _restore_snapshot(message, state, snapshot):
+    key = (message.from_user.id, message.chat.id)
     await state.set_data(snapshot['data'])
     await state.set_state(snapshot['state'])
-    card_id = snapshot['data'].get('_card_message_id')
-    card = message.model_copy(update={'message_id': int(card_id)}).as_(message.bot) if card_id else message
+    card = await begin_resumed_card(message, state, snapshot['data'])
     callback = ResumeCallback(id='restart', from_user=message.from_user, chat_instance='restart',
                               message=card, data=snapshot.get('navigation') or '').as_(message.bot)
     saved_state = snapshot['state'] or ''
@@ -59,7 +70,10 @@ async def restart_cmd(message: Message, state: FSMContext):
                                   InlineKeyboardButton(text='Home', callback_data='main_menu')]]))
             return
         callback = callback.model_copy(update={'data': f"resume_deposit_{invoice['id']}"}).as_(message.bot)
-        await resume_deposit(callback, state)
+        try:
+            await resume_deposit(callback, state)
+        finally:
+            await finish_resumed_card(message, state, card)
     elif saved_state == 'PurchaseStates:waiting_qty':
         product_id = snapshot['data'].get('pending_product_id')
         quantity = snapshot['data'].get(f'qty_{product_id}')
@@ -119,6 +133,9 @@ async def restart_cmd(message: Message, state: FSMContext):
             await deposit_menu(callback, state)
         else:
             await answer_card(message, 'Send /start to open Home.')
+    location = get_card_location(*key)
+    if location:
+        await state.update_data(_card_chat_id=location[0], _card_message_id=location[1])
     save_resume(key, make_snapshot(await state.get_state(), await state.get_data(), snapshot.get('navigation')))
 
 

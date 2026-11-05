@@ -35,6 +35,14 @@ def message(text):
 
 
 class ResumeTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        async def fresh_card(msg, state, data):
+            await state.update_data(_card_chat_id=7, _card_message_id=20)
+            return msg.model_copy(update={'message_id': 20}).as_(msg.bot)
+        patcher = patch('handlers.restart.begin_resumed_card', AsyncMock(side_effect=fresh_card))
+        self.begin_card = patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_snapshot_excludes_passwords_and_unsafe_actions(self):
         snapshot = make_snapshot('PurchaseStates:waiting_qty', {'pending_product_id': 9, 'password': 'private'}, 'confirm_buy_9')
         self.assertEqual(snapshot['data'], {'pending_product_id': 9})
@@ -123,6 +131,79 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
         resume._cache[key] = (datetime.utcnow() - timedelta(days=2), {'state': 'PurchaseStates:waiting_qty'})
         self.assertIsNone(await resume.load_resume(key))
         resume._cache.clear()
+
+    async def test_restart_without_saved_step_opens_home(self):
+        start = SimpleNamespace(start_cmd=AsyncMock())
+        state = State()
+        with patch.dict(sys.modules, {'handlers.start': start}), \
+             patch('handlers.restart.load_resume', AsyncMock(return_value=None)):
+            await restart_cmd(message('/restart'), state)
+        start.start_cmd.assert_awaited_once()
+        self.begin_card.assert_not_awaited()
+
+    async def test_saved_product_page_is_restored_with_wipe_in_flag(self):
+        snapshot = make_snapshot(None, {'_card_chat_id': 7, '_card_message_id': 11}, 'product_9')
+        products = SimpleNamespace(**{name: AsyncMock() for name in (
+            'products_menu', 'products_all', 'products_category', 'product_info')})
+        orders = SimpleNamespace(my_orders=AsyncMock(), order_detail=AsyncMock())
+        deposit = SimpleNamespace(deposit_menu=AsyncMock())
+        with patch.dict(sys.modules, {'handlers.products': products, 'handlers.orders': orders, 'handlers.deposit': deposit}), \
+             patch('handlers.restart.load_resume', AsyncMock(return_value=snapshot)), \
+             patch('handlers.restart.save_resume') as save:
+            await restart_cmd(message('/restart'), State())
+        callback = products.product_info.call_args.args[0]
+        self.assertEqual(callback.data, 'product_9')
+        self.assertTrue(callback.resume_wipe_in)
+        products.products_menu.assert_not_awaited()
+        self.assertEqual(save.call_args.args[1]['navigation'], 'product_9')
+
+    async def test_wipe_in_sends_saved_menu_as_new_card_instead_of_edit(self):
+        from utils import ui
+        actions = []
+        fresh = SimpleNamespace(chat=SimpleNamespace(id=7), message_id=30)
+        async def delete():
+            actions.append('wipe_out_marker')
+        async def send(text, **kwargs):
+            actions.append(('wipe_in_menu', text))
+            return fresh
+        marker = SimpleNamespace(chat=SimpleNamespace(id=7), message_id=20,
+                                 delete=AsyncMock(side_effect=delete), answer=AsyncMock(side_effect=send), edit_text=AsyncMock())
+        callback = SimpleNamespace(message=marker, from_user=SimpleNamespace(id=7), resume_wipe_in=True)
+        with patch.dict(ui._CARD_LOCATIONS, {}, clear=True):
+            await ui.show(callback, '<b>Saved product page</b>', parse_mode='HTML')
+            self.assertEqual(actions, ['wipe_out_marker', ('wipe_in_menu', '<b>Saved product page</b>')])
+            marker.edit_text.assert_not_awaited()
+            self.assertEqual(ui.get_card_location(7, 7), (7, 30))
+
+    async def test_wipe_deletes_only_tracked_cards_and_keeps_draft(self):
+        from utils import ui
+        bot = AsyncMock()
+        command = message('/restart').as_(bot)
+        fresh = command.model_copy(update={'message_id': 20}).as_(bot)
+        bot.return_value = fresh
+        state = State('DepositState:waiting_txid', {'deposit_id': 55})
+        data = {'deposit_id': 55, 'network': 'BEP20', '_card_chat_id': 7,
+                '_card_message_id': 11, 'invoice_photo_message_id': 12}
+        with patch.dict(ui._CARD_LOCATIONS, {(7, 7): (7, 22)}, clear=True):
+            card = await ui.begin_resumed_card(command, state, data)
+            deleted = {c.kwargs['message_id'] for c in bot.delete_message.call_args_list}
+            self.assertEqual(deleted, {4, 11, 12, 22})
+            self.assertEqual(card.message_id, 20)
+            self.assertEqual(ui.get_card_location(7, 7), (7, 20))
+            self.assertEqual(state.data['deposit_id'], 55)
+            self.assertEqual(state.data['_card_message_id'], 20)
+            self.assertNotIn('invoice_photo_message_id', state.data)
+
+    async def test_qr_replacement_removes_continuing_placeholder(self):
+        from utils import ui
+        bot = AsyncMock()
+        command = message('/restart').as_(bot)
+        placeholder = command.model_copy(update={'message_id': 20}).as_(bot)
+        state = State('DepositState:waiting_txid', {'deposit_id': 55, '_card_chat_id': 7, '_card_message_id': 30})
+        with patch.dict(ui._CARD_LOCATIONS, {(7, 7): (7, 20)}, clear=True):
+            await ui.finish_resumed_card(command, state, placeholder)
+            bot.delete_message.assert_awaited_once_with(chat_id=7, message_id=20)
+            self.assertEqual(ui.get_card_location(7, 7), (7, 30))
 
 
 if __name__ == '__main__':

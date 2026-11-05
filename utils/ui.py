@@ -73,6 +73,56 @@ def get_card_location(user_id: int, chat_id: int):
     return _CARD_LOCATIONS.get((int(user_id), int(chat_id)))
 
 
+async def begin_resumed_card(message: Message, state, previous_data: dict):
+    """Wipe only the tracked conversation card/input, then start one new card."""
+    user_id, chat_id = message.from_user.id, message.chat.id
+    old_ids = set()
+    location = get_card_location(user_id, chat_id)
+    if location:
+        old_ids.add(location[1])
+    if int(previous_data.get(_CARD_CHAT_ID_KEY) or chat_id) == chat_id:
+        for key in (_CARD_MESSAGE_ID_KEY, 'invoice_card_message_id', 'invoice_photo_message_id'):
+            value = previous_data.get(key)
+            if value and str(value).isdigit():
+                old_ids.add(int(value))
+    old_ids.add(message.message_id)  # /restart input, or the tapped Continue card.
+    for old_id in old_ids:
+        _cancel_scheduled_card_transition(chat_id, old_id)
+        _cancel_scheduled_card_delete(chat_id, old_id)
+
+    async def remove(old_id):
+        try:
+            await message.bot.delete_message(chat_id=chat_id, message_id=old_id)
+        except Exception:
+            logger.debug('Resume cleanup could not remove card %s', old_id)
+
+    await asyncio.gather(*(remove(old_id) for old_id in old_ids))
+    _forget_card(user_id, chat_id)
+    clean = {k: v for k, v in previous_data.items() if k not in {
+        _CARD_CHAT_ID_KEY, _CARD_MESSAGE_ID_KEY, 'invoice_card_message_id', 'invoice_photo_message_id'}}
+    await state.set_data(clean)
+    card = await message.answer('↻')
+    _remember_card(user_id, chat_id, card.message_id)
+    await state.update_data(**{_CARD_CHAT_ID_KEY: chat_id, _CARD_MESSAGE_ID_KEY: card.message_id})
+    await asyncio.sleep(0.2)  # Brief visible wipe gap, only for explicit /restart.
+    return card
+
+
+async def finish_resumed_card(message: Message, state, placeholder: Message):
+    """QR rendering can replace the placeholder; remove the unused one."""
+    data = await state.get_data()
+    card_id = data.get(_CARD_MESSAGE_ID_KEY)
+    chat_id = data.get(_CARD_CHAT_ID_KEY)
+    if chat_id == message.chat.id and card_id and card_id != placeholder.message_id:
+        _cancel_scheduled_card_transition(message.chat.id, placeholder.message_id)
+        _cancel_scheduled_card_delete(message.chat.id, placeholder.message_id)
+        try:
+            await message.bot.delete_message(chat_id=message.chat.id, message_id=placeholder.message_id)
+        except Exception:
+            logger.debug('Resume cleanup could not remove placeholder %s', placeholder.message_id)
+        _remember_card(message.from_user.id, message.chat.id, int(card_id))
+
+
 def _cancel_scheduled_card_delete(chat_id: int, message_id: int) -> None:
     key = (int(chat_id), int(message_id))
     task = _CARD_DELETE_TASKS.pop(key, None)
@@ -329,7 +379,15 @@ async def show(
     _cancel_scheduled_card_delete(callback.message.chat.id, callback.message.message_id)
 
     try:
-        if replace_media and callback.message.photo:
+        if getattr(callback, 'resume_wipe_in', False):
+            # The saved menu returns as a new card, giving Telegram's native
+            # remove/appear transition rather than editing the reload marker.
+            try:
+                await callback.message.delete()
+            except Exception:
+                pass
+            msg = await callback.message.answer(text, **kwargs)
+        elif replace_media and callback.message.photo:
             # Telegram cannot turn a photo message into a text message via edit.
             try:
                 await callback.message.delete()
