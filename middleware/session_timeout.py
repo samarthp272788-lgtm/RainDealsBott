@@ -88,6 +88,10 @@ class CallbackSessionTimeoutMiddleware(BaseMiddleware):
             self._record_activity(key, _message_timestamp(event), timeout)
 
         result = await handler(event, data)
+        if isinstance(event, Message):
+            command = (event.text or '').split(maxsplit=1)[0].split('@')[0].lower() if event.text else ''
+            if command in {'/start', '/restart'}:
+                return result  # These commands persist/clear their own draft, including cancellation.
         if state and getattr(event, 'from_user', None):
             message = event.message if isinstance(event, CallbackQuery) else event
             if message and message.chat.type == 'private':

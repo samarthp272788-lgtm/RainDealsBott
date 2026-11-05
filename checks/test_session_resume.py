@@ -9,7 +9,7 @@ from aiogram.types import Chat, Message, User
 from middleware.session_timeout import CallbackSessionTimeoutMiddleware
 from services.session_resume import make_snapshot
 import services.session_resume as resume
-from handlers.restart import restart_cmd
+from handlers.restart import restart_cmd, stop_restart
 
 
 class State:
@@ -114,6 +114,30 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
             await middleware(handler, message('/restart'), {'state': State('PurchaseStates:waiting_qty')})
         handler.assert_awaited_once()
 
+    async def test_start_cancels_restart_before_saved_menu_can_return(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def loading(_key):
+            entered.set()
+            await release.wait()
+            return make_snapshot(None, {}, 'product_9')
+        with patch('handlers.restart.load_resume', AsyncMock(side_effect=loading)), \
+             patch('handlers.restart.answer_card', AsyncMock()) as answer:
+            running = asyncio.create_task(restart_cmd(message('/restart'), State()))
+            await asyncio.wait_for(entered.wait(), 0.5)
+            await stop_restart((7, 7))
+            release.set()
+            await asyncio.wait_for(running, 0.5)
+        self.begin_card.assert_not_awaited()
+        answer.assert_not_awaited()
+
+    async def test_command_middleware_does_not_rewrite_cleared_resume_draft(self):
+        middleware = CallbackSessionTimeoutMiddleware()
+        state = State('PurchaseStates:waiting_qty', {'pending_product_id': 9})
+        with patch('middleware.session_timeout.save_resume') as save:
+            await middleware(AsyncMock(), message('/restart'), {'state': state})
+            await middleware(AsyncMock(), message('/start'), {'state': state})
+        save.assert_not_called()
+
     async def test_pending_snapshot_cannot_overwrite_start_clear(self):
         key = (7, 7)
         writes = []
@@ -204,6 +228,22 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
             await ui.finish_resumed_card(command, state, placeholder)
             bot.delete_message.assert_awaited_once_with(chat_id=7, message_id=20)
             self.assertEqual(ui.get_card_location(7, 7), (7, 30))
+
+    async def test_start_replaces_home_and_newer_resumed_cards_with_one_menu(self):
+        from utils import ui
+        bot = AsyncMock()
+        command = message('/start').as_(bot)
+        fresh = command.model_copy(update={'message_id': 50}).as_(bot)
+        bot.return_value = fresh
+        with patch.dict(ui._CARD_LOCATIONS, {(7, 7): (7, 30)}, clear=True):
+            await ui.update_card(command, text='Home', owner_id=7, force_new_card=True,
+                                 chat_id=7, message_id=11, cleanup_cards=[(7, 40), (99, 123)])
+            deleted = {(c.kwargs['chat_id'], c.kwargs['message_id']) for c in bot.delete_message.call_args_list}
+            self.assertEqual(deleted, {(7, 11), (7, 30), (7, 40)})
+            self.assertEqual(ui.get_card_location(7, 7), (7, 50))
+            sent = [c.args[0] for c in bot.await_args_list if type(c.args[0]).__name__ == 'SendMessage']
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(sent[0].text, 'Home')
 
 
 if __name__ == '__main__':

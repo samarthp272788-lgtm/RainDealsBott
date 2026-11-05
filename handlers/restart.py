@@ -11,6 +11,15 @@ from utils.ui import answer_card, begin_resumed_card, finish_resumed_card, get_c
 
 router = Router()
 logger = logging.getLogger(__name__)
+_running_restarts = {}
+
+
+async def stop_restart(key):
+    task = _running_restarts.get(key)
+    if task and task is not asyncio.current_task():
+        _running_restarts.pop(key, None)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 class ResumeCallback(CallbackQuery):
@@ -25,6 +34,21 @@ class ResumeCallback(CallbackQuery):
 async def restart_cmd(message: Message, state: FSMContext):
     if message.chat.type != 'private':
         return
+    key = (message.from_user.id, message.chat.id)
+    await stop_restart(key)
+    task = asyncio.create_task(_restart_saved_screen(message, state))
+    _running_restarts[key] = task
+    try:
+        await task
+    except asyncio.CancelledError:
+        if _running_restarts.get(key) is task:
+            raise
+    finally:
+        if _running_restarts.get(key) is task:
+            _running_restarts.pop(key, None)
+
+
+async def _restart_saved_screen(message: Message, state: FSMContext):
     key = (message.from_user.id, message.chat.id)
     try:
         snapshot = await load_resume(key)

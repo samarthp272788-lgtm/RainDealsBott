@@ -516,6 +516,13 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
     if message.chat.type != "private":
         return
 
+    from handlers.restart import stop_restart
+    await stop_restart((message.from_user.id, message.chat.id))
+    previous_card = await state.get_data()
+    previous_cards = [
+        (previous_card.get('_card_chat_id') or message.chat.id, previous_card.get(key))
+        for key in ('_card_message_id', 'invoice_card_message_id', 'invoice_photo_message_id')
+    ]
     # Reset only transient prompts. Any unpaid/pending invoice remains in the
     # database and is reused/reported by the deposit flow after /start.
     await state.clear()
@@ -598,6 +605,7 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
         message_id=result["profile"].get("home_menu_message_id"),
         owner_id=telegram_id,
         force_new_card=True,
+        cleanup_cards=previous_cards,
         disable_web_page_preview=True,
     )
     if menu_card:

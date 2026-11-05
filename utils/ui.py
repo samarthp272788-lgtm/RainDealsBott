@@ -456,6 +456,7 @@ async def update_card(
     owner_id: int | None = None,
     replace_media: bool = False,
     force_new_card: bool = False,
+    cleanup_cards=None,
     **extra,
 ):
     """
@@ -487,18 +488,25 @@ async def update_card(
         # A user may have cleared chat history while the database still points
         # at the old home-menu message. Replace it with a fresh, visible card
         # on /start instead of trusting Telegram to edit that stale message.
-        if (chat_id is None or message_id is None) and card_owner_id:
+        old_cards = set()
+        if chat_id and message_id:
+            old_cards.add((int(chat_id), int(message_id)))
+        if card_owner_id:
             remembered = _CARD_LOCATIONS.get((card_owner_id, message.chat.id))
             if remembered:
-                chat_id = chat_id or remembered[0]
-                message_id = message_id or remembered[1]
-        if chat_id and message_id:
-            _cancel_scheduled_card_transition(chat_id, message_id)
-            _cancel_scheduled_card_delete(chat_id, message_id)
+                old_cards.add(remembered)
+        for old_chat, old_id in cleanup_cards or []:
+            if old_chat and old_id:
+                old_cards.add((int(old_chat), int(old_id)))
+        for old_chat, old_id in old_cards:
+            if old_chat != message.chat.id:
+                continue
+            _cancel_scheduled_card_transition(old_chat, old_id)
+            _cancel_scheduled_card_delete(old_chat, old_id)
             try:
-                await message.bot.delete_message(chat_id=chat_id, message_id=message_id)
+                await message.bot.delete_message(chat_id=old_chat, message_id=old_id)
             except Exception:
-                logger.debug("Could not remove the previous home-menu card %s", message_id)
+                logger.debug("Could not remove the previous menu card %s", old_id)
         if card_owner_id:
             _forget_card(card_owner_id, message.chat.id)
         chat_id = None
