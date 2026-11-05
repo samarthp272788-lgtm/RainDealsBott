@@ -22,6 +22,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.parse import urlsplit
 import aiohttp
+from services.performance import supplier_observed
 
 logger = logging.getLogger(__name__)
 
@@ -326,6 +327,7 @@ class ResellerManager:
         clean_name = re.sub(r"^[\s\-:]+|[\s\-:]+$", "", clean_name).strip()
         return clean_name or raw_name, found_id
 
+    @supplier_observed
     async def _request(
             self,
             method: str,

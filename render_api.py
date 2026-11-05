@@ -31,6 +31,7 @@ from services.deposit_card_recovery import (
     recover_interrupted_deposit_cards,
 )
 from services.order_notifications import order_notification_loop
+from services.notification_outbox import notification_loop
 from services.product_api_access import ensure_product_api_access_schema
 from services.provider_schema import ensure_provider_schema
 from services.maintenance_mode import ensure_maintenance_schema, is_maintenance_enabled
@@ -79,6 +80,7 @@ if not INTERNAL_SECRET:
 async def lifespan(app: FastAPI):
     deposit_task: asyncio.Task | None = None
     deposit_card_task: asyncio.Task | None = None
+    notification_outbox_task: asyncio.Task | None = None
     order_notification_task: asyncio.Task | None = None
     polling_task: asyncio.Task | None = None
 
@@ -129,6 +131,8 @@ async def lifespan(app: FastAPI):
             name="deposit-checker",
         )
 
+        notification_outbox_task = asyncio.create_task(notification_loop(bot), name="notification-outbox")
+
         order_notification_task = asyncio.create_task(
             order_notification_loop(bot),
             name="admin-order-notifications",
@@ -167,6 +171,7 @@ async def lifespan(app: FastAPI):
             deposit_task,
             deposit_card_task,
             order_notification_task,
+            notification_outbox_task,
         )
 
         for task in tasks:

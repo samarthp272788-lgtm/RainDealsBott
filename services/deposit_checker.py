@@ -61,6 +61,7 @@ from web3 import Web3
 from web3.exceptions import TransactionNotFound
 
 from database import SessionLocal
+from services.notification_outbox import queue_message
 from models.deposit import Deposit
 from models.user import User
 
@@ -2169,83 +2170,8 @@ def credit_user(
         inr_amount=None,
         usdt_inr_rate=None,
 ) -> bool:
-    user = (
-        db.query(User)
-        .filter(
-            User.telegram_id
-            == deposit.telegram_id
-        )
-        .first()
-    )
-
-    if user is None:
-        return False
-
-    # ------------------------------------------------------------
-    # Final duplicate protection
-    # ------------------------------------------------------------
-
-    existing = (
-        db.query(Deposit)
-        .filter(
-            Deposit.tx_hash
-            == deposit.tx_hash,
-            Deposit.status
-            == "completed",
-            Deposit.id
-            != deposit.id,
-        )
-        .first()
-    )
-
-    if existing:
-        logger.warning(
-            "Duplicate TX prevented | tx=%s",
-            deposit.tx_hash,
-        )
-
-        return False
-
-    # ------------------------------------------------------------
-    # Credit
-    # ------------------------------------------------------------
-
-    user.balance += Decimal(
-        str(credited_amount)
-    )
-
-    if hasattr(
-            user,
-            "total_deposit",
-    ):
-        user.total_deposit += float(
-            credited_amount
-        )
-
-    # Store Decimal values without passing through float, which prevents
-    # decimal precision loss in credited deposit records.
-    deposit.amount = credited_amount
-
-    deposit.status = "completed"
-
-    deposit.received_amount = credited_amount
-
-    if inr_amount is not None:
-        deposit.inr_amount = Decimal(str(inr_amount))
-
-    if usdt_inr_rate is not None:
-        deposit.conversion_rate = Decimal(str(usdt_inr_rate))
-
-    db.commit()
-
-    logger.info(
-        "CREDITED | User=%s | Amount=%s | Balance=%s",
-        user.telegram_id,
-        credited_amount,
-        user.balance,
-    )
-
-    return True
+    from services.payment_submissions import credit_verified
+    return credit_verified(db, deposit, credited_amount, inr_amount, usdt_inr_rate)
 
 
 # ================================================================
@@ -2326,7 +2252,7 @@ async def _notify_attempt_limit(bot, result_info: dict) -> None:
         return
 
     try:
-        await bot.send_message(
+        await queue_message(bot, f"deposit-attempt-limit:{result_info.get('deposit_id')}",
             telegram_id,
             "⚠️ <b>Deposit Verification Cancelled</b>\n\n"
             f"We could not verify your payment after {result_info.get('attempts', MAX_CHECK_ATTEMPTS)} checks, "
@@ -2340,7 +2266,7 @@ async def _notify_attempt_limit(bot, result_info: dict) -> None:
 
     for admin_id in getattr(config, "ADMIN_IDS", []):
         try:
-            await bot.send_message(
+            await queue_message(bot, f"deposit-attempt-limit:{result_info.get('deposit_id')}",
                 admin_id,
                 "⚠️ <b>Deposit Verification Cancelled</b>\n\n"
                 f"🆔 Deposit: <code>#{result_info.get('deposit_id')}</code>\n"
@@ -2356,7 +2282,7 @@ async def _notify_attempt_limit(bot, result_info: dict) -> None:
     notification_channel = getattr(config, "NOTIFICATION_CHANNEL_ID", "")
     if notification_channel:
         try:
-            await bot.send_message(
+            await queue_message(bot, f"deposit-attempt-limit:{result_info.get('deposit_id')}",
                 notification_channel,
                 "⚠️ <b>Deposit Verification Cancelled</b>\n\n"
                 f"🆔 Deposit: <code>#{result_info.get('deposit_id')}</code>\n"
@@ -2385,6 +2311,10 @@ def _finalize_failed(
         deposit: Deposit,
         reason: str,
 ):
+    deposit = db.query(Deposit).filter(Deposit.id == deposit.id).populate_existing().with_for_update().first()
+    if not deposit or deposit.status in ('completed', 'failed'):
+        db.rollback()
+        return
     if DELETE_FAILED_DEPOSITS:
         db.delete(deposit)
     else:

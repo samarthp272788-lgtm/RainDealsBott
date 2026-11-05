@@ -14,6 +14,8 @@ from config import BOT_TOKEN
 
 from middleware.membership import BannedUserMiddleware
 from middleware.session_timeout import CallbackSessionTimeoutMiddleware
+from middleware.screen_navigation import ScreenNavigationMiddleware
+from services.performance import TelegramTimings, UpdateTimings
 
 
 # ============================================================
@@ -22,6 +24,8 @@ from middleware.session_timeout import CallbackSessionTimeoutMiddleware
 
 from handlers.start import router as start_router
 from handlers.restart import router as restart_router
+from handlers.order_workflow import router as order_workflow_router
+from handlers.bot_operations import router as bot_operations_router
 from handlers.products import _fetch_active_products, router as products_router
 from handlers.orders import router as orders_router
 from handlers.deposit import router as deposit_router
@@ -84,6 +88,9 @@ bot = Bot(
 # DISPATCHER
 # ============================================================
 
+bot.session.middleware(TelegramTimings())
+
+
 dp = Dispatcher(
     storage=MemoryStorage(),
 )
@@ -137,6 +144,11 @@ dp.update.outer_middleware(
     BannedUserMiddleware()
 )
 session_timeout_middleware = CallbackSessionTimeoutMiddleware()
+dp.callback_query.outer_middleware(UpdateTimings())
+dp.message.outer_middleware(UpdateTimings())
+screen_navigation_middleware = ScreenNavigationMiddleware()
+dp.callback_query.outer_middleware(screen_navigation_middleware)
+dp.message.outer_middleware(screen_navigation_middleware)
 dp.callback_query.outer_middleware(session_timeout_middleware)
 dp.message.outer_middleware(session_timeout_middleware)
 
@@ -153,6 +165,8 @@ dp.include_router(
     start_router
 )
 dp.include_router(restart_router)
+dp.include_router(order_workflow_router)
+dp.include_router(bot_operations_router)
 
 dp.include_router(
     products_router

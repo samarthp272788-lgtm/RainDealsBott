@@ -25,6 +25,10 @@ from models.order import Order
 from models.order_rating import OrderRating
 from models.product import Product
 from models.order_requirement_submission import OrderRequirementSubmission
+from services.order_workflow import record_event
+from services.warranty import start_coverage
+from services.notification_outbox import queue_message
+from services.input_forms import field_value, is_cancel, InputError
 from states.product_states import OrderRequirementStates
 import config
 from utils.ui import show, update_card, answer_card
@@ -634,6 +638,12 @@ def _save_order_requirement_submission(order_id: int, telegram_id: int, values: 
             order.status = "pending_manual" if order.manual_pending_quantity else "completed"
         else:
             order.status = "pending_manual"
+        record_event(db, order.id, 'information', 'Customer information received.', actor_id=telegram_id)
+        if order.delivered_account:
+            record_event(db, order.id, 'automatic_delivery', 'Reserved automatic delivery released.')
+        if order.status == 'completed':
+            start_coverage(order)
+            record_event(db, order.id, 'completed', 'Order completed.')
         db.commit()
         return {"status": order.status, "delivery": order.delivered_account, "product_name": order.product_name}
     except Exception:
@@ -672,7 +682,7 @@ async def order_cancel_info(callback: CallbackQuery, state: FSMContext):
 
 @router.message(OrderRequirementStates.waiting_input)
 async def order_requirement_input(message: Message, state: FSMContext):
-    if (message.text or "").strip().lower() == "/cancel":
+    if is_cancel(message.text):
         await state.clear()
         await answer_card(message, "Stopped. You can continue from My Orders.")
         return
@@ -685,36 +695,11 @@ async def order_requirement_input(message: Message, state: FSMContext):
         return
     field = fields[index]
     kind = str(field.get("type", "text")).lower()
-    if kind == "photo":
-        if not message.photo:
-            await answer_card(message, "Please upload a photo for this field.")
-            return
-        value = {"kind": "photo", "file_id": message.photo[-1].file_id}
-    elif kind == "contact":
-        if not message.contact:
-            await answer_card(message, "Please share a Telegram contact using the attachment menu.")
-            return
-        value = {"kind": "contact", "phone": message.contact.phone_number,
-                 "first_name": message.contact.first_name, "user_id": message.contact.user_id}
-    elif kind == "email":
-        text = (message.text or "").strip()
-        if len(text) > 254 or "@" not in text or "." not in text.rsplit("@", 1)[-1]:
-            await answer_card(message, "Please send a valid email address.")
-            return
-        value = {"kind": "text", "value": text[:254]}
-    elif kind == "phone":
-        text = (message.text or "").strip()
-        digits = sum(ch.isdigit() for ch in text)
-        if digits < 7 or len(text) > 40:
-            await answer_card(message, "Please send a valid phone/contact number.")
-            return
-        value = {"kind": "text", "value": text}
-    else:
-        text = (message.text or "").strip()
-        if not text or len(text) > 3000:
-            await answer_card(message, "Please send text up to 3000 characters.")
-            return
-        value = {"kind": "text", "value": text}
+    try:
+        value = field_value(message, kind)
+    except InputError as error:
+        await answer_card(message, str(error))
+        return
 
     values = data.get("order_requirement_values") or {}
     values[str(field.get("label") or kind)] = value
@@ -744,7 +729,7 @@ async def order_requirement_input(message: Message, state: FSMContext):
         channel = getattr(config, "ADMIN_ORDER_NOTIFICATION_CHANNEL_ID", "")
         if channel:
             try:
-                await message.bot.send_message(channel,
+                await queue_message(message.bot, f"order-information:{order_id}", channel,
                     f"🧾 <b>Buyer information received</b>\nOrder: <code>#{order_id}</code>\n"
                     f"Buyer: <code>{message.from_user.id}</code>\nOpen Admin → Orders to review.", parse_mode="HTML")
             except Exception:
@@ -947,6 +932,11 @@ async def order_detail(callback: CallbackQuery):
                     style="success",
                 )
             ])
+
+    action_buttons.append([InlineKeyboardButton(text="🕒 Order timeline", callback_data=f"order_timeline_{order.id}", style="primary")])
+
+    if getattr(order, "warranty_days", 0):
+        action_buttons.append([InlineKeyboardButton(text="🛡 Warranty / replacement", callback_data=f"warranty_order_{order.id}", style="primary")])
 
     # Share button
     action_buttons.append([

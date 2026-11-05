@@ -70,7 +70,7 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
         product = SimpleNamespace(is_active=True, price=1)
         products = SimpleNamespace(_fetch_product=Mock(return_value=product), _get_custom_price=Mock(return_value=None),
                                    _get_max_qty=lambda p: 4, _real_stock=lambda p: 2,
-                                   _qty_text=Mock(return_value='Updated confirmation'), _confirm_keyboard=lambda *args: None,
+                                   _qty_text=Mock(return_value='Updated confirmation'), _confirm_keyboard=lambda *args, **kwargs: None,
                                    _do_purchase=buy)
         with patch.dict(sys.modules, {'handlers.products': products}), \
              patch('handlers.restart.load_resume', AsyncMock(return_value=snapshot)), \

@@ -5,6 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+from services.warranty import start_coverage
 from services.fulfillment_policy import plan_delivery, order_capacity, manual_allowed
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,7 +36,7 @@ class Product:
 
 
 class Order(SimpleNamespace):
-    telegram_id = product_id = status = refunded = id = Field()
+    telegram_id = product_id = status = refunded = id = checkout_key = Field()
 
 
 class Submission(SimpleNamespace):
@@ -66,13 +67,13 @@ class Query:
 
 
 class CheckoutTests(unittest.TestCase):
-    def checkout(self, p, quantity):
+    def checkout(self, p, quantity, replay=False):
         user = SimpleNamespace(telegram_id=7, balance=Decimal('100'), total_orders=0,
                                total_spent=Decimal('0'), referred_by=None, is_banned=False)
         added = []
         class DB:
             def query(self, model):
-                return Query(user if model is User else p if model is Product else None)
+                return Query(user if model is User else p if model is Product else added[0] if added else None)
             def add(self, obj):
                 obj.id = 9
                 added.append(obj)
@@ -88,10 +89,21 @@ class CheckoutTests(unittest.TestCase):
                   Decimal=Decimal, _money=lambda v: Decimal(str(v)).quantize(Decimal('.00000001')),
                   _active_custom_price=lambda *args: None, _get_bulk_price=lambda *args: None,
                   plan_delivery=plan_delivery, order_capacity=order_capacity, manual_allowed=manual_allowed,
-                  DEFAULT_LOW_STOCK_THRESHOLD=3, invalidate_products_cache=lambda: None)
+                  DEFAULT_LOW_STOCK_THRESHOLD=3, invalidate_products_cache=lambda: None, enqueue=lambda *args, **kwargs: None, record_event=lambda *args, **kwargs: None, start_coverage=start_coverage)
         exec(compile(ast.Module(body=[node], type_ignores=[]), '<checkout>', 'exec'), ns)
-        result = ns['_do_purchase'](7, 1, quantity)
+        result = ns['_do_purchase'](7, 1, quantity, None, 'e'*64 if replay else None)
+        if replay:
+            repeated = ns['_do_purchase'](7, 1, quantity, None, 'e'*64)
+            self.assertEqual(repeated, {'duplicate_order_id': result['order_id']})
         return result, user, added
+
+    def test_replayed_confirmation_cannot_debit_or_allocate_stock_again(self):
+        p = product()
+        _, user, orders = self.checkout(p, 3, replay=True)
+        self.assertEqual(user.balance, Decimal('97'))
+        self.assertEqual(user.total_orders, 1)
+        self.assertEqual(p.stock, 997)
+        self.assertEqual(len(orders), 1)
 
     def test_hybrid_two_ready_one_manual_and_one_wallet_charge(self):
         p = product()
@@ -144,6 +156,8 @@ class CheckoutTests(unittest.TestCase):
     def test_information_submission_releases_partial_delivery_but_keeps_manual_remainder(self):
         _, _, orders = self.checkout(product(required_info=[{'label': 'Email', 'type': 'email'}]), 3)
         order = orders[0]
+        order.assigned_admin_id = None
+        order.assigned_at = None
         class DB:
             def query(self, model):
                 return Query(order if model is Order else None)
@@ -154,7 +168,7 @@ class CheckoutTests(unittest.TestCase):
             def close(self):
                 pass
         fn = extract('handlers/orders.py', '_save_order_requirement_submission',
-                     dict(SessionLocal=DB, Order=Order, OrderRequirementSubmission=Submission))
+                     dict(SessionLocal=DB, Order=Order, OrderRequirementSubmission=Submission, enqueue=lambda *args, **kwargs: None, record_event=lambda *args, **kwargs: None, start_coverage=start_coverage))
         result = fn(9, 7, {'Email': {'kind': 'text', 'value': 'buyer@example.com'}})
         self.assertEqual(result['status'], 'pending_manual')
         self.assertEqual(result['delivery'], 'a:1\nb:2')
@@ -164,6 +178,8 @@ class CheckoutTests(unittest.TestCase):
     def test_manual_completion_appends_without_overwriting_automatic_delivery(self):
         _, _, orders = self.checkout(product(), 3)
         order = orders[0]
+        order.assigned_admin_id = None
+        order.assigned_at = None
         class DB:
             def query(self, model):
                 return Query(order if model is Order else None)
@@ -175,7 +191,7 @@ class CheckoutTests(unittest.TestCase):
         from unittest.mock import Mock
         fn = extract('handlers/admin_orders.py', '_do_deliver',
                      dict(transaction=transaction, Order=Order, ApiOrder=type('ApiOrder', (), {'id': Field(), 'order_id': Field()}),
-                          AdminAuditLog=Submission, logger=Mock()))
+                          AdminAuditLog=Submission, logger=Mock(), datetime=__import__("datetime").datetime, enqueue=lambda *args, **kwargs: None, record_event=lambda *args, **kwargs: None, start_coverage=start_coverage))
         result = fn(9, 'c:3', 123)
         self.assertNotIn('error', result)
         self.assertEqual(order.delivered_account, 'a:1\nb:2\nc:3')
@@ -198,7 +214,7 @@ class CheckoutTests(unittest.TestCase):
         from unittest.mock import Mock
         fn = extract('handlers/admin_orders.py', '_do_refund',
                      dict(transaction=transaction, Order=Order, User=User, Product=Product, AdminAuditLog=Submission,
-                          Decimal=Decimal, _money=lambda v: Decimal(str(v)), logger=Mock()))
+                          Decimal=Decimal, _money=lambda v: Decimal(str(v)), logger=Mock(), enqueue=lambda *args, **kwargs: None, record_event=lambda *args, **kwargs: None, start_coverage=start_coverage))
         self.assertNotIn('error', fn(9, 123))
         self.assertEqual(p.stock, 1000)
         self.assertEqual(p.file_content, 'a:1\nb:2')

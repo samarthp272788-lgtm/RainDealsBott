@@ -261,6 +261,17 @@ def valid_session(token: str, client_ip: str = "unknown") -> bool:
     return session_status(token, client_ip)[0] == "valid"
 
 
+def session_owner(token: str, client_ip: str):
+    """Server-side actor identity for fulfillment; never trust a submitted admin ID."""
+    if not valid_session(token, client_ip):
+        return None
+    with SessionLocal() as db:
+        row = db.query(ManagerAuthSession.telegram_id).filter(
+            ManagerAuthSession.token_hash == _hash(token), ManagerAuthSession.revoked_at.is_(None),
+            ManagerAuthSession.expires_at > _now()).first()
+        return row.telegram_id if row else None
+
+
 def revoke_session(token: str) -> None:
     if not token:
         return

@@ -31,6 +31,11 @@ from models.product_engagement import ProductEngagement
 from models.custom_rate import CustomRate
 from models.rate_control import ProductRateControl, RateControlAssignment
 from services.fulfillment_policy import order_capacity, manual_allowed, plan_delivery
+from services.checkout_actions import confirmation_token, action_key, claim_checkout, finish_checkout, recover_checkout
+from services.order_workflow import record_event
+from services.warranty import start_coverage
+from services.input_forms import quantity as parse_quantity, is_cancel, InputError
+from services.notification_outbox import enqueue_once
 
 # Reseller Manager & Reseller Config imports
 try:
@@ -246,6 +251,7 @@ async def _refresh_reseller_stock_cache_if_needed():
             semaphore = asyncio.Semaphore(4)
 
             async def refresh_provider(prov):
+                from services.provider_health import observe_sync
                 if not prov.get("api_key") or not prov.get("base_url"):
                     return
                 async with semaphore:
@@ -274,7 +280,9 @@ async def _refresh_reseller_stock_cache_if_needed():
                                 stock = 999999
                             if sid:
                                 _reseller_stock_cache[sid] = stock
+                        observe_sync(prov.get("id") or prov.get("provider_id") or "default_provider")
                     except Exception as exc:
+                        observe_sync(prov.get("id") or prov.get("provider_id") or "default_provider", exc)
                         logger.warning(
                             "Supplier stock refresh failed provider_id=%s name=%s error_type=%s "
                             "http_status=%s reason=%s; "
@@ -676,22 +684,19 @@ def _restock_subscribers(product_id: int) -> list[int]:
         db.close()
 
 
-def _claim_restock_subscription(user_id: int, product_id: int) -> bool:
-    db = SessionLocal()
-    try:
-        row = _engagement_row(db, user_id, product_id)
+def _queue_restock_subscription(user_id, product_id, bot_id, text, keyboard):
+    from uuid import uuid4
+    from database import transaction
+    from services.notification_outbox import enqueue
+    with transaction() as db:
+        row = db.query(ProductEngagement).filter_by(telegram_id=user_id, product_id=product_id).with_for_update().first()
         if not row or not row.restock_enabled:
             return False
+        enqueue(db, f'restock:{product_id}:{uuid4().hex}', user_id, text, bot_id, reply_markup=keyboard)
         row.restock_enabled = False
         if not row.is_favorite:
             db.delete(row)
-        db.commit()
-        return True
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
+    return True
 
 
 async def _notify_restock_subscribers(bot, product, stock: int) -> None:
@@ -711,21 +716,10 @@ async def _notify_restock_subscribers(bot, product, stock: int) -> None:
     ])
     for user_id in subscribers:
         try:
-            claimed = await asyncio.to_thread(_claim_restock_subscription, user_id, product.id)
+            await asyncio.to_thread(_queue_restock_subscription, user_id, product.id, bot.id, text, keyboard)
         except Exception:
-            logger.exception("Could not claim restock alert for user %s product %s", user_id, product.id)
-            continue
-        if not claimed:
-            continue
-        try:
-            await bot.send_message(user_id, text, parse_mode="HTML", reply_markup=keyboard)
-        except Exception:
-            # Restore the one-shot alert if Telegram did not accept the send.
-            try:
-                await asyncio.to_thread(_set_restock_subscription, user_id, product.id, True)
-            except Exception:
-                logger.exception("Could not restore failed restock alert for user %s product %s", user_id, product.id)
-            logger.info("Could not send restock alert to user %s for product %s", user_id, product.id)
+            # The subscription and queued notification roll back together.
+            logger.warning("Could not queue restock alert for user %s product %s", user_id, product.id)
 
 
 async def _search_products(query: str) -> list:
@@ -995,13 +989,8 @@ async def _send_stock_channel_message(bot, text: str, product_id: int | None = N
     task.add_done_callback(_log_stock_notification_task)
 
 
-_stock_destination_retry_at: dict[str, float] = {}
-
-
 async def _deliver_stock_channel_message(bot, text: str, destinations: list, product_id: int | None, can_buy: bool):
     global _stock_bot_username
-    now = time.monotonic()
-    destinations = [target for target in destinations if now >= _stock_destination_retry_at.get(str(target), 0)]
     if not destinations:
         return
     markup = None
@@ -1022,25 +1011,11 @@ async def _deliver_stock_channel_message(bot, text: str, destinations: list, pro
         except Exception:
             logger.exception("Could not create product deep link for stock notification")
 
-    results = await asyncio.gather(
-        *(
-            bot.send_message(target, text, parse_mode="HTML", reply_markup=markup)
-            for target in destinations
-        ),
-        return_exceptions=True,
-    )
-    for target, result in zip(destinations, results):
-        if isinstance(result, Exception):
-            if any(reason in str(result).lower() for reason in ("chat not found", "bot was kicked", "not enough rights", "bot is not a member")):
-                _stock_destination_retry_at[str(target)] = time.monotonic() + 300
-                logger.warning(
-                    "Stock notification destination %s is unavailable; check STOCK_GROUP_ID/GROUP_ID "
-                    "and bot membership/posting rights. Retrying in 5 minutes. Error: %s", target, result,
-                )
-            else:
-                logger.error("Failed to send stock notification to %s: %s", target, result)
-        else:
-            _stock_destination_retry_at.pop(str(target), None)
+    from uuid import uuid4
+    event = f'stock:{product_id}:{uuid4().hex}'
+    # Destination rejection/backoff and retries are handled by the durable outbox.
+    for target in destinations:
+        await asyncio.to_thread(enqueue_once, event, target, text, bot.id, markup)
 
 
 def _log_stock_notification_task(task: asyncio.Task):
@@ -1874,6 +1849,9 @@ async def product_info(
         f"  {delivery_info['icon']} <b>Delivery:</b> {delivery_info['label']}\n"
     )
 
+    if getattr(product, "warranty_days", 0):
+        text += f"  🛡 <b>Replacement warranty:</b> {product.warranty_days} day(s) after delivery\n"
+
     if delivery_info['desc']:
         text += f"  └ <i>{delivery_info['desc']}</i>\n"
 
@@ -2019,9 +1997,9 @@ def _qty_text(product, qty: int, real_stock_available: bool, custom_price: Decim
     )
 
 
-def _confirm_keyboard(product_id: int, is_free: bool = False) -> InlineKeyboardMarkup:
+def _confirm_keyboard(product_id: int, is_free: bool = False, checkout_token: str | None = None) -> InlineKeyboardMarkup:
     confirm_text = "🎁 Claim Now! 🎁" if is_free else "✅ Confirm Purchase"
-    buttons = [[InlineKeyboardButton(text=confirm_text, callback_data=f"confirm_buy_{product_id}", style="success")]]
+    buttons = [[InlineKeyboardButton(text=confirm_text, callback_data=f"confirm_buy_{product_id}_{checkout_token or 'expired'}", style="success")]]
 
     if not is_free:
         buttons.append(
@@ -2078,9 +2056,10 @@ async def select_qty(callback: CallbackQuery, state: FSMContext):
 
     if is_free:
         await state.update_data(**{f"qty_{product_id}": 1})
+        token = await confirmation_token(state, product_id)
         real_stock_available = _real_stock(product) > 0
         await show(callback, _qty_text(product, 1, real_stock_available, custom_price),
-                   parse_mode="HTML", reply_markup=_confirm_keyboard(product_id, is_free=True))
+                   parse_mode="HTML", reply_markup=_confirm_keyboard(product_id, is_free=True, checkout_token=token))
         return
 
     cat_config = _get_category_config(product.category)
@@ -2121,6 +2100,15 @@ async def receive_qty(message: Message, state: FSMContext):
     card_chat_id = data.get("_card_chat_id")
     card_message_id = data.get("_card_message_id")
 
+    if is_cancel(message.text):
+        await state.clear()
+        await update_card(message, None, 'Cancelled. No order was placed.', chat_id=card_chat_id,
+                          message_id=card_message_id, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                              InlineKeyboardButton(text='Back to product' if product_id else 'Products',
+                                                   callback_data=f'product_{product_id}' if product_id else 'products_menu'),
+                              InlineKeyboardButton(text='Home', callback_data='main_menu')]]))
+        return
+
     if product_id is None:
         await state.clear()
         await update_card(message, None, f"⚠️ <b>Session Expired</b>\n\nPlease start over from the product page.",
@@ -2148,9 +2136,10 @@ async def receive_qty(message: Message, state: FSMContext):
     is_free = float(product.price) == 0
     if is_free:
         await state.update_data(**{f"qty_{product_id}": 1})
+        token = await confirmation_token(state, product_id)
         real_stock_available = _real_stock(product) > 0
         await update_card(message, state, _qty_text(product, 1, real_stock_available, custom_price),
-                          parse_mode="HTML", reply_markup=_confirm_keyboard(product_id, is_free=True))
+                          parse_mode="HTML", reply_markup=_confirm_keyboard(product_id, is_free=True, checkout_token=token))
         return
 
     max_qty = _get_max_qty(product)
@@ -2164,28 +2153,17 @@ async def receive_qty(message: Message, state: FSMContext):
                           ]))
         return
 
-    raw = message.text.strip()
-    if not raw.isdigit():
-        range_msg = f"1 to {max_qty}" if max_qty < 999999 else "1 or more"
-        await update_card(message, state,
-                          f"⚠️ <b>Invalid Input</b>\n\n{_divider('─', 24)}\n\n❌ Please send a whole number.\n\n"
-                          f"<b>Valid range:</b> {range_msg}\n\n<i>Example: 1 or 3</i>",
-                          parse_mode="HTML", reply_markup=_cancel_input_keyboard(product_id))
-        return
-
-    qty = int(raw)
-    if qty < 1 or (max_qty < 999999 and qty > max_qty):
-        range_msg = f"1 and {max_qty}" if max_qty < 999999 else "at least 1"
-        await update_card(message, state,
-                          f"⚠️ <b>Out of Range</b>\n\n{_divider('─', 24)}\n\n❌ Quantity must be between {range_msg}.\n\n"
-                          f"You entered: <b>{qty}</b>\n\n<i>Please try again.</i>",
-                          parse_mode="HTML", reply_markup=_cancel_input_keyboard(product_id))
+    try:
+        qty = parse_quantity(message.text, max_qty)
+    except InputError as error:
+        await update_card(message, state, str(error), reply_markup=_cancel_input_keyboard(product_id))
         return
 
     await state.update_data(**{f"qty_{product_id}": qty})
+    token = await confirmation_token(state, product_id)
     real_stock_available = _real_stock(product) > 0
     await update_card(message, state, _qty_text(product, qty, real_stock_available, custom_price),
-                      parse_mode="HTML", reply_markup=_confirm_keyboard(product_id, is_free))
+                      parse_mode="HTML", reply_markup=_confirm_keyboard(product_id, is_free, checkout_token=token))
 
 
 @router.callback_query(F.data.startswith("cancel_buy_"))
@@ -2213,6 +2191,7 @@ def _do_purchase(
     product_id: int,
     quantity: int,
     delivery_telegram_id: int | None = None,
+    checkout_key: str | None = None,
 ) -> dict:
     with transaction() as db:
         user = db.query(User).filter(User.telegram_id == telegram_id).with_for_update().first()
@@ -2220,6 +2199,11 @@ def _do_purchase(
             return {"error": "User not found."}
         if getattr(user, "is_banned", False):
             return {"error": "Your account is banned from making purchases."}
+
+        if checkout_key:
+            existing = db.query(Order).filter(Order.checkout_key == checkout_key, Order.telegram_id == telegram_id).first()
+            if existing:
+                return {"duplicate_order_id": existing.id}
 
         product = db.query(Product).filter(Product.id == product_id).with_for_update().first()
         if not product:
@@ -2316,10 +2300,22 @@ def _do_purchase(
             automatic_quantity=len(plan.automatic), manual_pending_quantity=plan.manual_quantity,
             stock_deducted_quantity=0 if plan.preorder else quantity,
             is_preorder=is_preorder_order, status=status, refunded=False,
-            delivery_telegram_id=delivery_telegram_id,
+            delivery_telegram_id=delivery_telegram_id, checkout_key=checkout_key,
         )
+        order.warranty_days = max(0, int(getattr(product, "warranty_days", 0) or 0))
+        if status == "completed":
+            start_coverage(order)
         db.add(order)
         db.flush()
+        record_event(db, order.id, 'created', 'Order received.', actor_id=telegram_id)
+        if status == 'pending_info':
+            record_event(db, order.id, 'awaiting_information', 'Waiting for customer information.')
+        elif plan.automatic:
+            record_event(db, order.id, 'automatic_delivery', f'{len(plan.automatic)} unit(s) delivered automatically.')
+        if status == 'completed':
+            record_event(db, order.id, 'completed', 'Order completed.')
+        elif status == 'pending_manual':
+            record_event(db, order.id, 'manual_pending', f'{plan.manual_quantity} unit(s) awaiting team delivery.')
 
         referral_commission_paid = None
         if not is_preorder_order and user.referred_by:
@@ -2360,6 +2356,7 @@ async def _do_reseller_purchase(
     product_id: int,
     quantity: int,
     progress_callback=None,
+    checkout_key: str | None = None,
 ) -> dict:
     async def report_progress(percent: int, stage: str) -> None:
         if progress_callback is None:
@@ -2420,6 +2417,7 @@ async def _do_reseller_purchase(
                 "balance": float(user_balance)
             }
 
+        warranty_days = max(0, int(getattr(product, "warranty_days", 0) or 0))
         product_name = product.name
         product_icon = product.icon
         delivery_instruction = product.delivery_instruction
@@ -2435,7 +2433,7 @@ async def _do_reseller_purchase(
         return {"error": "Reseller service is not configured properly."}
 
     await report_progress(30, "Checking your balance and product availability")
-    external_order_id = f"ORD-{telegram_id}-{int(time.time())}"
+    external_order_id = f"RD-{checkout_key[:32]}" if checkout_key else f"ORD-{telegram_id}-{int(time.time())}"
 
     try:
         manager = ResellerManager(api_key=api_key, base_url=base_url, provider_config=creds)
@@ -2451,10 +2449,10 @@ async def _do_reseller_purchase(
         err_detail = str(e)
         logger.error("ResellerAPIError during purchase (status %s):\n%s", status_code, err_detail)
 
-        return {"error": f"❌ Provider Error ({status_code}): {err_detail}"}
+        return {"error": f"❌ Provider Error ({status_code}): {err_detail}", "needs_review": not status_code or status_code >= 500}
     except Exception as e:
         logger.exception("Unexpected error ordering from reseller API")
-        return {"error": f"❌ Supplier service error: {str(e)}"}
+        return {"error": f"❌ Supplier service error: {str(e)}", "needs_review": True}
 
     delivered_list = []
     if isinstance(api_response, dict):
@@ -2502,6 +2500,13 @@ async def _do_reseller_purchase(
             if not u:
                 raise Exception("User not found during transaction commit")
 
+            if checkout_key:
+                existing = db.query(Order).filter(Order.checkout_key == checkout_key, Order.telegram_id == telegram_id).first()
+                if existing:
+                    return {"duplicate_order_id": existing.id}
+            if _money(u.balance) < total_amount:
+                raise RuntimeError('Wallet changed after supplier confirmation; manual reconciliation required')
+
             u.balance = _money(u.balance) - total_amount
             u.total_orders += 1
             u.total_spent = _money(u.total_spent) + total_amount
@@ -2522,13 +2527,20 @@ async def _do_reseller_purchase(
                 delivery_type="automatic",
                 is_preorder=False,
                 status="processing" if is_async_provider_order else "completed",
-                refunded=False,
+                refunded=False, checkout_key=checkout_key,
                 reseller_id=local_provider_id,
                 reseller_service_id=service_id,
                 reseller_order_id=external_order_id if is_async_provider_order else str(provider_order_id or external_order_id),
             )
             db.add(order)
             db.flush()
+            order.warranty_days = warranty_days
+            if order.status == "completed":
+                start_coverage(order)
+            record_event(db, order.id, 'created', 'Supplier order received.', actor_id=telegram_id)
+            record_event(db, order.id, 'supplier_pending' if is_async_provider_order else 'completed',
+                         'Supplier is processing the order.' if is_async_provider_order else 'Supplier delivery completed.')
+
 
             referral_commission_paid = None
             if u.referred_by:
@@ -2567,6 +2579,8 @@ async def _do_reseller_purchase(
     try:
         await report_progress(95, "Securing your order and updating stock")
         result = await asyncio.to_thread(_finalize_db_transaction)
+        if result.get("duplicate_order_id"):
+            return result
         if service_id in _reseller_stock_cache and _reseller_stock_cache[service_id] < 999999:
             _reseller_stock_cache[service_id] = max(
                 0, _reseller_stock_cache[service_id] - quantity
@@ -2579,17 +2593,17 @@ async def _do_reseller_purchase(
         return result
     except Exception:
         logger.exception("Error finalizing local order after successful reseller order")
-        return {"error": "❌ Order processing error. Please contact support with your purchase details."}
+        return {"error": "❌ Order processing needs review. Check My Orders and contact support before retrying.", "needs_review": True}
 
 
-async def _notify_admins_low_stock(bot, alert: dict):
+async def _notify_admins_low_stock(bot, alert: dict, order_id: int):
     for admin_id in ADMIN_IDS:
         try:
-            await bot.send_message(admin_id,
+            await asyncio.to_thread(enqueue_once, f"low-stock:{order_id}", admin_id,
                                    f"⚠️ <b>LOW STOCK ALERT</b>\n\n{_divider('─', 24)}\n\n"
                                    f"📦 <b>Product:</b> {alert['product_name']}\n🆔 <b>ID:</b> #{alert['product_id']}\n"
                                    f"📊 <b>Remaining:</b> {alert['stock']}\n🔔 <b>Threshold:</b> {alert['threshold']}\n\n"
-                                   f"⚡ <i>Stock has dropped below the alert threshold.</i>", parse_mode="HTML")
+                                   f"⚡ <i>Stock has dropped below the alert threshold.</i>", bot.id)
         except Exception:
             logger.exception("Failed to notify admin %s of low stock", admin_id)
 
@@ -2609,14 +2623,14 @@ async def _notify_stock_purchase(bot, buyer_id: int, result: dict):
     )
 
 
-async def _notify_referral_commission(bot, commission: dict):
+async def _notify_referral_commission(bot, commission: dict, order_id: int):
     try:
-        await bot.send_message(
+        await asyncio.to_thread(enqueue_once, f"referral:{order_id}",
             commission["referrer_telegram_id"],
             f"🎉 <b>Referral Commission Earned!</b>\n\n{_divider('─', 22)}\n\n"
             f"💵 <b>Amount:</b> ${commission['amount']:.2f}\n👤 <b>From:</b> A user you referred\n\n"
             f"<i>Thanks for sharing your link! 🙏</i>",
-            parse_mode="HTML",
+            bot.id,
         )
     except Exception:
         logger.exception("Failed to notify referrer %s", commission.get("referrer_telegram_id"))
@@ -2669,6 +2683,48 @@ async def show_delivery_instruction(callback: CallbackQuery):
 # ║              CONFIRM PURCHASE                                ║
 # ╚══════════════════════════════════════════════════════════════╝
 
+async def _purchase_notifications(callback, telegram_id, product_id, result):
+    # Order notification channel
+    if ORDER_NOTIFICATION_CHANNEL_ID:
+        try:
+            uid = str(telegram_id)
+            username = callback.from_user.username
+            if username:
+                masked_user = f"@{username[:2]}***{username[-1:]}" if len(username) > 3 else f"@{username}"
+            else:
+                masked_user = f"{uid[:4]}***{uid[-3:]}" if len(uid) >= 7 else uid
+            delivery_status = (
+                "⚡ Delivered instantly" if result.get("status") == "completed"
+                else "⏳ Awaiting restock" if result.get("status") == "preorder"
+                else "⏳ Delivery processing"
+            )
+            group_msg = (
+                "🛍 <b>PRODUCT ORDER</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+                f"🧾 <b>Order:</b> <code>#{result['order_id']}</code>\n"
+                f"👤 <b>User:</b> <code>{_esc(masked_user)}</code>\n"
+                f"📦 <b>Product:</b> {_esc(result['name'])}\n"
+                f"🔢 <b>Quantity:</b> {result['quantity']}\n"
+                f"💰 <b>Total:</b> ${result['total_price']:.2f}\n\n"
+                f"{delivery_status}"
+            )
+            await asyncio.to_thread(enqueue_once, f"public-order:{result['order_id']}", ORDER_NOTIFICATION_CHANNEL_ID, group_msg, callback.bot.id)
+        except Exception:
+            logger.exception("Failed to send order notification")
+
+    if result.get("low_stock_alert"):
+        task = asyncio.create_task(_notify_admins_low_stock(callback.bot, result["low_stock_alert"], result["order_id"]))
+        task.add_done_callback(_log_stock_notification_task)
+    task = asyncio.create_task(_notify_stock_purchase(callback.bot, telegram_id, result))
+    task.add_done_callback(_log_stock_notification_task)
+    asyncio.create_task(_refresh_and_scan_product(callback.bot, product_id))
+
+    commission = result.get("referral_commission_paid")
+    if commission:
+        task = asyncio.create_task(_notify_referral_commission(callback.bot, commission, result["order_id"]))
+        task.add_done_callback(_log_stock_notification_task)
+
+
 @router.callback_query(F.data.startswith("confirm_buy_"))
 async def confirm_buy(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
@@ -2683,9 +2739,28 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
     async with lock:
         data = await state.get_data()
         quantity = data.get(f"qty_{product_id}", 1)
+        token = callback.data.split('_', 3)[3] if len(callback.data.split('_', 3)) == 4 else ''
+        if len(token) != 24 or any(c not in '0123456789abcdef' for c in token):
+            await show(callback, 'This confirmation expired. Open the product and confirm again.',
+                       reply_markup=_cancel_input_keyboard(product_id))
+            return
+        checkout_key = action_key(callback.bot.id, telegram_id, product_id, token)
+        claim = await asyncio.to_thread(claim_checkout, checkout_key, telegram_id, product_id, quantity,
+                                        data.get(f'checkout_token_{product_id}') == token)
+        if not claim['new']:
+            existing_id = claim.get('order_id') or await asyncio.to_thread(recover_checkout, checkout_key, telegram_id)
+            text = (f"Order #{existing_id} is already recorded. No new charge." if existing_id else
+                    'This confirmation was already used or is processing. Check My Orders before trying again.'
+                    if claim['status'] != 'expired' else 'This confirmation expired. Open the product again.')
+            await show(callback, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text='My Orders', callback_data=f'order_detail_{existing_id}' if existing_id else 'orders_menu'),
+                InlineKeyboardButton(text='Home', callback_data='main_menu')]]))
+            return
+
 
         product = await asyncio.to_thread(_fetch_product, product_id)
         if not product or not product.is_active:
+            await asyncio.to_thread(finish_checkout, checkout_key, {"error": "unavailable"})
             await show(callback, f"❌ <b>NOT FOUND</b>\n\n<b>This product is no longer available.</b>",
                        parse_mode="HTML",
                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -2719,10 +2794,10 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
                     telegram_id,
                     product_id,
                     quantity,
-                    progress_callback=update_purchase_progress,
+                    progress_callback=update_purchase_progress, checkout_key=checkout_key,
                 )
             else:
-                result = await asyncio.to_thread(_do_purchase, telegram_id, product_id, quantity)
+                result = await asyncio.to_thread(_do_purchase, telegram_id, product_id, quantity, None, checkout_key)
         except asyncio.CancelledError:
             logger.warning(
                 "Order request interrupted for user=%s product=%s; result may need review",
@@ -2748,7 +2823,7 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
             raise
         except SQLAlchemyError:
             logger.exception("Database error during purchase")
-            await show(callback, f"❌ <b>Database Error</b>\n\nSomething went wrong. Please try again.",
+            await show(callback, f"❌ <b>Database Error</b>\n\nOpen My Orders before retrying. Contact support if the result is unclear.",
                        parse_mode="HTML",
                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                            [InlineKeyboardButton(text="🔄 Try Again", callback_data=f"product_{product_id}",
@@ -2758,7 +2833,7 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
             return
         except Exception:
             logger.exception("Unexpected error during purchase")
-            await show(callback, f"❌ <b>Unexpected Error</b>\n\nPlease try again or contact support.",
+            await show(callback, f"❌ <b>Unexpected Error</b>\n\nOpen My Orders before retrying, or contact support.",
                        parse_mode="HTML",
                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                            [InlineKeyboardButton(text="🆘 Support", callback_data="support_menu", style="danger"),
@@ -2766,6 +2841,14 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
                        ]))
             return
 
+        # Notifications are independent of the screen the buyer opens next.
+        if result.get('order_id'):
+            task = asyncio.create_task(_purchase_notifications(callback, telegram_id, product_id, result))
+            task.add_done_callback(_log_stock_notification_task)
+        await asyncio.to_thread(finish_checkout, checkout_key, result)
+        if result.get('duplicate_order_id'):
+            await show(callback, f"Order #{result['duplicate_order_id']} is already recorded. Open My Orders.")
+            return
         await state.update_data(**{f"qty_{product_id}": 1})
         await state.clear()
 
@@ -2814,7 +2897,8 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
                     "❌ <b>PURCHASE COULDN’T BE COMPLETED</b>\n"
                     "━━━━━━━━━━━━━━━━━━\n\n"
                     f"⚠️ {_esc(error_msg)}\n\n"
-                    "Your wallet has not been charged. Contact support if you need help."
+                    + ("Check My Orders and contact support before retrying. The payment status needs review."
+                     if result.get("needs_review") else "Your wallet has not been charged. Contact support if you need help.")
                 )
                 reply_markup = InlineKeyboardMarkup(
                     inline_keyboard=[
@@ -2842,38 +2926,6 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
 
             await show(callback, text, parse_mode="HTML", reply_markup=reply_markup)
             return
-
-        # Order notification channel
-        if ORDER_NOTIFICATION_CHANNEL_ID:
-            try:
-                uid = str(telegram_id)
-                username = callback.from_user.username
-                if username:
-                    masked_user = f"@{username[:2]}***{username[-1:]}" if len(username) > 3 else f"@{username}"
-                else:
-                    masked_user = f"{uid[:4]}***{uid[-3:]}" if len(uid) >= 7 else uid
-                delivery_status = (
-                    "⚡ Delivered instantly" if result.get("status") == "completed"
-                    else "⏳ Awaiting restock" if result.get("status") == "preorder"
-                    else "⏳ Delivery processing"
-                )
-                group_msg = (
-                    "🛍 <b>PRODUCT ORDER</b>\n"
-                    "━━━━━━━━━━━━━━━━━━\n\n"
-                    f"🧾 <b>Order:</b> <code>#{result['order_id']}</code>\n"
-                    f"👤 <b>User:</b> <code>{_esc(masked_user)}</code>\n"
-                    f"📦 <b>Product:</b> {_esc(result['name'])}\n"
-                    f"🔢 <b>Quantity:</b> {result['quantity']}\n"
-                    f"💰 <b>Total:</b> ${result['total_price']:.2f}\n\n"
-                    f"{delivery_status}"
-                )
-                await callback.bot.send_message(
-                    chat_id=ORDER_NOTIFICATION_CHANNEL_ID,
-                    text=group_msg,
-                    parse_mode="HTML",
-                )
-            except Exception:
-                logger.exception("Failed to send order notification")
 
         is_free = float(result.get("total_price", 0)) == 0
         delivery_instruction = result.get("delivery_instruction")
@@ -3016,17 +3068,6 @@ async def confirm_buy(callback: CallbackQuery, state: FSMContext):
                     f"{accounts_text}\n\nTrack the remaining delivery in My Orders.")
         await show(callback, text, parse_mode="HTML", reply_markup=reply_markup)
 
-        if result.get("low_stock_alert"):
-            task = asyncio.create_task(_notify_admins_low_stock(callback.bot, result["low_stock_alert"]))
-            task.add_done_callback(_log_stock_notification_task)
-        task = asyncio.create_task(_notify_stock_purchase(callback.bot, telegram_id, result))
-        task.add_done_callback(_log_stock_notification_task)
-        asyncio.create_task(_refresh_and_scan_product(callback.bot, product_id))
-
-        commission = result.get("referral_commission_paid")
-        if commission:
-            task = asyncio.create_task(_notify_referral_commission(callback.bot, commission))
-            task.add_done_callback(_log_stock_notification_task)
 
 
 # ╔══════════════════════════════════════════════════════════════╗

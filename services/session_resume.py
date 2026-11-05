@@ -29,7 +29,7 @@ def make_snapshot(state, data, navigation=None):
     navigation = navigation if navigation and SAFE_NAV.fullmatch(navigation) else None
     if not state and not navigation:
         return None
-    clean = {k: v for k, v in data.items() if k in SAFE_KEYS or re.fullmatch(r'qty_\d+', k)}
+    clean = {k: v for k, v in data.items() if k in SAFE_KEYS or re.fullmatch(r'(?:qty|checkout_token)_\d+', k)}
     return json.loads(json.dumps({'state': state, 'data': clean, 'navigation': navigation}, default=str))
 
 

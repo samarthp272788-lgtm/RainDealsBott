@@ -90,19 +90,17 @@ class CatalogRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.ns['_load_stock_refresh_providers'].side_effect = lambda: self.assertNotEqual(threading.get_ident(), main_thread) or []
         await self.ns['_refresh_reseller_stock_cache_if_needed']()
 
-    async def test_unreachable_notification_chat_backs_off_without_blocking_others(self):
-        namespace = dict(asyncio=asyncio, time=time, logger=Mock(spec=logging.Logger),
-                         _stock_destination_retry_at={}, _stock_bot_username=None)
+    async def test_stock_notifications_queue_without_waiting_for_telegram(self):
+        queued = Mock()
+        namespace = dict(asyncio=asyncio, logger=Mock(spec=logging.Logger),
+                         enqueue_once=queued, _stock_bot_username=None)
         load_functions({'_deliver_stock_channel_message'}, namespace)
-        async def send(target, *_args, **_kwargs):
-            if target == 'missing':
-                raise RuntimeError('Bad Request: chat not found')
-        bot = SimpleNamespace(send_message=AsyncMock(side_effect=send))
-        for _ in range(2):
-            await namespace['_deliver_stock_channel_message'](bot, 'stock', ['missing', 'valid'], None, False)
-        targets = [call.args[0] for call in bot.send_message.call_args_list]
-        self.assertEqual(targets.count('missing'), 1)
-        self.assertEqual(targets.count('valid'), 2)
+        bot = SimpleNamespace(id=12345, send_message=AsyncMock())
+        await namespace['_deliver_stock_channel_message'](bot, 'stock', ['first', 'second'], None, False)
+        self.assertEqual(queued.call_count, 2)
+        self.assertEqual(queued.call_args_list[0].args[0], queued.call_args_list[1].args[0])
+        self.assertEqual([c.args[1] for c in queued.call_args_list], ['first', 'second'])
+        bot.send_message.assert_not_awaited()
 
     def test_only_purchase_can_wait_for_supplier_stock(self):
         waiters = []

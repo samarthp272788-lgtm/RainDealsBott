@@ -34,6 +34,7 @@ from html.parser import HTMLParser
 
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, Message
+from services.screen_controller import managed_screen, locations
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,7 @@ _CARD_MESSAGE_ID_KEY = "_card_message_id"
 # Lightweight fallback for handlers that don't receive an FSMContext.
 # FSM data is still preferred when supplied; the cache prevents ordinary
 # menus and text prompts from stacking bubbles during the process lifetime.
-_CARD_LOCATIONS: OrderedDict[tuple[int, int], tuple[int, int]] = OrderedDict()
+_CARD_LOCATIONS = locations
 _CARD_CACHE_LIMIT = 10_000
 _CARD_DELETE_TASKS: dict[tuple[int, int], asyncio.Task] = {}
 _CARD_TRANSITION_TASKS: dict[tuple[int, int], asyncio.Task] = {}
@@ -69,10 +70,16 @@ def _forget_card(user_id: int, chat_id: int) -> None:
     _CARD_LOCATIONS.pop((int(user_id), int(chat_id)), None)
 
 
+def track_card(user_id: int, chat_id: int, message_id: int) -> None:
+    """Register a custom media card so Home/restart can replace it too."""
+    _remember_card(user_id, chat_id, message_id)
+
+
 def get_card_location(user_id: int, chat_id: int):
     return _CARD_LOCATIONS.get((int(user_id), int(chat_id)))
 
 
+@managed_screen
 async def begin_resumed_card(message: Message, state, previous_data: dict):
     """Wipe only the tracked conversation card/input, then start one new card."""
     user_id, chat_id = message.from_user.id, message.chat.id
@@ -108,6 +115,7 @@ async def begin_resumed_card(message: Message, state, previous_data: dict):
     return card
 
 
+@managed_screen
 async def finish_resumed_card(message: Message, state, placeholder: Message):
     """QR rendering can replace the placeholder; remove the unused one."""
     data = await state.get_data()
@@ -357,6 +365,7 @@ def _caption_kwargs(kwargs):
     return caption_kwargs
 
 
+@managed_screen
 async def show(
     callback: CallbackQuery,
     text: str,
@@ -444,6 +453,7 @@ async def show(
     return msg
 
 
+@managed_screen
 async def update_card(
     message: Message,
     state=None,
@@ -524,12 +534,13 @@ async def update_card(
 
     if force_new_card:
         msg = await message.answer(text, **_kwargs(reply_markup, parse_mode, extra))
+        if card_owner_id:
+            _remember_card(card_owner_id, msg.chat.id, msg.message_id)
         if state is not None:
             await state.update_data(
                 **{_CARD_CHAT_ID_KEY: msg.chat.id, _CARD_MESSAGE_ID_KEY: msg.message_id}
             )
         if card_owner_id:
-            _remember_card(card_owner_id, msg.chat.id, msg.message_id)
             schedule_success_notice(msg, text, owner_id=card_owner_id)
         return msg
 
@@ -539,12 +550,13 @@ async def update_card(
         except Exception:
             pass
         msg = await message.answer(text, **_kwargs(reply_markup, parse_mode, extra))
+        if card_owner_id:
+            _remember_card(card_owner_id, msg.chat.id, msg.message_id)
         if state is not None:
             await state.update_data(
                 **{_CARD_CHAT_ID_KEY: msg.chat.id, _CARD_MESSAGE_ID_KEY: msg.message_id}
             )
         if card_owner_id:
-            _remember_card(card_owner_id, msg.chat.id, msg.message_id)
             schedule_success_notice(msg, text, owner_id=card_owner_id)
         return msg
 
@@ -592,22 +604,24 @@ async def update_card(
                     msg = None
         if msg is not None:
             _cancel_scheduled_card_delete(msg.chat.id, msg.message_id)
+            if card_owner_id:
+                _remember_card(card_owner_id, msg.chat.id, msg.message_id)
             if state is not None:
                 await state.update_data(
                     **{_CARD_CHAT_ID_KEY: msg.chat.id, _CARD_MESSAGE_ID_KEY: msg.message_id}
                 )
             if card_owner_id:
-                _remember_card(card_owner_id, msg.chat.id, msg.message_id)
                 schedule_success_notice(msg, text, owner_id=card_owner_id)
             return msg
 
     msg = await message.answer(text, **kwargs)
+    if card_owner_id:
+        _remember_card(card_owner_id, msg.chat.id, msg.message_id)
     if state is not None:
         await state.update_data(
             **{_CARD_CHAT_ID_KEY: msg.chat.id, _CARD_MESSAGE_ID_KEY: msg.message_id}
         )
     if card_owner_id:
-        _remember_card(card_owner_id, msg.chat.id, msg.message_id)
         schedule_success_notice(msg, text, owner_id=card_owner_id)
     return msg
 

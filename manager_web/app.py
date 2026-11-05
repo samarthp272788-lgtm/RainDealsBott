@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from services.warranty import start_coverage
+
 import asyncio
 import hashlib
 import hmac
@@ -45,7 +47,7 @@ from services.maintenance_mode import set_maintenance_enabled
 from services.manager_auth import (
     cancel_login_challenge, clear_login_failures, create_login_challenge, ensure_auth_state,
     issue_session_by_code, login_is_limited, record_login_failure,
-    revoke_session, session_status,
+    revoke_session, session_status, session_owner,
 )
 
 
@@ -1405,12 +1407,16 @@ a{{color:#32654a;text-decoration:none}}a:hover{{color:#17251c}}.wrap{{width:min(
     return HTMLResponse(html)
 
 
-def _complete_order(order_id: int, delivery_text: str, customer_telegram_id: int | None) -> None:
+def _complete_order(order_id: int, delivery_text: str, customer_telegram_id: int | None, admin_id: int) -> None:
+    if admin_id is None:
+        raise ValueError('A verified manager identity is required.')
     db = SessionLocal()
     try:
         order = db.query(Order).filter(Order.id == order_id).with_for_update().first()
         if not order:
             raise ValueError("Order not found.")
+        if order.assigned_admin_id not in (None, admin_id):
+            raise ValueError('This order is assigned to another admin. Reassign it in the bot fulfillment queue first.')
         deliverable = order.status in ("pending_manual", "preorder") or (
             order.status == "processing" and order.delivery_type in ("manual", "hybrid")
         )
@@ -1443,9 +1449,16 @@ def _complete_order(order_id: int, delivery_text: str, customer_telegram_id: int
                         if REFERRAL_CREDIT_TO_BALANCE:
                             referrer.balance = _money(referrer.balance) + commission
 
+        from services.order_workflow import record_event
+        if order.assigned_admin_id is None:
+            record_event(db, order.id, 'fulfillment_team', 'Assigned to the fulfillment team.')
+        order.assigned_admin_id = admin_id
+        order.assigned_at = order.assigned_at or _now_naive_utc()
+        record_event(db, order.id, 'completed', 'Team delivery completed.', actor_id=admin_id)
         order.delivered_account = "\n".join(filter(None, [order.delivered_account, delivery_text]))
         order.manual_pending_quantity = 0
         order.status = "completed"
+        start_coverage(order)
         order.is_preorder = False
         db.add(ManagerDeliveryOutbox(
             order_id=order.id,
@@ -1486,7 +1499,10 @@ async def deliver_order(request: Request, order_id: int):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Customer Telegram ID must be a positive integer.") from exc
     try:
-        await asyncio.to_thread(_complete_order, order_id, delivery_text, customer_id)
+        admin_id = await asyncio.to_thread(session_owner, request.session.get('auth_token', ''), _client_ip(request))
+        if admin_id is None:
+            raise HTTPException(status_code=401, detail='Manager session expired.')
+        await asyncio.to_thread(_complete_order, order_id, delivery_text, customer_id, admin_id)
     except ValueError as exc:
         return RedirectResponse(f"/?status=pending&error={quote(str(exc))}", status_code=303)
     return RedirectResponse("/?status=completed&notice=delivered", status_code=303)

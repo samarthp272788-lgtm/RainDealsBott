@@ -103,6 +103,8 @@ engine = create_engine(
     pool_reset_on_return="rollback",
 
     echo=False,
+    # Exception logs must not include bound account details or notification bodies.
+    hide_parameters=True,
 
     # TiDB Cloud requires TLS.
     connect_args={
@@ -116,6 +118,10 @@ engine = create_engine(
 # ---------------------------------------------------------------------------
 # TiDB SESSION OPTIONS
 # ---------------------------------------------------------------------------
+
+from services.performance import install_database_observers
+install_database_observers(engine)
+
 
 @event.listens_for(engine, "connect")
 def _set_tidb_session_options(

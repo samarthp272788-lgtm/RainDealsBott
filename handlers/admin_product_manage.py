@@ -535,6 +535,7 @@ ${float(product.price or 0):.2f}
                     callback_data=f"edit_category_{product.id}"
                 )
             ],
+            [InlineKeyboardButton(text=f"🛡 Warranty: {getattr(product, 'warranty_days', 0)} days", callback_data=f"warranty_config_{product.id}")],
             [InlineKeyboardButton(
                 text="🧾 Edit Buyer Information",
                 callback_data=f"edit_required_info_{product.id}"

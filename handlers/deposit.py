@@ -1,3 +1,7 @@
+from services.screen_controller import managed_screen
+from services.payment_submissions import bind_reference
+from services.notification_outbox import queue_message
+from services.input_forms import is_cancel
 # handlers/deposit.py
 
 import re
@@ -20,7 +24,7 @@ from aiogram.types import (
     FSInputFile,
 )
 from aiogram.fsm.context import FSMContext
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy import desc
 
 from states.deposit_states import DepositState
@@ -33,6 +37,7 @@ from keyboards.deposit import get_deposit_menu
 import config
 from config import BEP20_ADDRESS, POLYGON_ADDRESS, BINANCE_PAY_ID
 from utils.ui import (
+    track_card,
     show,
     update_card,
     answer_card,
@@ -561,7 +566,7 @@ def _check_promo_used(telegram_id: int, code: str) -> bool:
             db.query(Deposit)
             .filter(
                 Deposit.telegram_id == telegram_id,
-                Deposit.tx_hash == f"PROMO_{code.upper()}",
+                Deposit.tx_hash.in_((f"PROMO_{code.upper()}", f"PROMO_{code.upper()}_{telegram_id}")),
                 Deposit.status == "completed",
             )
             .first()
@@ -572,67 +577,13 @@ def _check_promo_used(telegram_id: int, code: str) -> bool:
 
 
 def _apply_promo_to_user(telegram_id: int, promo_code: str, promo_amount: Decimal):
-    """Apply promocode: credit balance, increment usage, create deposit record."""
-    db = SessionLocal()
+    from services.promotions import redeem
     try:
-        user = (
-            db.query(User)
-            .filter(User.telegram_id == telegram_id)
-            .first()
-        )
+        return redeem(telegram_id, promo_code)
+    except Exception:
+        logger.exception('Promocode redemption could not be completed')
+        return False, 'Could not redeem the promocode. Check your wallet before retrying.'
 
-        if not user:
-            return False, "❌ User not found.\nPlease use /start first."
-
-        promo = (
-            db.query(PromoCode)
-            .filter(PromoCode.code == promo_code.upper())
-            .first()
-        )
-
-        if not promo:
-            return False, "❌ Promocode no longer available."
-
-        user.balance += promo_amount
-        promo.used_count += 1
-
-        deposit = Deposit(
-            telegram_id=telegram_id,
-            amount=float(promo_amount),
-            tx_hash=f"PROMO_{promo_code.upper()}",
-            network="PROMO",
-            status="completed",
-        )
-
-        db.add(deposit)
-        db.commit()
-        db.refresh(user)
-
-        logger.info(
-            "Promo redeemed | Code=%s | Amount=%s | User=%s",
-            promo_code.upper(),
-            promo_amount,
-            telegram_id,
-        )
-
-        return True, {
-            "code": promo_code.upper(),
-            "amount": promo_amount,
-            "balance": user.balance,
-        }
-
-    except Exception as e:
-        db.rollback()
-        logger.exception("Promo redeem error")
-        return False, "❌ An unexpected error occurred while applying promocode."
-
-    finally:
-        db.close()
-
-
-# ╔══════════════════════════════════════════════════════════════╗
-# ║              DEPOSIT MENU (ENTRY POINT)                     ║
-# ╚══════════════════════════════════════════════════════════════╝
 
 @router.callback_query(F.data == "deposit_start")
 async def deposit_menu(callback: CallbackQuery, state: FSMContext):
@@ -730,7 +681,7 @@ async def process_promo_code(message: Message, state: FSMContext):
     """Process promocode from direct redemption flow."""
     text = (message.text or "").strip().upper()
 
-    if text == "CANCEL":
+    if is_cancel(message.text):
         await update_card(
             message, state,
             "❌ <b>Promocode Redemption Cancelled</b>",
@@ -754,7 +705,7 @@ async def process_promo_code(message: Message, state: FSMContext):
         )
         return
 
-    is_valid, promo_data = _validate_and_get_promo(text)
+    is_valid, promo_data = await asyncio.to_thread(_validate_and_get_promo, text)
 
     if not is_valid:
         await update_card(
@@ -766,7 +717,7 @@ async def process_promo_code(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    if _check_promo_used(message.from_user.id, text):
+    if await asyncio.to_thread(_check_promo_used, message.from_user.id, text):
         await update_card(
             message, state,
             (
@@ -782,7 +733,7 @@ async def process_promo_code(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    success, result = _apply_promo_to_user(
+    success, result = await asyncio.to_thread(_apply_promo_to_user,
         message.from_user.id, text, promo_data["promo_amount"]
     )
 
@@ -825,7 +776,7 @@ async def process_promo_code(message: Message, state: FSMContext):
                 "<code>━━━━━━━━━━━━━━━━━━━━━━</code>\n"
                 "<code>Wallet synchronized.</code>"
             )
-            await message.bot.send_message(
+            await queue_message(message.bot, f"promo:{message.from_user.id}:{result['code']}",
                 chat_id=config.GROUP_ID,
                 text=group_msg,
                 parse_mode="HTML",
@@ -1372,6 +1323,7 @@ def _invoice_payload(network: str, data: dict) -> tuple[str, str | None]:
     return body, qr
 
 
+@managed_screen
 async def _show_invoice(target, state: FSMContext, deposit_id: int, network: str, data: dict):
     body, qr = _invoice_payload(network, data)
     bot = target.bot
@@ -1420,6 +1372,7 @@ async def _show_invoice(target, state: FSMContext, deposit_id: int, network: str
             invoice_message = await target.answer(
                 body, parse_mode="HTML", reply_markup=_invoice_keyboard()
             )
+    track_card(target.from_user.id, invoice_message.chat.id, invoice_message.message_id)
     await state.update_data(
         _card_chat_id=invoice_message.chat.id,
         _card_message_id=invoice_message.message_id,
@@ -1437,36 +1390,6 @@ async def _show_invoice(target, state: FSMContext, deposit_id: int, network: str
 # ╔══════════════════════════════════════════════════════════════╗
 # ║           TXID / UTR / ORDER ID PROCESSING                  ║
 # ╚══════════════════════════════════════════════════════════════╝
-
-def _check_duplicate(txid: str) -> bool:
-    db = SessionLocal()
-    try:
-        return db.query(Deposit).filter(Deposit.tx_hash == txid).first() is not None
-    finally:
-        db.close()
-
-
-def _save_txid(deposit_id: int, txid: str) -> str:
-    db = SessionLocal()
-    try:
-        deposit = db.query(Deposit).filter(Deposit.id == deposit_id).first()
-        if not deposit:
-            return "not_found"
-        if deposit.invoice_expires_at and deposit.invoice_expires_at <= datetime.utcnow():
-            deposit.status = "expired"
-            db.commit()
-            return "expired"
-        deposit.tx_hash = txid
-        deposit.verification_started_at = datetime.utcnow()
-        try:
-            db.commit()
-        except IntegrityError:
-            db.rollback()
-            return "duplicate"
-        return "ok"
-    finally:
-        db.close()
-
 
 def _set_pending_if_waiting(deposit_id: int) -> None:
     db = SessionLocal()
@@ -1566,21 +1489,25 @@ async def process_txid(message: Message, state: FSMContext):
             )
             return
 
-    if await asyncio.to_thread(_check_duplicate, txid):
-        await update_card(
-            message, state,
-            (
-                f"⚠️ <b>Duplicate Detected</b>\n\n"
-                f"{_divider('─', 24)}\n\n"
-                f"❌ This reference has already been used.\n\n"
-                f"If you believe this is an error, contact support."
-            ),
-            parse_mode="HTML",
-            reply_markup=_cancel_kb(),
-        )
+    try:
+        result = await asyncio.to_thread(bind_reference, deposit_id, txid, message.from_user.id, network)
+    except SQLAlchemyError:
+        logger.warning('Payment reference storage unavailable; retry using the same reference')
+        await update_card(message, state, 'Could not confirm that your reference was saved. Retry the same reference; avoid creating another invoice.',
+                          reply_markup=_verification_pending_keyboard())
         return
 
-    result = await asyncio.to_thread(_save_txid, deposit_id, txid)
+    if result in ('already_submitted', 'reference_locked', 'completed', 'closed'):
+        await state.clear()
+        notices = {
+            'completed': '✅ This deposit is already verified. Open your wallet to see the balance.',
+            'closed': 'This invoice is closed. Open My Deposits to review it.',
+            'already_submitted': '⏳ Your reference is already saved. Automatic verification continues; no need to submit it again.',
+            'reference_locked': 'This invoice already has a reference. Open My Deposits before submitting another payment.',
+        }
+        await update_card(message, None, notices[result], chat_id=card_chat_id, message_id=card_message_id,
+                          reply_markup=_verification_pending_keyboard())
+        return
 
     if result == "not_found":
         await update_card(
@@ -1697,7 +1624,7 @@ async def process_txid(message: Message, state: FSMContext):
                     "<code>━━━━━━━━━━━━━━━━━━━━━━</code>\n"
                     "<code>Wallet synchronized.</code>"
                 )
-                await message.bot.send_message(
+                await queue_message(message.bot, f"deposit-completed:{deposit_id}",
                     chat_id=config.GROUP_ID,
                     text=group_msg,
                     parse_mode="HTML",

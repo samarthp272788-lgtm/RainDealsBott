@@ -1,3 +1,6 @@
+from services.warranty import start_coverage
+from services.order_workflow import record_event
+from services.notification_outbox import enqueue
 import hashlib
 import hmac
 import json
@@ -82,6 +85,8 @@ async def process_upstream_callback(raw_body: bytes, headers, bot) -> dict:
             if delivery:
                 order.delivered_account = str(delivery)
                 order.status = "completed"
+                start_coverage(order)
+                record_event(session, order.id, "completed", "Supplier delivery completed.")
                 notification = (order.telegram_id, order.product_name, str(delivery), "delivered")
         elif status == "canceled":
             if not order.refunded:
@@ -92,20 +97,13 @@ async def process_upstream_callback(raw_body: bytes, headers, bot) -> dict:
                     user.total_spent = max(0, user.total_spent - order.amount)
                 order.refunded = True
             order.status = "refunded"
+            record_event(session, order.id, "refunded", "Supplier cancellation refunded to wallet.")
             notification = (order.telegram_id, order.product_name, "", "canceled")
         else:
             order.status = "processing"
 
-        session.commit()
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
-
-    if notification:
-        telegram_id, product_name, delivery, outcome = notification
-        try:
+        if notification:
+            telegram_id, product_name, delivery, outcome = notification
             if outcome == "delivered":
                 message = (
                     f"✅ <b>Order delivered</b>\n\n"
@@ -120,8 +118,13 @@ async def process_upstream_callback(raw_body: bytes, headers, bot) -> dict:
                     f"Order: <code>{escape(str(downstream_order_no))}</code>\n"
                     "The amount has been returned to your bot balance."
                 )
-            await bot.send_message(telegram_id, message, parse_mode="HTML")
-        except Exception:
-            pass
+            enqueue(session, f'upstream:{order.id}:{outcome}', telegram_id, message)
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
 
     return {"ok": True, "message": "received"}

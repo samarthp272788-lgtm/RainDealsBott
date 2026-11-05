@@ -16,6 +16,7 @@ from services.deposit_card_recovery import (
     recover_interrupted_deposit_cards,
 )
 from services.order_notifications import order_notification_loop
+from services.notification_outbox import notification_loop
 from services.product_api_access import ensure_product_api_access_schema
 from services.provider_schema import ensure_provider_schema
 from services.maintenance_mode import ensure_maintenance_schema
@@ -98,6 +99,7 @@ async def main():
 
     deposit_task = None
     deposit_card_task = None
+    notification_outbox_task = None
     order_notification_task = None
 
     # --------------------------------------------------------
@@ -123,6 +125,8 @@ async def main():
     logger.info(
         "Deposit checker started"
     )
+
+    notification_outbox_task = asyncio.create_task(notification_loop(bot), name="notification-outbox")
 
     order_notification_task = asyncio.create_task(
         order_notification_loop(bot)
@@ -169,6 +173,13 @@ async def main():
         )
 
     finally:
+
+        if notification_outbox_task:
+            notification_outbox_task.cancel()
+            try:
+                await notification_outbox_task
+            except asyncio.CancelledError:
+                pass
 
         if deposit_card_task and not deposit_card_task.done():
 

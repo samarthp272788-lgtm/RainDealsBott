@@ -7,6 +7,7 @@ from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.fsm.context import FSMContext
 from services.session_resume import load_resume, make_snapshot, save_resume
+from services.checkout_actions import confirmation_token
 from utils.ui import answer_card, begin_resumed_card, finish_resumed_card, get_card_location
 
 router = Router()
@@ -106,8 +107,9 @@ async def _restore_snapshot(message, state, snapshot):
             product, price = await asyncio.gather(asyncio.to_thread(_fetch_product, product_id),
                                                   asyncio.to_thread(_get_custom_price, key[0], product_id))
             if product and product.is_active and 0 < int(quantity) <= _get_max_qty(product):
+                token = await confirmation_token(state, product_id, reuse=True)
                 await answer_card(message, _qty_text(product, int(quantity), _real_stock(product) > 0, price), state=state,
-                                  parse_mode='HTML', reply_markup=_confirm_keyboard(product_id, float(product.price) == 0))
+                                  parse_mode='HTML', reply_markup=_confirm_keyboard(product_id, float(product.price) == 0, checkout_token=token))
             else:
                 await answer_card(message, 'Stock changed. Send a new quantity or /start for Home.', state=state)
         else:

@@ -393,14 +393,17 @@ async function route(request,env){
     const suppliedRecipient=String(b.customer_telegram_id||'').trim();
     if(suppliedRecipient&&!/^\d{1,20}$/.test(suppliedRecipient))error('Customer Telegram ID must be a positive numeric ID.');
     const orderColumns=await columnsFor(env,'orders');
-    const splitSelect=['automatic_quantity','manual_pending_quantity','stock_deducted_quantity'].filter(c=>orderColumns.includes(c)).map(c=>','+c).join('');
+    const splitSelect=['automatic_quantity','manual_pending_quantity','stock_deducted_quantity','assigned_admin_id'].filter(c=>orderColumns.includes(c)).map(c=>','+c).join('');
+    const timelineEnabled=(await rows(env,"SELECT 1 AS present FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='order_events' LIMIT 1")).length>0;
     const orderTimestamp=orderColumns.includes('updated_at')?',updated_at=UTC_TIMESTAMP()':'';
+    const warrantyUpdate=orderColumns.includes('warranty_days')&&orderColumns.includes('warranty_expires_at')?",warranty_expires_at=CASE WHEN warranty_days>0 AND warranty_expires_at IS NULL THEN DATE_ADD(UTC_TIMESTAMP(),INTERVAL warranty_days DAY) ELSE warranty_expires_at END":'';
     const completed=await tx(env,async t=>{
       const order=(await t.execute('SELECT id,telegram_id,product_id,product_name,amount,quantity,status,delivery_type,is_preorder,refunded,delivery_telegram_id,delivered_account'+splitSelect+' FROM orders WHERE id=? FOR UPDATE',[orderId])).rows?.[0];
       if(!order)error('Order not found.',404);
       const state=String(order.status||'').toLowerCase(),deliveryType=String(order.delivery_type||'').toLowerCase();
       const canFulfill=!Number(order.refunded)&&['manual','hybrid'].includes(deliveryType)&&(state==='preorder'||['pending_manual','processing'].includes(state));
       if(!canFulfill)error('This order is not waiting for manual fulfillment, or it has been refunded.',409);
+      if(order.assigned_admin_id&&String(order.assigned_admin_id)!==String(auth.admin_id))error('This order is assigned to another admin. Reassign it in the bot fulfillment queue first.',409);
       const apiOrder=Boolean((await t.execute('SELECT order_id FROM api_orders WHERE order_id=? LIMIT 1',[orderId])).rows?.length);
       let recipient=String(order.delivery_telegram_id||'');
       if(apiOrder){
@@ -448,7 +451,16 @@ async function route(request,env){
           preorderCommission={referrer_telegram_id:referrerId,amount:String(commission),credited_to_balance:creditToBalance};
         }
       }
-      await t.execute("UPDATE orders SET delivered_account=?,status='completed',is_preorder=0,delivery_telegram_id=?"+splitUpdate+orderTimestamp+' WHERE id=?',[deliveryText,recipient,orderId]);
+      const assignmentUpdate=orderColumns.includes('assigned_admin_id')?',assigned_admin_id=COALESCE(assigned_admin_id,?)':'';
+      const assignmentTime=orderColumns.includes('assigned_at')?',assigned_at=COALESCE(assigned_at,UTC_TIMESTAMP())':'';
+      const completionParams=[deliveryText,recipient];
+      if(assignmentUpdate)completionParams.push(auth.admin_id);
+      completionParams.push(orderId);
+      await t.execute("UPDATE orders SET delivered_account=?,status='completed',is_preorder=0,delivery_telegram_id=?"+splitUpdate+orderTimestamp+warrantyUpdate+assignmentUpdate+assignmentTime+' WHERE id=?',completionParams);
+      if(timelineEnabled){
+        if(!order.assigned_admin_id)await t.execute("INSERT INTO order_events (order_id,kind,summary,customer_visible,created_at) VALUES (?,'fulfillment_team','Assigned to the fulfillment team.',1,UTC_TIMESTAMP())",[orderId]);
+        await t.execute("INSERT INTO order_events (order_id,kind,actor_id,summary,customer_visible,created_at) VALUES (?,'completed',?,'Team delivery completed.',1,UTC_TIMESTAMP())",[orderId,auth.admin_id]);
+      }
       const sessionInfo=(await t.execute('SELECT created_at FROM raindeals_web_manager_sessions WHERE token_hash=?',[auth.token_hash])).rows?.[0];
       await t.execute('INSERT INTO raindeals_web_manager_audit (admin_id,action,target_type,target_id,details,created_at) VALUES (?,?,?,?,?,UTC_TIMESTAMP(6))',[auth.admin_id,'fulfill','order',String(orderId),JSON.stringify({mode,stock_used:stockUsed,recipient_id:recipient,preorder_commission:preorderCommission,session_started_at:sessionInfo?.created_at||null})]);
       return{recipient,stock_used:stockUsed,product_id:order.product_id,preorder_commission:preorderCommission};

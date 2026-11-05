@@ -10,7 +10,8 @@ from html import escape
 import config
 from sqlalchemy import text
 
-from database import SessionLocal, engine
+from database import SessionLocal, engine, transaction
+from services.notification_outbox import enqueue
 from models.order import Order
 
 
@@ -52,7 +53,7 @@ def _pending_orders(limit: int = 50) -> list[dict]:
     try:
         rows = (
             db.query(Order)
-            .filter(Order.admin_notification_sent_at.is_(None))
+            .filter(Order.admin_notification_sent_at.is_(None), Order.admin_notification_queued_at.is_(None))
             .order_by(Order.id.asc())
             .limit(limit)
             .all()
@@ -75,27 +76,14 @@ def _pending_orders(limit: int = 50) -> list[dict]:
         db.close()
 
 
-def _mark_sent(order_id: int) -> bool:
-    db = SessionLocal()
-    try:
-        order = (
-            db.query(Order)
-            .filter(
-                Order.id == order_id,
-                Order.admin_notification_sent_at.is_(None),
-            )
-            .first()
-        )
-        if not order:
-            return False
-        order.admin_notification_sent_at = datetime.utcnow()
-        db.commit()
-        return True
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
+def _queue_order(order, channel_id, bot_id):
+    with transaction() as db:
+        stored = db.query(Order).filter(Order.id == order['id']).with_for_update().first()
+        if not stored or stored.admin_notification_sent_at or stored.admin_notification_queued_at:
+            return
+        enqueue(db, f"admin-order:{order['id']}", channel_id, _format_order(order), bot_id,
+                source_order_id=order['id'])
+        stored.admin_notification_queued_at = datetime.utcnow()
 
 
 def _format_order(order: dict) -> str:
@@ -140,12 +128,7 @@ async def order_notification_loop(bot) -> None:
         try:
             orders = await asyncio.to_thread(_pending_orders)
             for order in orders:
-                await bot.send_message(
-                    channel_id,
-                    _format_order(order),
-                    parse_mode="HTML",
-                )
-                await asyncio.to_thread(_mark_sent, order["id"])
+                await asyncio.to_thread(_queue_order, order, channel_id, bot.id)
         except asyncio.CancelledError:
             raise
         except Exception:

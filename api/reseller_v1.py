@@ -62,6 +62,8 @@ from models.order import Order
 from models.product import Product
 from models.user import User
 
+from services.checkout_actions import api_checkout_key, recover_checkout
+
 from services.api_keys import (
     ApiKeyConfigurationError,
     authenticate_api_key,
@@ -1102,6 +1104,13 @@ async def create_order(
     # --------------------------------------------------------
 
     if not is_new:
+        if not request_row.order_id:
+            recovered = await asyncio.to_thread(recover_checkout,
+                api_checkout_key(principal.key_id, payload.client_order_id), principal.telegram_id)
+            if recovered:
+                await asyncio.to_thread(_set_api_order_result, request_row.id, recovered)
+                request_row.order_id = recovered
+
 
         if request_row.order_id:
 
@@ -1180,6 +1189,7 @@ async def create_order(
                 principal.telegram_id,
                 payload.service_id,
                 payload.quantity,
+                checkout_key=api_checkout_key(principal.key_id, payload.client_order_id),
             )
 
         else:
@@ -1190,6 +1200,7 @@ async def create_order(
                 payload.service_id,
                 payload.quantity,
                 payload.delivery_telegram_id,
+                api_checkout_key(principal.key_id, payload.client_order_id),
             )
 
     except Exception as exc:
@@ -1216,6 +1227,9 @@ async def create_order(
     # --------------------------------------------------------
     # Purchase returned error
     # --------------------------------------------------------
+
+    if result and result.get('duplicate_order_id'):
+        result['order_id'] = result['duplicate_order_id']
 
     if not result:
 

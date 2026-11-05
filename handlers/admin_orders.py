@@ -1,5 +1,9 @@
 
-from utils.ui import answer_card, schedule_success_notice
+from utils.ui import answer_card, schedule_success_notice, show
+from services.order_workflow import record_event
+from services.warranty import start_coverage
+from services.notification_outbox import enqueue, queue_message
+from datetime import datetime
 import asyncio
 import logging
 from html import escape
@@ -57,6 +61,26 @@ def is_admin(user_id: int) -> bool:
 # ADMIN ORDERS LIST
 # ==========================================================
 
+def _load_admin_orders(page):
+    with SessionLocal() as db:
+        query = db.query(Order).filter(Order.status != "deleted").order_by(Order.id.desc())
+        total = query.count()
+        pages = max(1, (total + ADMIN_ORDERS_PER_PAGE - 1) // ADMIN_ORDERS_PER_PAGE)
+        page = min(page, pages - 1)
+        orders = query.offset(page * ADMIN_ORDERS_PER_PAGE).limit(ADMIN_ORDERS_PER_PAGE).all()
+        return orders, total, pages, page
+
+
+def _load_admin_order(order_id):
+    with SessionLocal() as db:
+        order = db.get(Order, order_id)
+        if not order:
+            return None, None, {}
+        user = db.query(User).filter(User.telegram_id == order.telegram_id).first()
+        submission = db.query(OrderRequirementSubmission).filter_by(order_id=order_id).first()
+        return order, user, submission.values if submission else {}
+
+
 @router.callback_query(F.data == "admin_orders")
 @router.callback_query(F.data.startswith("admin_orders_page_"))
 async def admin_orders(callback: CallbackQuery):
@@ -70,110 +94,93 @@ async def admin_orders(callback: CallbackQuery):
     except ValueError:
         page = 0
 
-    db = SessionLocal()
-    try:
-        # Soft-deleted orders never show up in the admin list again —
-        # see delete_order() below, which sets status="deleted"
-        # instead of removing the row.
-        query = (
-            db.query(Order)
-            .filter(Order.status != "deleted")
-            .order_by(Order.id.desc())
-        )
-        total = query.count()
-        total_pages = max(1, (total + ADMIN_ORDERS_PER_PAGE - 1) // ADMIN_ORDERS_PER_PAGE)
-        page = min(page, total_pages - 1)
-        orders = query.offset(page * ADMIN_ORDERS_PER_PAGE).limit(ADMIN_ORDERS_PER_PAGE).all()
+    await callback.answer()
+    orders, total, total_pages, page = await asyncio.to_thread(_load_admin_orders, page)
 
-        if not orders:
-            await callback.message.edit_text(
-                "❌ No orders found.",
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [InlineKeyboardButton(text="⬅ Back", callback_data="admin_panel")]
-                    ]
-                )
+    if not orders:
+        await show(callback,
+            "❌ No orders found.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="📋 Fulfillment queue", callback_data="work_queue_all_0")],
+                    [InlineKeyboardButton(text="⬅ Back", callback_data="admin_panel")]
+                ]
             )
-            await callback.answer()
-            return
-
-        keyboard = []
-        for order in orders:
-            if order.refunded:
-                icon = "💸"
-            elif order.status == "completed":
-                icon = "✅"
-            elif order.status == "preorder":
-                icon = "📦"
-            else:
-                icon = "⏳"
-
-            keyboard.append([
-                InlineKeyboardButton(
-                    text=f"#{order.id} {icon} {order.product_name}",
-                    callback_data=f"order_{order.id}_{page}"
-                )
-            ])
-
-        navigation = []
-        if page > 0:
-            navigation.append(InlineKeyboardButton(text="⬅ Previous", callback_data=f"admin_orders_page_{page - 1}"))
-        if page < total_pages - 1:
-            navigation.append(InlineKeyboardButton(text="Next ➡", callback_data=f"admin_orders_page_{page + 1}"))
-        if navigation:
-            keyboard.append(navigation)
-        keyboard.append([InlineKeyboardButton(text="⬅ Back", callback_data="admin_panel")])
-
-        await callback.message.edit_text(
-            f"📦 Orders ({page + 1}/{total_pages}) — {total} total",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
         )
-        await callback.answer()
+        return
 
-    finally:
-        db.close()
+    keyboard = []
+    for order in orders:
+        if order.refunded:
+            icon = "💸"
+        elif order.status == "completed":
+            icon = "✅"
+        elif order.status == "preorder":
+            icon = "📦"
+        else:
+            icon = "⏳"
+
+        keyboard.append([
+            InlineKeyboardButton(
+                text=f"#{order.id} {icon} {order.product_name}",
+                callback_data=f"order_{order.id}_{page}"
+            )
+        ])
+
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton(text="⬅ Previous", callback_data=f"admin_orders_page_{page - 1}"))
+    if page < total_pages - 1:
+        navigation.append(InlineKeyboardButton(text="Next ➡", callback_data=f"admin_orders_page_{page + 1}"))
+    if navigation:
+        keyboard.append(navigation)
+    keyboard.append([InlineKeyboardButton(text="📋 Fulfillment queue", callback_data="work_queue_all_0")])
+    keyboard.append([InlineKeyboardButton(text="⬅ Back", callback_data="admin_panel")])
+
+    await show(callback,
+        f"📦 Orders ({page + 1}/{total_pages}) — {total} total",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+    )
+
 
 
 # ==========================================================
 # SINGLE ORDER
 # ==========================================================
 
-@router.callback_query(F.data.startswith("order_"))
+@router.callback_query(F.data.regexp(r"^order_\d+(?:_\d+)?$"))
 async def order_info(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
     parts = callback.data.split("_")
     order_id = int(parts[1])
     list_page = int(parts[2]) if len(parts) > 2 else 0
 
-    db = SessionLocal()
-    try:
-        order = db.query(Order).filter(Order.id == order_id).first()
+    await callback.answer()
+    order, user, submitted_values = await asyncio.to_thread(_load_admin_order, order_id)
+    if not order:
+        await show(callback, "Order not found.")
+        return
+    username = f"@{user.username}" if user and user.username else "Not set"
 
-        if not order:
-            await callback.answer("Order not found.")
-            return
+    delivered = order.delivered_account or "Not delivered yet"
+    status_label = STATUS_LABELS.get(order.status, order.status)
 
-        user = db.query(User).filter(User.telegram_id == order.telegram_id).first()
-        requirement_submission = db.query(OrderRequirementSubmission).filter_by(order_id=order.id).first()
-        submitted_values = requirement_submission.values if requirement_submission else {}
-        username = f"@{user.username}" if user and user.username else "Not set"
-
-        delivered = order.delivered_account or "Not delivered yet"
-        status_label = STATUS_LABELS.get(order.status, order.status)
-
-        text = f"""
+    text = f"""
 📦 Order #{order.id}
 
 👤 User ID:
 <code>{order.telegram_id}</code>
 
 🔎 Username:
-{username}
+{escape(username)}
 
 📦 Product:
-{order.product_name} x{order.quantity or 1}
+{escape(order.product_name or "Product")} x{order.quantity or 1}
 
 🔑 Delivered:
-<code>{delivered}</code>
+<code>{escape(delivered)}</code>
 
 💰 Amount:
 ${_money(order.amount):.2f}
@@ -188,60 +195,61 @@ Refunded:
 {"✅ YES" if order.refunded else "❌ NO"}
 """
 
-        photo_file_ids = []
-        if submitted_values:
-            text += "\n🧾 Buyer information:\n"
-            for label, item in submitted_values.items():
-                kind = item.get("kind") if isinstance(item, dict) else "text"
-                if kind == "photo":
-                    photo_file_ids.append((label, item.get("file_id")))
-                    value = "Photo attached (shown below)"
-                elif kind == "contact":
-                    value = f"{item.get('first_name', '')} · {item.get('phone', '')}"
-                elif isinstance(item, dict):
-                    value = item.get("value", "")
-                else:
-                    value = str(item)
-                text += f"• <b>{escape(str(label))}:</b> <code>{escape(str(value))}</code>\n"
+    photo_file_ids = []
+    if submitted_values:
+        text += "\n🧾 Buyer information:\n"
+        for label, item in submitted_values.items():
+            kind = item.get("kind") if isinstance(item, dict) else "text"
+            if kind == "photo":
+                photo_file_ids.append((label, item.get("file_id")))
+                value = "Photo attached (shown below)"
+            elif kind == "contact":
+                value = f"{item.get('first_name', '')} · {item.get('phone', '')}"
+            elif isinstance(item, dict):
+                value = item.get("value", "")
+            else:
+                value = str(item)
+            text += f"• <b>{escape(str(label))}:</b> <code>{escape(str(value))}</code>\n"
 
-        keyboard = []
+    text += f"\nTeam owner: {order.assigned_admin_id or 'Unassigned'}\nAutomatic: {order.automatic_quantity or 0} · Remaining: {order.manual_pending_quantity or 0}\n"
+    keyboard = [[InlineKeyboardButton(text="🕒 Timeline", callback_data=f"admin_timeline_{order.id}"),
+                 InlineKeyboardButton(text="📋 Team workspace", callback_data=f"work_view_{order.id}")]]
+    if order.warranty_days:
+        keyboard.append([InlineKeyboardButton(text='🛡 Warranty / replacement', callback_data=f'warranty_admin_{order.id}')])
 
-        needs_fulfillment = (
-            order.status in ("pending_manual", "preorder")
-            and not order.refunded
-        )
-        if needs_fulfillment:
-            keyboard.append([
-                InlineKeyboardButton(text="📤 Deliver", callback_data=f"deliver_order_{order.id}")
-            ])
+    needs_fulfillment = (
+        order.status in ("pending_manual", "preorder")
+        and not order.refunded
+    )
+    if needs_fulfillment:
+        keyboard.append([
+            InlineKeyboardButton(text="📤 Deliver", callback_data=f"deliver_order_{order.id}")
+        ])
 
-        if not order.refunded and order.status != "deleted":
-            keyboard.append([
-                InlineKeyboardButton(text="💸 Refund", callback_data=f"refund_{order.id}")
-            ])
+    if not order.refunded and order.status != "deleted":
+        keyboard.append([
+            InlineKeyboardButton(text="💸 Refund", callback_data=f"refund_{order.id}")
+        ])
 
-        if order.status != "deleted":
-            keyboard.append([
-                InlineKeyboardButton(text="🗑 Delete", callback_data=f"delete_order_{order.id}")
-            ])
+    if order.status != "deleted":
+        keyboard.append([
+            InlineKeyboardButton(text="🗑 Delete", callback_data=f"delete_order_{order.id}")
+        ])
 
-        keyboard.append([InlineKeyboardButton(
-            text="⬅ Back",
-            callback_data="admin_orders" if list_page == 0 else f"admin_orders_page_{list_page}",
-        )])
+    keyboard.append([InlineKeyboardButton(
+        text="⬅ Back",
+        callback_data="admin_orders" if list_page == 0 else f"admin_orders_page_{list_page}",
+    )])
 
-        await callback.message.edit_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
-        )
-        for label, file_id in photo_file_ids:
-            if file_id:
-                await callback.message.answer_photo(file_id, caption=f"Order #{order.id} · {escape(str(label))}")
-        await callback.answer()
+    await show(callback,
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+    )
+    for label, file_id in photo_file_ids:
+        if file_id:
+            await callback.message.answer_photo(file_id, caption=f"Order #{order.id} · {escape(str(label))}")
 
-    finally:
-        db.close()
 
 
 # ==========================================================
@@ -367,6 +375,9 @@ def _do_refund(order_id: int, admin_id: int) -> dict:
         # --- Refund the buyer -----------------------------------
         buyer.balance = _money(buyer.balance) + refund_amount
 
+        record_event(db, order.id, 'refunded', 'Order refunded to wallet.', actor_id=admin_id)
+        enqueue(db, f'refund:{order.id}', order.telegram_id,
+                f'💸 Your order #{order.id} was refunded.\n\nAmount returned to your balance: ${refund_amount:.2f}')
         order.refunded = True
         order.status = "refunded"
         db.add(AdminAuditLog(
@@ -416,15 +427,6 @@ async def refund_order(callback: CallbackQuery):
 
     await callback.answer("✅ Refunded")
 
-    try:
-        await callback.bot.send_message(
-            result["buyer_id"],
-            "💸 Your order was refunded.\n\n"
-            f"💰 Amount returned to your balance: ${result['amount']:.2f}"
-        )
-    except Exception:
-        logger.exception("Failed to notify buyer %s of refund", result["buyer_id"])
-
     callback.data = f"order_{order_id}"
     await order_info(callback)
 
@@ -452,6 +454,7 @@ async def delete_order(callback: CallbackQuery):
         # Soft delete: keep the row (audit trail, refund history,
         # referral-commission bookkeeping) but hide it from the admin
         # orders list and stop offering further actions on it.
+        record_event(db, order.id, "deleted", "Order archived by the team.", actor_id=callback.from_user.id, customer_visible=False)
         order.status = "deleted"
         db.add(AdminAuditLog(
             admin_telegram_id=int(callback.from_user.id), action="soft_delete_order",
@@ -464,7 +467,7 @@ async def delete_order(callback: CallbackQuery):
     finally:
         db.close()
 
-    deleted_notice = await callback.message.edit_text(
+    deleted_notice = await show(callback,
         "✅ Order deleted.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
@@ -563,11 +566,19 @@ def _do_deliver(order_id: int, delivered_text: str, admin_id: int) -> dict:
 
         if order.status not in {"pending_manual", "preorder", "processing"}:
             return {"error": "This order is not ready for manual delivery."}
+        if order.assigned_admin_id not in (None, admin_id):
+            return {"error": "This order belongs to another admin. Reassign it in the team workspace first."}
+        if not delivered_text or not delivered_text.strip():
+            return {"error": "Delivery content cannot be empty."}
+        order.assigned_admin_id = admin_id
+        order.assigned_at = order.assigned_at or datetime.utcnow()
+        record_event(db, order.id, "completed", "Team delivery completed.", actor_id=admin_id)
         was_preorder = order.is_preorder
 
         order.delivered_account = "\n".join(filter(None, [order.delivered_account, delivered_text]))
         order.manual_pending_quantity = 0
         order.status = "completed"
+        start_coverage(order)
         order.is_preorder = False
         db.add(AdminAuditLog(
             admin_telegram_id=int(admin_id), action="manual_deliver_order",
@@ -745,7 +756,7 @@ async def deliver_order_finish(message: Message, state: FSMContext):
             waiting = delivery_result.get("status") == "waiting_for_start"
             if waiting and not result["is_api_order"] and config.DELIVERY_BOT_USERNAME:
                 try:
-                    await message.bot.send_message(
+                    await queue_message(message.bot, f"delivery-start:{order_id}",
                         destination_id,
                         "📦 Your order is ready. Start the Delivery Bot to receive it here:\n"
                         f"https://t.me/{escape(config.DELIVERY_BOT_USERNAME)}?start=order_{order_id}",
@@ -766,7 +777,7 @@ async def deliver_order_finish(message: Message, state: FSMContext):
             )
         else:
             destination_id = result["buyer_id"]
-            await message.bot.send_message(
+            await queue_message(message.bot, f"manual-delivery:{order_id}",
                 destination_id,
                 order_text,
                 parse_mode="HTML",
