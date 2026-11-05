@@ -444,6 +444,16 @@ class ResellerManager:
 
         except ResellerAPIError:
             raise
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Reseller request timed out | provider_id=%s | timeout_seconds=%s | feature=%s",
+                self.provider_id, self.timeout.total, feature_name,
+            )
+            raise ResellerAPIError(
+                message="Provider request timed out. Please try again later.",
+                status_code=504,
+                provider_id=self.provider_id,
+            ) from None
         except aiohttp.ClientError as e:
             logger.error("Reseller Network Client Error | provider_id=%s | error=%s", self.provider_id, str(e))
             raise ResellerAPIError(

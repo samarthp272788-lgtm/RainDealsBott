@@ -81,7 +81,9 @@ ORDER_NOTIFICATION_CHANNEL_ID = getattr(config, "ORDER_NOTIFICATION_CHANNEL_ID",
 _reseller_stock_cache: dict[str, int] = {}
 _reseller_stock_cache_time: float = 0.0
 _reseller_cache_lock = asyncio.Lock()
-RESELLER_CACHE_TTL = 30  # 30s TTL to strictly respect rate limits
+_reseller_refresh_task: asyncio.Task | None = None
+RESELLER_CACHE_TTL = 30  # Includes empty/failed refreshes, preventing retry storms.
+RESELLER_STOCK_TIMEOUT_SECONDS = 6
 
 # Per-user per-provider in-flight import locks
 _reseller_import_locks: set[tuple[int, str]] = set()
@@ -205,83 +207,91 @@ async def _call_reseller_place_order(manager, service_id: str, quantity: int, ex
     return res
 
 
-async def _refresh_reseller_stock_cache_if_needed():
-    """
-    Fetch live product stock across ALL active providers and update cache.
-    Refreshes at most once every 30 seconds across all users.
-    """
-    global _reseller_stock_cache_time, _reseller_stock_cache
+def _load_stock_refresh_providers():
+    """Run synchronous provider/config lookups outside the Telegram event loop."""
+    db = SessionLocal()
+    try:
+        from handlers.admin_products import _get_all_active_providers
+        providers = _get_all_active_providers(db)
+    finally:
+        db.close()
+    if not providers:
+        creds = _get_reseller_credentials()
+        if creds.get("api_key") and creds.get("base_url"):
+            providers = [creds]
+    return providers
 
+
+async def _refresh_reseller_stock_cache_if_needed():
+    """Bounded shared refresh; browsing schedules this without waiting for it."""
+    global _reseller_stock_cache_time
     if not ResellerManager:
         return _reseller_stock_cache
-
     async with _reseller_cache_lock:
-        now = asyncio.get_event_loop().time()
-        if _reseller_stock_cache and (now - _reseller_stock_cache_time) < RESELLER_CACHE_TTL:
+        loop = asyncio.get_running_loop()
+        if _reseller_stock_cache_time and loop.time() - _reseller_stock_cache_time < RESELLER_CACHE_TTL:
             return _reseller_stock_cache
-
-        db = SessionLocal()
         try:
-            from handlers.admin_products import _get_all_active_providers
-            providers = _get_all_active_providers(db)
-        except Exception:
-            providers = []
-        finally:
-            db.close()
+            providers = await asyncio.to_thread(_load_stock_refresh_providers)
+            semaphore = asyncio.Semaphore(4)
 
-        if not providers:
-            creds = _get_reseller_credentials()
-            if creds.get("api_key") and creds.get("base_url"):
-                providers = [creds]
-
-        new_cache = {}
-        for prov in providers:
-            api_key = prov.get("api_key")
-            base_url = prov.get("base_url")
-            if not api_key or not base_url:
-                continue
-
-            try:
-                manager = ResellerManager(api_key=api_key, base_url=base_url, provider_config=prov)
-                reseller_data = await _call_reseller_get_products(manager)
-
-                services = []
-                if isinstance(reseller_data, list):
-                    services = reseller_data
-                elif isinstance(reseller_data, dict):
-                    services = (
-                            reseller_data.get("services", [])
-                            or reseller_data.get("products", [])
-                            or reseller_data.get("data", [])
-                    )
-
-                for s in services:
-                    if isinstance(s, dict):
-                        sid = str(
-                            s.get("service_id")
-                            or s.get("provider_product_id")
-                            or s.get("id", "")
-                        ).strip()
-
-                        raw_stk = s.get("stock")
-                        if raw_stk is not None:
+            async def refresh_provider(prov):
+                if not prov.get("api_key") or not prov.get("base_url"):
+                    return
+                async with semaphore:
+                    try:
+                        manager = ResellerManager(
+                            api_key=prov["api_key"], base_url=prov["base_url"],
+                            provider_config=prov, timeout=RESELLER_STOCK_TIMEOUT_SECONDS,
+                        )
+                        reseller_data = await asyncio.wait_for(
+                            _call_reseller_get_products(manager),
+                            timeout=RESELLER_STOCK_TIMEOUT_SECONDS + 1,
+                        )
+                        services = []
+                        if isinstance(reseller_data, list):
+                            services = reseller_data
+                        elif isinstance(reseller_data, dict):
+                            services = (reseller_data.get("services") or reseller_data.get("products")
+                                        or reseller_data.get("data") or [])
+                        for item in services:
+                            if not isinstance(item, dict):
+                                continue
+                            sid = str(item.get("service_id") or item.get("provider_product_id") or item.get("id", "")).strip()
                             try:
-                                stk = int(raw_stk)
+                                stock = int(item["stock"]) if item.get("stock") is not None else 999999
                             except (ValueError, TypeError):
-                                stk = 999999
-                        else:
-                            stk = 999999
+                                stock = 999999
+                            if sid:
+                                _reseller_stock_cache[sid] = stock
+                    except Exception as exc:
+                        logger.warning(
+                            "Supplier stock refresh failed provider_id=%s name=%s error_type=%s; "
+                            "keeping previous/database stock and retrying after %ss",
+                            prov.get("id") or prov.get("provider_id"), prov.get("name", "Reseller"),
+                            type(exc).__name__, RESELLER_CACHE_TTL,
+                        )
 
-                        if sid:
-                            new_cache[sid] = stk
-            except Exception as e:
-                logger.warning("Error refreshing reseller stock for provider %s: %s", prov.get("name", "Reseller"), e)
-
-        if new_cache:
-            _reseller_stock_cache.update(new_cache)
-        _reseller_stock_cache_time = now
-
+            await asyncio.gather(*(refresh_provider(prov) for prov in providers))
+        except Exception:
+            logger.exception("Could not refresh supplier stock; keeping previous/database stock")
+        finally:
+            # Timestamp completion, including empty data and failures. A 6s timeout
+            # must not immediately trigger a second request for waiting callbacks.
+            _reseller_stock_cache_time = loop.time()
         return _reseller_stock_cache
+
+
+def _schedule_reseller_stock_refresh():
+    """Keep a single refresh task, with no queue of browsing callbacks."""
+    global _reseller_refresh_task
+    if not ResellerManager:
+        return
+    loop = asyncio.get_running_loop()
+    if _reseller_stock_cache_time and loop.time() - _reseller_stock_cache_time < RESELLER_CACHE_TTL:
+        return
+    if _reseller_refresh_task is None or _reseller_refresh_task.done():
+        _reseller_refresh_task = asyncio.create_task(_refresh_reseller_stock_cache_if_needed())
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -979,8 +989,15 @@ async def _send_stock_channel_message(bot, text: str, product_id: int | None = N
     task.add_done_callback(_log_stock_notification_task)
 
 
+_stock_destination_retry_at: dict[str, float] = {}
+
+
 async def _deliver_stock_channel_message(bot, text: str, destinations: list, product_id: int | None, can_buy: bool):
     global _stock_bot_username
+    now = time.monotonic()
+    destinations = [target for target in destinations if now >= _stock_destination_retry_at.get(str(target), 0)]
+    if not destinations:
+        return
     markup = None
     if product_id is not None and can_buy:
         try:
@@ -1008,7 +1025,16 @@ async def _deliver_stock_channel_message(bot, text: str, destinations: list, pro
     )
     for target, result in zip(destinations, results):
         if isinstance(result, Exception):
-            logger.error("Failed to send stock notification to %s: %s", target, result)
+            if any(reason in str(result).lower() for reason in ("chat not found", "bot was kicked", "not enough rights", "bot is not a member")):
+                _stock_destination_retry_at[str(target)] = time.monotonic() + 300
+                logger.warning(
+                    "Stock notification destination %s is unavailable; check STOCK_GROUP_ID/GROUP_ID "
+                    "and bot membership/posting rights. Retrying in 5 minutes. Error: %s", target, result,
+                )
+            else:
+                logger.error("Failed to send stock notification to %s: %s", target, result)
+        else:
+            _stock_destination_retry_at.pop(str(target), None)
 
 
 def _log_stock_notification_task(task: asyncio.Task):
@@ -1113,7 +1139,7 @@ async def notify_new_product(bot, product):
 async def freebies_menu(callback: CallbackQuery):
     await callback.answer()
 
-    await _refresh_reseller_stock_cache_if_needed()
+    _schedule_reseller_stock_refresh()
     products = await asyncio.to_thread(_fetch_free_products)
 
     if not products:
@@ -1292,6 +1318,7 @@ async def products_all(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("products_cat_"))
 async def products_category(callback: CallbackQuery):
+    started = time.perf_counter()
     await callback.answer()
     try:
         representative_id = int(callback.data.removeprefix("products_cat_"))
@@ -1304,6 +1331,8 @@ async def products_category(callback: CallbackQuery):
         await _show_product_categories(callback, products)
         return
     await _show_products_catalog(callback, products, category=_category_key(representative))
+    logger.info("button_timing button=category user_id=%s total_ms=%.1f",
+                callback.from_user.id, (time.perf_counter() - started) * 1000)
 
 
 async def _show_products_catalog(
@@ -1343,7 +1372,7 @@ async def _show_products_catalog(
 
     # Keep reseller refresh in the background so category screens remain fast.
     if any((getattr(product, "source", "own") or "own") == "reseller" for product in visible_products):
-        asyncio.create_task(_refresh_reseller_stock_cache_if_needed())
+        _schedule_reseller_stock_refresh()
 
     _fire_stock_scan(callback.bot, visible_products)
     custom_prices = await asyncio.to_thread(
@@ -1423,7 +1452,7 @@ async def favorites_menu(callback: CallbackQuery):
         )
         return
 
-    await _refresh_reseller_stock_cache_if_needed()
+    _schedule_reseller_stock_refresh()
     products = await asyncio.to_thread(_fetch_products_by_ids, fav_ids)
 
     if not products:
@@ -1674,7 +1703,7 @@ async def search_results(message: Message, state: FSMContext):
                       f"🔍 <b>Searching for:</b> <code>{_esc(query)}</code>\n\n<i>Looking through products...</i>",
                       parse_mode="HTML")
 
-    await _refresh_reseller_stock_cache_if_needed()
+    _schedule_reseller_stock_refresh()
     products = await asyncio.to_thread(_search_products, query)
     await state.clear()
     data = await state.get_data()
@@ -1766,23 +1795,20 @@ async def product_info(
     linked_product_id: int | None = None,
     acknowledge_callback: bool = True,
 ):
+    started = time.perf_counter()
     is_callback = isinstance(callback, CallbackQuery)
     if is_callback and acknowledge_callback:
         await callback.answer()
     product_id = linked_product_id if linked_product_id is not None else int(callback.data.split("_")[1])
 
     user_id = callback.from_user.id
-    if linked_product_id is not None:
-        product, custom_price = await asyncio.gather(
-            asyncio.to_thread(_fetch_product, product_id),
-            asyncio.to_thread(_get_custom_price, user_id, product_id),
-        )
-        if product and (getattr(product, "source", "own") or "own") == "reseller":
-            asyncio.create_task(_refresh_reseller_stock_cache_if_needed())
-    else:
-        await _refresh_reseller_stock_cache_if_needed()
-        product = await asyncio.to_thread(_fetch_product, product_id)
-        custom_price = await asyncio.to_thread(_get_custom_price, user_id, product_id)
+    product, custom_price, is_fav = await asyncio.gather(
+        asyncio.to_thread(_fetch_product, product_id),
+        asyncio.to_thread(_get_custom_price, user_id, product_id),
+        asyncio.to_thread(_is_favorite, user_id, product_id),
+    )
+    if product and (getattr(product, "source", "own") or "own") == "reseller":
+        _schedule_reseller_stock_refresh()
 
     if not product:
         not_found_text = "❌ <b>NOT FOUND</b>\n\n<b>This product is no longer available.</b>"
@@ -1802,7 +1828,6 @@ async def product_info(
     real_stock_available = _real_stock(product) > 0
     stock_count = _real_stock(product)
     cat_config = _get_category_config(product.category)
-    is_fav = await asyncio.to_thread(_is_favorite, user_id, product_id)
 
     delivery_type = (product.delivery_type or "automatic").lower()
     delivery_config = {
@@ -1916,6 +1941,8 @@ async def product_info(
         await show(callback, text, parse_mode="HTML", reply_markup=markup)
     else:
         await callback.answer(text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
+    logger.info("button_timing button=product user_id=%s product_id=%s total_ms=%.1f",
+                user_id, product_id, (time.perf_counter() - started) * 1000)
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -2006,9 +2033,11 @@ async def select_qty(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     product_id = int(callback.data.split("_")[2])
 
-    await _refresh_reseller_stock_cache_if_needed()
-    product = await asyncio.to_thread(_fetch_product, product_id)
-    custom_price = await asyncio.to_thread(_get_custom_price, callback.from_user.id, product_id)
+    _schedule_reseller_stock_refresh()
+    product, custom_price = await asyncio.gather(
+        asyncio.to_thread(_fetch_product, product_id),
+        asyncio.to_thread(_get_custom_price, callback.from_user.id, product_id),
+    )
 
     if not product or not product.is_active:
         await show(callback, f"⚠️ <b>Product Unavailable</b>", parse_mode="HTML",
@@ -2086,9 +2115,11 @@ async def receive_qty(message: Message, state: FSMContext):
                           ]))
         return
 
-    await _refresh_reseller_stock_cache_if_needed()
-    product = await asyncio.to_thread(_fetch_product, product_id)
-    custom_price = await asyncio.to_thread(_get_custom_price, message.from_user.id, product_id)
+    _schedule_reseller_stock_refresh()
+    product, custom_price = await asyncio.gather(
+        asyncio.to_thread(_fetch_product, product_id),
+        asyncio.to_thread(_get_custom_price, message.from_user.id, product_id),
+    )
 
     if not product or not product.is_active:
         await state.clear()
