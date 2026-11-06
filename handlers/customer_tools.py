@@ -44,28 +44,15 @@ def _cart_display_amount(value):
 
 
 async def notifications_screen(target,page=0):
-    data=await asyncio.to_thread(inbox.listing,target.from_user.id,page,target.bot.id)
-    text=f"🔔 <b>Notifications</b> · {data['unread']} unread\n"
-    text+=("Welcome back to RainDeals Notifications.\n"
-           "Stay up to date with your account, payments, wallet, and support.\n"
-           "Your recent updates are kept here so you can revisit them anytime.\n"
-           "Tap a message to open its available action.\n\n")
-    text+=f"Page {data['page']+1} · Up to 7 updates\n"
-    buttons=[]
-    for row in data['rows']:
-        marker='🔴' if row['unread'] else '✓'
-        text+=f"\n{marker} <b>{escape(row['title'])}</b>\n{escape(row['summary'])}\n<i>{row['created_at']:%d %b %H:%M} UTC</i>\n"
-        buttons.append([Button(text=f"{marker} {row['title'][:55]}",callback_data=f"ct_notice_{row['id']}_{data['page']}")])
-    if not data['rows']:
-        text+='\nNo notifications yet.'
-    pagination=[]
-    if data['page']: pagination.append(Button(text='‹ Previous',callback_data=f"ct_inbox_{data['page']-1}"))
-    if data['has_more']: pagination.append(Button(text='Next · 7 more ›',callback_data=f"ct_inbox_{data['page']+1}"))
-    if pagination: buttons.append(pagination)
-    if data['unread']:
-        buttons.append([Button(text='✓ Mark all as read',callback_data=f"ct_readall_{data['newest_id']}")])
-    buttons.append([Button(text='⚙ Preferences',callback_data='ct_preferences'),Button(text='Refresh',callback_data=f"ct_inbox_{data['page']}")])
-    buttons.append([Button(text='🧾 Wallet statement',callback_data='ct_wallet_0'),Button(text='🏠 Home',callback_data='main_menu')])
+    text=("🔔 <b>Notifications</b>\n\n"
+          "Welcome back to RainDeals Notifications.\n"
+          "Stay up to date with your account, payments, wallet, and support.\n"
+          "Your recent updates are kept here so you can revisit them anytime.\n"
+          "Tap a message to open its available action.")
+    buttons=[
+        [Button(text='⚙ Preferences',callback_data='ct_preferences')],
+        [Button(text='🏠 Home',callback_data='main_menu')],
+    ]
     await answer_card(target,text,parse_mode='HTML',reply_markup=kb(buttons),replace_media=True)
 
 
