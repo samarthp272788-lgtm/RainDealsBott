@@ -44,15 +44,35 @@ def _cart_display_amount(value):
 
 
 async def notifications_screen(target,page=0):
+    data=await asyncio.to_thread(inbox.listing,target.from_user.id,page,target.bot.id)
     text=("🔔 <b>RAINDEALS NOTIFICATIONS</b>\n\n"
           "✨ Stay informed about your RainDeals account.\n"
           "💳 Payment and wallet updates, support replies, claim decisions, and restock alerts keep you up to date.\n"
-          "📩 When an update needs action, use the button on its message to continue.\n"
-          "⚙️ Manage optional alerts below.")
-    buttons=[
+          "📩 Tap an update below to open its related action.\n"
+          "⚙️ Manage optional alerts in Preferences below.\n\n")
+    buttons=[]
+    for row in data['rows']:
+        marker='🔴' if row['unread'] else '✓'
+        text+=(f"\n{marker} <b>{escape(row['title'])}</b>\n"
+               f"{escape(row['summary'])}\n"
+               f"<i>{row['created_at']:%d %b %H:%M} UTC</i>\n")
+        buttons.append([Button(text=f"{marker} {row['title'][:50]}",
+                               callback_data=f"ct_notice_{row['id']}_{data['page']}")])
+    if not data['rows']:
+        text+='\n✨ You’re all caught up. New updates will appear here.'
+    pagination=[]
+    if data['page']:
+        pagination.append(Button(text='‹ Previous',callback_data=f"ct_inbox_{data['page']-1}"))
+    if data['has_more']:
+        pagination.append(Button(text='Next ›',callback_data=f"ct_inbox_{data['page']+1}"))
+    if pagination:
+        buttons.append(pagination)
+    if data['unread']:
+        buttons.append([Button(text='✓ Mark all as read',callback_data=f"ct_readall_{data['newest_id']}")])
+    buttons.extend([
         [Button(text='⚙ Preferences',callback_data='ct_preferences')],
         [Button(text='🏠 Main Menu',callback_data='main_menu')],
-    ]
+    ])
     await answer_card(target,text,parse_mode='HTML',reply_markup=kb(buttons),replace_media=True)
 
 
@@ -164,37 +184,21 @@ async def customer_action(callback:CallbackQuery,state:FSMContext):
         elif action=='notice':
             job_id,page=(value.split('_',1)+['0'])[:2] if '_' in value else (value,'0')
             row=await asyncio.to_thread(inbox.read,user_id,int(job_id),callback.bot.id)
-            markup=InlineKeyboardMarkup.model_validate(row['reply_markup']).inline_keyboard if row['reply_markup'] else []
-            buttons=[list(r) for r in markup]
-            if row['order']:
-                if row['claim']:
-                    label='Open refund request' if row['claim']['request_type']=='refund' else 'Open warranty request'
-                    buttons.append([Button(text=label,callback_data=f"warranty_order_{row['order_id']}")])
-                buttons.append([Button(text='View order details',callback_data=f"order_detail_{row['order_id']}")])
+            buttons=[]
+            if row['claim'] and row['order_id']:
+                label='Open refund request' if row['claim']['request_type']=='refund' else 'Open warranty request'
+                buttons.append([Button(text=label,callback_data=f"warranty_order_{row['order_id']}")])
             elif row['kind']=='deposit':
                 buttons.append([Button(text='Open Wallet',callback_data='deposit_start')])
             elif row['kind']=='support':
                 buttons.append([Button(text='Open Support',callback_data='support_ticket')])
             elif row['kind']=='restock':
                 buttons.append([Button(text='Open Shop',callback_data='products_menu')])
-            order_info=''
-            if row['order']:
-                order=row['order']
-                order_info=(f"\n\n<b>Order details</b>\nProduct: {escape((order['product_name'] or 'Product')[:100])}"
-                            f"\nStatus: {escape(order['status'])} · Quantity: {order['quantity']}"
-                            f"\nPaid: ${_cart_display_amount(order['amount'])} USDT"
-                            f"\nPlaced: {order['created_at']:%d %b %Y %H:%M} UTC")
-            claim_info=''
-            if row['claim']:
-                claim=row['claim']
-                claim_info=f"\n\n<b>Request status</b>\n{escape(claim['request_type'].title())}: {escape(claim['status'])}"
-                if claim['refund_amount'] is not None:
-                    claim_info+=f"\nEstimated refund: ${_cart_display_amount(claim['refund_amount'])} USDT"
-                if claim['used_days'] is not None:
-                    claim_info+=f"\nDays used: {claim['used_days']} · Remaining: {claim['remaining_days']}"
+            elif row['kind'] in ('order','subscription'):
+                buttons.append([Button(text='My Orders',callback_data='orders_menu')])
             buttons.append([Button(text='⬅ Notifications',callback_data=f'ct_inbox_{max(0,int(page))}'),Button(text='Home',callback_data='main_menu')])
             detail=(f"🔔 <b>{escape(row['title'])}</b>\n<i>{row['created_at']:%d %b %Y %H:%M} UTC</i>\n\n"
-                    f"{escape(row['summary'])}{order_info}{claim_info}")
+                    f"{escape(row['summary'])}")
             await show(callback,detail,parse_mode='HTML',reply_markup=kb(buttons),replace_media=True)
         elif action=='readall':
             await asyncio.to_thread(inbox.mark_read,user_id,int(value),callback.bot.id)

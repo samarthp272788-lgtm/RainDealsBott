@@ -124,14 +124,16 @@ def _view_row(row, order=None, claim=None):
                       'Support · Ticket update' if kind == 'support' else
                       'Shop · Restock update' if kind == 'restock' else
                       'Subscription reminder' if kind == 'subscription' else 'Account update')
-    if kind == 'refund':
-        title = f'{order_text} · Refund update'
-    elif kind == 'warranty':
-        title = f'{order_text} · Warranty update'
-    elif kind == 'order':
-        title = f'{order_text} · Order update'
-    else:
-        title = order_text
+    title = {
+        'refund': '💸 Refund update',
+        'warranty': '🛡️ Warranty update',
+        'order': '📦 Order update',
+        'deposit': '💳 Payment update',
+        'support': '💬 Support update',
+        'restock': '📦 Restock alert',
+        'subscription': '⏳ Subscription reminder',
+        'account': '👤 Account update',
+    }.get(kind, '🔔 RainDeals update')
     return dict(
         id=row.id,
         title=title[:120],
