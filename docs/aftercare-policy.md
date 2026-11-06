@@ -1,5 +1,10 @@
 # Product warranty and refund policy
 
+The shared bot/manager claim dossier now adds explicit product confirmation,
+issue categories, private screenshot storage, original invoice/delivery snapshots,
+and historical metadata recovery. See [claim dossiers](claim-dossier.md) for the
+current review screens and migration instructions.
+
 ## Setup
 
 After the description of an own product, choose **Warranty**, **Refund**, or

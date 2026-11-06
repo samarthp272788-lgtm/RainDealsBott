@@ -214,8 +214,9 @@ Refunded:
     text += f"\nTeam owner: {order.assigned_admin_id or 'Unassigned'}\nAutomatic: {order.automatic_quantity or 0} · Remaining: {order.manual_pending_quantity or 0}\n"
     keyboard = [[InlineKeyboardButton(text="🕒 Timeline", callback_data=f"admin_timeline_{order.id}"),
                  InlineKeyboardButton(text="📋 Team workspace", callback_data=f"work_view_{order.id}")]]
-    if order.warranty_days:
-        keyboard.append([InlineKeyboardButton(text='🛡 Warranty / replacement', callback_data=f'warranty_admin_{order.id}')])
+    from services.warranty import policy
+    if policy(order) != 'skip':
+        keyboard.append([InlineKeyboardButton(text='🛡 Warranty / refund claim', callback_data=f'warranty_admin_{order.id}')])
 
     needs_fulfillment = (
         order.status in ("pending_manual", "preorder")

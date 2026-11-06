@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import worker from './src/index.js';
-import {page,loginPage} from './src/ui.js';
+import {page} from './src/ui.js';
+import {loginPage} from './src/login_v2.js';
 
 const calls=[];
 const csrf='c'.repeat(64),token='a'.repeat(64);
@@ -14,8 +15,8 @@ assert.equal((await worker.fetch(new Request('https://manager.example/manage/pro
 assert.equal((await worker.fetch(request('/manage/settings',{key:'maintenance_requested',value:'1'},{'x-csrf-token':'bad'}),env)).status,403);
 assert.equal((await worker.fetch(request('/manage/settings',{key:'maintenance_requested',value:'1'},{origin:'https://attacker.example'}),env)).status,403);
 let r=await worker.fetch(request('/manage/settings',{key:'maintenance_requested',value:'1'}),env);
-assert.equal(r.status,200);assert.match((await r.json()).message,/not configured/);
-assert.equal(calls.some(x=>/^UPDATE maintenance_settings|^INSERT INTO maintenance_settings/.test(x.sql)),false);
+assert.equal(r.status,200);assert.match((await r.json()).message,/shared database/);
+assert.deepEqual(calls.find(x=>x.sql.startsWith('INSERT INTO maintenance_settings')).args,[1]);
 assert.equal((await worker.fetch(request('/manage/settings',{key:'arbitrary_sql',value:'DROP TABLE users'}),env)).status,400);
 r=await worker.fetch(request('/manage/products/12/accounts',{mode:'append',content:'second\nthird'}),env);assert.equal(r.status,200);
 const inventory=calls.find(x=>x.sql.startsWith('UPDATE products SET file_content'));assert.deepEqual(inventory.args,['first\nsecond\nthird',3,'12']);assert(calls.some(x=>x.sql==='COMMIT'));

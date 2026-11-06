@@ -16,11 +16,14 @@ router = Router()
 
 class Inputs(StatesGroup):
     warranty_days = State()
+    product_confirmation = State()
+    issue_type = State()
     reason = State()
     deactivated = State()
     evidence = State()
     confirmation = State()
     resolution = State()
+    metadata = State()
 
 
 def keyboard(rows):
@@ -119,19 +122,25 @@ async def render_warranty(target, order_id, admin=False):
     refund = ctx['policy'] == 'refund'
     text = warranty.summary_text(ctx)
     buttons = []
+    buttons.append([Button(text='🧾 Order / product invoice',callback_data=f'warranty_invoice_{order_id}'),
+                    Button(text='📦 Delivered information',callback_data=f'warranty_delivery_{order_id}')])
+    buttons.append([Button(text='📋 Full order & submitted details',callback_data=f'order_{order_id}' if admin else f'order_detail_{order_id}')])
     if request:
         evidence = request['evidence']
         buttons.append([Button(text='🧾 Request details', callback_data=f'warranty_details_{order_id}')])
         if evidence.get('kind') == 'photo' and evidence.get('file_id'):
             buttons.append([Button(text='📷 View evidence', callback_data=f'warranty_photo_{order_id}')])
         if admin and ctx['reviewable'] and request['status'] == 'submitted':
-            label = f"Approve refund ${request['refund_amount']:.8f}" if refund else 'Approve replacement'
-            buttons.append([Button(text=label, callback_data=f'warranty_approve_{order_id}', style='success'),
-                            Button(text='Decline', callback_data=f'warranty_reject_{order_id}', style='danger')])
+            if not refund or request['refund_amount'] is not None:
+                label = f"Approve refund ${request['refund_amount']:.8f}" if refund else 'Approve replacement'
+                buttons.append([Button(text=label, callback_data=f'warranty_approve_{order_id}', style='success')])
+            buttons.append([Button(text='Decline', callback_data=f'warranty_reject_{order_id}', style='danger')])
         elif admin and ctx['reviewable'] and request['status'] == 'approved':
             buttons.append([Button(text='Deliver replacement', callback_data=f'warranty_complete_{order_id}', style='success')])
-    elif not ctx['error']:
+    elif ctx.get('can_submit',not ctx['error']):
         buttons.append([Button(text='💸 Ask for refund' if refund else '🛡 Claim warranty', callback_data=f'warranty_request_{order_id}', style='primary')])
+    if admin and ctx.get('reviewable'):
+        buttons.append([Button(text='🗓 Confirm subscription / delivery date',callback_data=f'warranty_metadata_{order_id}')])
     buttons.append([Button(text='Refresh', callback_data=f'warranty_admin_{order_id}' if admin else f'warranty_order_{order_id}'),
                     Button(text='⬅ Back', callback_data='warranty_queue_0' if admin else f'order_detail_{order_id}')])
     await answer_card(target, text, parse_mode='HTML', reply_markup=keyboard(buttons), replace_media=True)
@@ -166,12 +175,50 @@ async def warranty_status(callback: CallbackQuery, state: FSMContext):
 async def request_warranty(callback: CallbackQuery, state: FSMContext):
     order_id = int(callback.data.rsplit('_', 1)[1])
     ctx = await asyncio.to_thread(warranty.context, order_id, callback.from_user.id)
-    if not ctx or ctx['error'] or ctx['request']:
+    if not ctx or not ctx.get('can_submit',not ctx['error']) or ctx['request']:
         await callback.answer('Request unavailable. Refresh this order.', show_alert=True)
         return
     await callback.answer()
+    await state.clear()
+    await state.set_state(Inputs.product_confirmation)
+    await state.update_data(warranty_order=order_id,warranty_mode=ctx['policy'],warranty_product_confirmed=False)
+    from services.claim_details import invoice_text
+    await show(callback,invoice_text(ctx['invoice'])+'\n\nIs this the product with the issue?',parse_mode='HTML',
+               reply_markup=keyboard([[Button(text='✅ Confirm product',callback_data=f'warranty_confirm_{order_id}',style='success')],
+                                      [Button(text='Back',callback_data=f'warranty_order_{order_id}')]]))
+
+
+@router.callback_query(F.data.startswith('warranty_confirm_'))
+async def confirm_claim_product(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    order_id = int(callback.data.rsplit('_',1)[1])
+    if await state.get_state() != Inputs.product_confirmation.state or data.get('warranty_order') != order_id:
+        await callback.answer('Open the claim form from your order again.',show_alert=True)
+        return
+    await callback.answer()
+    await state.update_data(warranty_product_confirmed=True)
+    await state.set_state(Inputs.issue_type)
+    from services.claim_details import ISSUES
+    await show(callback,'What is wrong with this product?',reply_markup=keyboard([
+        [Button(text=label,callback_data=f'warranty_issue_{order_id}_{code}')] for code,label in ISSUES.items()]))
+
+
+@router.callback_query(F.data.startswith('warranty_issue_'))
+async def choose_claim_issue(callback: CallbackQuery, state: FSMContext):
+    from services.claim_details import ISSUES
+    _,_,raw_order,issue = callback.data.split('_',3)
+    order_id = int(raw_order)
+    data = await state.get_data()
+    if await state.get_state() != Inputs.issue_type.state or data.get('warranty_order') != order_id or not data.get('warranty_product_confirmed') or issue not in ISSUES:
+        await callback.answer('Confirm the product first.',show_alert=True)
+        return
+    ctx = await asyncio.to_thread(warranty.context,order_id,callback.from_user.id)
+    if not ctx or not ctx.get('can_submit',not ctx['error']) or ctx['request']:
+        await callback.answer('This claim is no longer available.',show_alert=True)
+        return
+    await callback.answer()
+    await state.update_data(warranty_issue_type=issue)
     await state.set_state(Inputs.reason)
-    await state.update_data(warranty_order=order_id, warranty_mode=ctx['policy'])
     text = 'Describe what stopped working or was deactivated (10–1500 characters).\nDo not send passwords. /cancel to stop.'
     if ctx['policy'] == 'refund':
         text = warranty.REFUND_RULES+'\n\n'+warranty.quote_text(ctx['quote'])+'\n\n'+text
@@ -216,16 +263,34 @@ async def warranty_input(message: Message, state: FSMContext):
     await claim_confirmation(message, state)
 
 
+@router.message(Inputs.product_confirmation)
+@router.message(Inputs.issue_type)
+async def claim_choice_input(message: Message,state: FSMContext):
+    data = await state.get_data()
+    order_id = data.get('warranty_order')
+    if is_cancel(message.text):
+        await state.clear()
+        await render_warranty(message,order_id)
+        return
+    if await state.get_state() == Inputs.product_confirmation.state:
+        rows = [[Button(text='✅ Confirm product',callback_data=f'warranty_confirm_{order_id}')]]
+    else:
+        from services.claim_details import ISSUES
+        rows = [[Button(text=label,callback_data=f'warranty_issue_{order_id}_{code}')] for code,label in ISSUES.items()]
+    rows.append([Button(text='Cancel',callback_data=f'warranty_order_{order_id}')])
+    await answer_card(message,'Choose an option below, or /cancel.',reply_markup=keyboard(rows))
+
+
 async def claim_confirmation(target, state, notice=''):
     data = await state.get_data()
     order_id = data['warranty_order']
     ctx = await asyncio.to_thread(warranty.context, order_id, target.from_user.id)
-    if not ctx or ctx['error'] or ctx['request']:
+    if not ctx or not ctx.get('can_submit',not ctx['error']) or ctx['request']:
         await state.clear()
         await render_warranty(target, order_id)
         return
     refund = ctx['policy'] == 'refund'
-    await state.update_data(warranty_expected_refund=str(ctx['quote']['refund_amount']) if refund else None)
+    await state.update_data(warranty_expected_refund=str(ctx['quote']['refund_amount']) if refund and ctx['quote'] else None)
     text = (escape(notice)+'\n\n' if notice else '') + f'🧾 <b>Review claim · Order #{order_id}</b>\n\n'
     text += 'Problem: '+escape(data['warranty_reason'][:600])+'\nDeactivated (reported): '+escape(data['warranty_deactivated'])
     text += '\nProof: screenshot attached.' if data['warranty_evidence']['kind'] == 'photo' else '\nProof: description attached.'
@@ -245,8 +310,26 @@ async def submit_claim(callback: CallbackQuery, state: FSMContext):
         await callback.answer('This form has expired. Open your order again.', show_alert=True)
         return
     await callback.answer()
+    if not data.get('warranty_product_confirmed'):
+        await answer_card(callback,'Confirm the purchased product first.',reply_markup=back(order_id))
+        return
+    proof = None
+    if data['warranty_evidence']['kind'] == 'photo':
+        from io import BytesIO
+        from services.claim_details import proof_mime
+        try:
+            buffer = BytesIO()
+            async with asyncio.timeout(20):
+                await callback.bot.download(data['warranty_evidence']['file_id'],destination=buffer)
+            proof = buffer.getvalue()
+            proof_mime(proof)
+        except Exception:
+            await answer_card(callback,'Could not save the screenshot for staff review. Try Submit claim again; your form is still saved.',reply_markup=keyboard([
+                [Button(text='Retry submit',callback_data=f'warranty_submit_{order_id}')],[Button(text='Back',callback_data=f'warranty_order_{order_id}')]]))
+            return
     error = await asyncio.to_thread(warranty.submit, order_id, callback.from_user.id,
-        data['warranty_reason'], data['warranty_evidence'], data['warranty_deactivated'], data.get('warranty_expected_refund'))
+        data['warranty_reason'], data['warranty_evidence'], data['warranty_deactivated'], data.get('warranty_expected_refund'),
+        issue_type=data.get('warranty_issue_type','other'),product_confirmed=True,proof_bytes=proof)
     if error:
         await claim_confirmation(callback, state, error)
         return
@@ -357,7 +440,77 @@ async def warranty_photo(callback: CallbackQuery):
         await callback.answer('Evidence not found.', show_alert=True)
         return
     await callback.answer()
+    if not request.get('proof_available'):
+        try:
+            from io import BytesIO
+            image = BytesIO()
+            async with asyncio.timeout(15):
+                await callback.bot.download(request['evidence']['file_id'],destination=image)
+            await asyncio.to_thread(warranty.cache_proof,order_id,callback.from_user.id,image.getvalue(),admin)
+        except Exception:
+            pass  # Telegram evidence still opens; web shows a clear missing-cache notice.
     await show_warranty_photo(callback, request['evidence']['file_id'], order_id, admin)
+
+
+@router.callback_query(F.data.startswith('warranty_invoice_'))
+async def claim_invoice(callback: CallbackQuery):
+    admin = callback.from_user.id in ADMIN_IDS
+    order_id = int(callback.data.rsplit('_',1)[1])
+    ctx = await asyncio.to_thread(warranty.context,order_id,callback.from_user.id,admin)
+    if not ctx:
+        await callback.answer('Order not found.',show_alert=True)
+        return
+    from services.claim_details import invoice_text
+    await callback.answer()
+    await show(callback,invoice_text(ctx['invoice']),parse_mode='HTML',reply_markup=back(order_id,admin),replace_media=True)
+
+
+@router.callback_query(F.data.startswith('warranty_delivery_'))
+async def claim_delivery(callback: CallbackQuery):
+    admin = callback.from_user.id in ADMIN_IDS
+    order_id = int(callback.data.rsplit('_',1)[1])
+    value = await asyncio.to_thread(warranty.delivery_details,order_id,callback.from_user.id,admin)
+    if value is None:
+        await callback.answer('Order not found.',show_alert=True)
+        return
+    await callback.answer()
+    await show(callback,f'📦 <b>Order #{order_id} · Delivery saved for this claim</b>\n\n<code>'+escape(value[:3000])+'</code>',
+               parse_mode='HTML',reply_markup=back(order_id,admin),replace_media=True)
+
+
+@router.callback_query(F.data.startswith('warranty_metadata_'))
+async def claim_metadata(callback: CallbackQuery,state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer('Access denied.',show_alert=True)
+        return
+    order_id = int(callback.data.rsplit('_',1)[1])
+    await callback.answer()
+    await state.set_state(Inputs.metadata)
+    await state.update_data(warranty_order=order_id)
+    await show(callback,'Confirm the real subscription length and delivery timestamp. Do not use today for an older delivery.\n\n'
+               'Send: days | YYYY-MM-DD HH:MM (UTC) | reason\nExample: 30 | 2026-11-02 10:30 | Checked delivery history\n/cancel to stop.',reply_markup=back(order_id,True))
+
+
+@router.message(Inputs.metadata)
+async def claim_metadata_input(message: Message,state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    data = await state.get_data()
+    if is_cancel(message.text):
+        await state.clear()
+        await render_warranty(message,data['warranty_order'],True)
+        return
+    parts = (message.text or '').split('|',2)
+    if len(parts)!=3 or not parts[0].strip().isdigit():
+        await answer_card(message,'Send: days | YYYY-MM-DD HH:MM (UTC) | reason',reply_markup=back(data['warranty_order'],True))
+        return
+    error = await asyncio.to_thread(warranty.correct_metadata,data['warranty_order'],message.from_user.id,
+                                    int(parts[0]),parts[1].strip(),parts[2].strip())
+    if error:
+        await answer_card(message,error,reply_markup=back(data['warranty_order'],True))
+        return
+    await state.clear()
+    await render_warranty(message,data['warranty_order'],True)
 
 
 @managed_screen

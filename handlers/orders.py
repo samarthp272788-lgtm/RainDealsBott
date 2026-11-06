@@ -936,10 +936,11 @@ async def order_detail(callback: CallbackQuery):
     action_buttons.append([InlineKeyboardButton(text="🕒 Order timeline", callback_data=f"order_timeline_{order.id}", style="primary")])
 
     from services.warranty import policy, eligibility
+    from services.claim_details import missing_metadata
     claim_policy = policy(order)
     if claim_policy != 'skip' and order.status in ('completed', 'refunded'):
         label = '💸 Ask for refund' if claim_policy == 'refund' else '🛡 Claim warranty'
-        if eligibility(order, callback.from_user.id):
+        if eligibility(order, callback.from_user.id) and not missing_metadata(order):
             label = '💸 Refund status' if claim_policy == 'refund' else '🛡 Warranty status'
         action_buttons.append([InlineKeyboardButton(text=label, callback_data=f"warranty_order_{order.id}", style="primary")])
 

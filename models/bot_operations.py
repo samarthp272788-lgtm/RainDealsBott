@@ -1,5 +1,7 @@
 """Persistent customer aftercare, provider observations and notification outbox."""
-from sqlalchemy import Column, Integer, BigInteger, String, Text, DateTime, JSON, Index, Numeric, func
+from sqlalchemy import Column, Integer, BigInteger, String, Text, DateTime, JSON, Index, Numeric, LargeBinary, func
+from sqlalchemy.dialects.mysql import MEDIUMBLOB
+from sqlalchemy.orm import deferred
 from database import Base
 
 
@@ -16,6 +18,13 @@ class WarrantyRequest(Base):
     used_days = Column(Integer, nullable=True)
     remaining_days = Column(Integer, nullable=True)
     deactivated_at = Column(String(200), nullable=True)
+    issue_type = Column(String(32), nullable=False, default='other', server_default='other')
+    product_confirmed = Column(Integer, nullable=False, default=0, server_default='0')
+    invoice_snapshot = Column(JSON, nullable=True)
+    delivery_snapshot = deferred(Column(Text, nullable=True))
+    proof_image = deferred(Column(LargeBinary().with_variant(MEDIUMBLOB(), 'mysql'), nullable=True))
+    proof_mime = Column(String(32), nullable=True)
+    bot_id = Column(BigInteger, nullable=True)
     admin_id = Column(BigInteger, nullable=True)
     resolution = Column(Text, nullable=True)
     created_at = Column(DateTime, nullable=False, server_default=func.now())

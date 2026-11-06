@@ -62,6 +62,13 @@ def ensure_order_requirements_schema() -> None:
         _ensure_column(connection, "bot_warranty_requests", "used_days", "INT NULL")
         _ensure_column(connection, "bot_warranty_requests", "remaining_days", "INT NULL")
         _ensure_column(connection, "bot_warranty_requests", "deactivated_at", "VARCHAR(200) NULL")
+        for column, definition in {
+            'issue_type': "VARCHAR(32) NOT NULL DEFAULT 'other'",
+            'product_confirmed': 'INT NOT NULL DEFAULT 0', 'invoice_snapshot': 'JSON NULL',
+            'delivery_snapshot': 'TEXT NULL', 'proof_image': 'MEDIUMBLOB NULL',
+            'proof_mime': 'VARCHAR(32) NULL', 'bot_id': 'BIGINT NULL',
+        }.items():
+            _ensure_column(connection, 'bot_warranty_requests', column, definition)
         for table in ('products', 'orders'):
             _ensure_column(connection, table, 'aftercare_policy', 'VARCHAR(16) NULL')
             _ensure_column(connection, table, 'subscription_days', 'INT NOT NULL DEFAULT 0')

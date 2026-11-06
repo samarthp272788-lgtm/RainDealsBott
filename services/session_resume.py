@@ -33,13 +33,14 @@ ADMIN_FAMILIES = {'AddProduct', 'EditProduct', 'AddStock', 'DeleteProduct', 'Add
                   'ProviderEditState', 'MaintenanceModeState', 'ManagerWebState',
                   'PromoCodeCreation', 'WorkInput'}
 EXTRA_USER_STATES = {'Inputs:reason', 'Inputs:deactivated', 'Inputs:evidence', 'Inputs:confirmation',
+                     'Inputs:product_confirmation','Inputs:issue_type',
                      'RedeemState:waiting_for_code', 'OrderFilterStates:waiting_date_range',
                      'OrderFilterStates:waiting_export_format', 'OrderFilterStates:waiting_rating',
                      'OrderFilterStates:waiting_reminder_time'}
 
 
 def admin_state(state):
-    return bool(state and (state.split(':', 1)[0] in ADMIN_FAMILIES or state in {'Inputs:warranty_days', 'Inputs:resolution'}))
+    return bool(state and (state.split(':', 1)[0] in ADMIN_FAMILIES or state in {'Inputs:warranty_days', 'Inputs:resolution','Inputs:metadata'}))
 
 
 @contextmanager

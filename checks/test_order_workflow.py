@@ -803,3 +803,77 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotEqual(first['id'],third['id'])
         with self.factory() as db:
             self.assertEqual(db.query(self.deposits.Deposit).count(),2)
+
+    def test_manager_delivery_history_recovers_original_clock_without_extending_coverage(self):
+        from services import warranty
+        now=datetime.utcnow()
+        order_id=self.refund_order(coverage_started_at=None,delivery_type='manual',created_at=now-timedelta(days=6))
+        completed=now-timedelta(days=4)
+        with self.factory.begin() as db:
+            db.add(self.workflow.OrderEvent(order_id=order_id,kind='completed',summary='Delivered by manager',created_at=completed))
+        ctx=warranty.context(order_id,7)
+        self.assertFalse(ctx['metadata_missing'])
+        self.assertIsNone(ctx['error'])
+        self.assertEqual(ctx['quote']['used_days'],5)
+        with self.factory() as db:
+            self.assertEqual(db.get(self.orders.Order,order_id).coverage_started_at,completed)
+        self.assertEqual(warranty.context(order_id,7)['invoice']['delivered_at'],completed.isoformat())
+
+    def test_missing_delivery_metadata_accepts_evidence_but_blocks_credit_until_audited_correction(self):
+        from services import warranty
+        now=datetime.utcnow()
+        order_id=self.refund_order(coverage_started_at=None,subscription_days=0,delivery_type='manual',
+                                  created_at=now-timedelta(days=6),delivered_account='used:original-credential')
+        ctx=warranty.context(order_id,7)
+        self.assertTrue(ctx['can_submit'])
+        self.assertTrue(ctx['metadata_missing'])
+        proof=b'\xff\xd8\xfffixture-proof'
+        self.assertIsNone(warranty.submit(order_id,7,'The account was deactivated.',{'kind':'photo','file_id':'fixture'},
+                           'Yesterday',issue_type='deactivated',proof_bytes=proof))
+        self.assertIn('Confirm the saved',warranty.review(order_id,101,'approve'))
+        with self.factory() as db:
+            c=db.query(self.operations.WarrantyRequest).one()
+            self.assertEqual(c.proof_image,proof)
+            self.assertEqual(c.proof_mime,'image/jpeg')
+            self.assertEqual(c.invoice_snapshot['paid'],'100.00000000')
+            self.assertEqual(c.delivery_snapshot,'used:original-credential')
+            self.assertIsNone(c.refund_amount)
+        delivery=now-timedelta(days=2,hours=1)
+        self.assertIsNotNone(warranty.correct_metadata(order_id,999,30,delivery.isoformat(),'Reviewed delivery history'))
+        self.assertIsNotNone(warranty.correct_metadata(order_id,101,30,(now+timedelta(days=1)).isoformat(),'Reviewed delivery history'))
+        self.assertIsNone(warranty.correct_metadata(order_id,101,30,delivery.isoformat(),'Reviewed delivery history'))
+        self.assertEqual(warranty.context(order_id,7)['request']['refund_amount'],Decimal('72'))
+        self.assertIsNone(warranty.review(order_id,101,'approve'))
+        with self.factory() as db:
+            self.assertEqual(db.query(self.users.User).one().balance,Decimal('77'))
+            self.assertEqual(db.query(self.audit.AdminAuditLog).filter_by(action='aftercare_metadata').count(),1)
+
+    def test_claim_invoice_and_delivery_remain_as_submitted_and_do_not_leak_in_summary(self):
+        from services import warranty
+        order_id=self.refund_order(delivered_account='original:private-credential',created_at=datetime.utcnow()-timedelta(days=6))
+        self.assertIsNone(warranty.submit(order_id,7,'The account was deactivated.',{'kind':'photo','file_id':'fixture'},'Today',
+                           issue_type='deactivated',proof_bytes=b'\xff\xd8\xfffixture'))
+        with self.factory.begin() as db:
+            order=db.get(self.orders.Order,order_id)
+            order.product_name='Changed later'
+            order.delivered_account='edited:changed-credential'
+        ctx=warranty.context(order_id,7)
+        self.assertEqual(ctx['invoice']['product'],'Test')
+        self.assertNotIn('private-credential',str(ctx))
+        self.assertNotIn('changed-credential',str(ctx))
+        self.assertEqual(warranty.delivery_details(order_id,7),'original:private-credential')
+        self.assertIsNone(warranty.delivery_details(order_id,8))
+        self.assertIsNone(warranty.delivery_details(order_id,999,True))
+        self.assertIsNone(warranty.correct_metadata(order_id,101,30,ctx['invoice']['delivered_at'],'Confirmed the original delivery date'))
+        self.assertEqual(warranty.context(order_id,7)['invoice']['product'],'Test')
+
+    def test_invalid_proof_type_and_unconfirmed_product_do_not_create_claim(self):
+        from services import warranty
+        order_id=self.refund_order()
+        args=(order_id,7,'The account was deactivated.',{'kind':'photo','file_id':'fixture'},'Today')
+        self.assertIsNotNone(warranty.submit(*args,proof_bytes=b'<svg>bad</svg>'))
+        self.assertIsNotNone(warranty.submit(*args,proof_bytes=b'\xff\xd8\xff'+b'x'*(2*1024*1024)))
+        self.assertIsNotNone(warranty.submit(*args,product_confirmed=False))
+        self.assertIsNotNone(warranty.submit(*args,issue_type='arbitrary'))
+        with self.factory() as db:
+            self.assertEqual(db.query(self.operations.WarrantyRequest).count(),0)

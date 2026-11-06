@@ -41,6 +41,34 @@ def load(file, names, namespace):
 
 
 class AftercareFormsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_claim_confirms_original_product_then_selects_issue(self):
+        inputs = SimpleNamespace(**{name:SimpleNamespace(state='Inputs:'+name) for name in ('product_confirmation','issue_type','reason')})
+        inv=dict(reference='RD-21',product='Original product',product_id=8,quantity=1,paid='30',customer_id='7',
+                 purchased_at='2026-11-01',delivered_at=None)
+        ctx=dict(error='Missing date',can_submit=True,request=None,policy='refund',quote=None,invoice=inv)
+        service=SimpleNamespace(context=Mock(return_value=ctx),REFUND_RULES=warranty.REFUND_RULES,quote_text=warranty.quote_text)
+        show=AsyncMock()
+        h=load('handlers/bot_operations.py',['request_warranty','confirm_claim_product','choose_claim_issue'],dict(
+            asyncio=asyncio,Inputs=inputs,warranty=service,show=show,keyboard=lambda rows:rows,Button=InlineKeyboardButton,back=lambda *a:None))
+        callback=SimpleNamespace(from_user=SimpleNamespace(id=7),data='warranty_request_21',answer=AsyncMock())
+        state=State()
+        await h.request_warranty(callback,state)
+        self.assertEqual(state.value,inputs.product_confirmation.state)
+        self.assertIn('Original product',show.await_args.args[1])
+        self.assertFalse(state.data['warranty_product_confirmed'])
+        callback.data='warranty_issue_21_deactivated'
+        await h.choose_claim_issue(callback,state)
+        self.assertEqual(state.value,inputs.product_confirmation.state)
+        callback.data='warranty_confirm_21'
+        await h.confirm_claim_product(callback,state)
+        self.assertTrue(state.data['warranty_product_confirmed'])
+        self.assertEqual(state.value,inputs.issue_type.state)
+        callback.data='warranty_issue_21_deactivated'
+        await h.choose_claim_issue(callback,state)
+        self.assertEqual(state.value,inputs.reason.state)
+        self.assertEqual(state.data['warranty_issue_type'],'deactivated')
+        self.assertIn('pending staff',show.await_args.args[1])
+
     async def test_creation_asks_policy_before_delivery_and_import_is_not_saved_early(self):
         show = AsyncMock()
         save = AsyncMock()
@@ -90,7 +118,7 @@ class AftercareFormsTests(unittest.IsolatedAsyncioTestCase):
                   text_value=text_value, field_value=field_value, is_cancel=is_cancel, answer_card=show,
                   render_warranty=render, back=lambda *args:None, keyboard=lambda rows:rows, Button=InlineKeyboardButton)
         h = load('handlers/bot_operations.py',['warranty_input','claim_confirmation','submit_claim','claim_confirmation_input'],ns)
-        state = State(inputs.reason.state,warranty_order=21,warranty_mode='refund')
+        state = State(inputs.reason.state,warranty_order=21,warranty_mode='refund',warranty_product_confirmed=True,warranty_issue_type='deactivated')
         message = SimpleNamespace(from_user=SimpleNamespace(id=7),text='Account shows deactivated.',photo=[])
         await h.warranty_input(message,state)
         self.assertEqual(state.value,inputs.deactivated.state)
@@ -109,9 +137,15 @@ class AftercareFormsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('$21.60000000',show.await_args.args[1])
         self.assertIn('2 PM IST',show.await_args.args[1])
         submit.assert_not_called()
-        callback = SimpleNamespace(from_user=message.from_user,data='warranty_submit_21',answer=AsyncMock())
+        async def download(file_id,destination):
+            destination.write(b'\xff\xd8\xfffixture-image')
+        callback = SimpleNamespace(from_user=message.from_user,data='warranty_submit_21',answer=AsyncMock(),
+                                   bot=SimpleNamespace(download=AsyncMock(side_effect=download)))
         await h.submit_claim(callback,state)
         self.assertEqual(submit.call_args.args,(21,7,'Account shows deactivated.',{'kind':'photo','file_id':'proof-photo'},'6 November, 2 PM IST','21.6'))
+        self.assertEqual(submit.call_args.kwargs['issue_type'],'deactivated')
+        self.assertTrue(submit.call_args.kwargs['product_confirmed'])
+        self.assertEqual(submit.call_args.kwargs['proof_bytes'],b'\xff\xd8\xfffixture-image')
         self.assertIsNone(state.value)
         submit.reset_mock()
         await h.submit_claim(callback,state)

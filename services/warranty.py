@@ -60,7 +60,7 @@ def refund_quote(order, now=None):
 
 def quote_text(quote):
     if not quote:
-        return 'Refund estimate unavailable.'
+        return 'Refund calculation is pending staff confirmation of the subscription and delivery date.'
     return (f'Paid: <b>${quote["paid"]:.8f}</b> · Subscription: {quote["subscription_days"]} days\n'
             f'Used: {quote["used_days"]} · Remaining: {quote["remaining_days"]}\n'
             f'Estimated refund: <b>${quote["refund_amount"]:.8f} USDT</b>\n'
@@ -73,24 +73,32 @@ def summary_text(ctx):
     mode = ctx.get('policy', 'warranty')
     title = 'Refund' if mode == 'refund' else 'Warranty'
     text = f'🛡 <b>Order #{ctx["order_id"]} · {title}</b>\nCoverage: {ctx["days"]} day(s)\nEnds: {expires}\n'
+    if ctx.get('invoice'):
+        inv = ctx['invoice']
+        text += f'Product: <b>{escape((inv["product"] or "Product")[:70])}</b> · Qty {inv["quantity"]}\nPaid: ${escape(inv["paid"])} USDT\n'
     request = ctx['request']
     if not request:
         if mode == 'refund':
             text += '\n' + REFUND_RULES + '\n\n' + quote_text(ctx.get('quote')) + '\n'
         return text + ('\n' + escape(ctx['error']) if ctx['error'] else '')
     reason = request['reason']
-    text += f'\nStatus: <b>{escape(request["status"])}</b>\nReason: {escape(reason[:250])}'
+    text += f'\nStatus: <b>{escape(request["status"])}</b>\nReason: {escape(reason[:120])}'
+    if request.get('issue_type'):
+        from services.claim_details import ISSUES
+        text += '\nIssue: '+ISSUES.get(request['issue_type'],'Other issue')
+    if mode == 'refund' and request.get('refund_amount') is None:
+        text += '\nCalculation pending staff confirmation of subscription/delivery details.'
     if request.get('refund_amount') is not None:
         text += (f'\nRefund: <b>${request["refund_amount"]:.8f} USDT</b>'
                  f'\nDays used: {request["used_days"]} · Remaining: {request["remaining_days"]}')
     if request.get('deactivated_at'):
         text += '\nDeactivated (reported): ' + escape(request['deactivated_at'])
-    if len(reason) > 250:
+    if len(reason) > 120:
         text += '…'
     evidence = request['evidence']
     if evidence.get('kind') == 'text':
         value = evidence.get('value', '')
-        text += '\nEvidence: ' + escape(value[:250]) + ('…' if len(value) > 250 else '')
+        text += '\nEvidence: ' + escape(value[:120]) + ('…' if len(value) > 120 else '')
     if request['resolution']:
         text += '\n\nResponse / replacement:\n' + escape(request['resolution'])
     return text
@@ -99,6 +107,9 @@ def summary_text(ctx):
 def request_text(ctx):
     request = ctx['request']
     text = f'🧾 <b>Order #{ctx["order_id"]} · Request details</b>\n\n' + escape(request['reason'])
+    from services.claim_details import ISSUES
+    text += '\n\nIssue: '+ISSUES.get(request.get('issue_type'),'Other issue')
+    text += '\nProduct confirmed: '+('Yes' if request.get('product_confirmed') else 'Not recorded for this older claim')
     if request.get('deactivated_at'):
         text += '\n\n<b>Deactivated / stopped working (reported)</b>\n' + escape(request['deactivated_at'])
     if request['evidence'].get('kind') == 'text':
@@ -173,28 +184,53 @@ def context(order_id, user_id, admin=False):
     from database import SessionLocal
     from models.order import Order
     from models.bot_operations import WarrantyRequest
+    from services.claim_details import recover_delivery_date, missing_metadata, invoice, metadata_invoice
     if admin and user_id not in ADMIN_IDS:
         return None
     with SessionLocal() as db:
-        order = db.get(Order, order_id)
+        order = db.query(Order).filter(Order.id == order_id).with_for_update().first()
         if not order or (not admin and order.telegram_id != user_id):
             return None
         request = db.query(WarrantyRequest).filter_by(order_id=order_id).first()
         mode = policy(order)
+        changed = recover_delivery_date(db,order) if mode != 'skip' else False
+        if request and not request.bot_id:
+            from services.notification_outbox import main_bot_id
+            request.bot_id = main_bot_id()
+            changed = True
+        if request:
+            updated_invoice = metadata_invoice(request.invoice_snapshot,order)
+            if updated_invoice != request.invoice_snapshot:
+                request.invoice_snapshot,changed = updated_invoice,True
+            if request.status=='submitted' and request.request_type=='refund' and request.refund_amount is None and not missing_metadata(order):
+                recovered_quote=refund_quote(order,request.created_at)
+                if recovered_quote and recovered_quote['refund_amount']>0:
+                    request.refund_amount,request.used_days,request.remaining_days = recovered_quote['refund_amount'],recovered_quote['used_days'],recovered_quote['remaining_days']
+                    changed=True
+        if changed:
+            db.commit()
         expires = order.warranty_expires_at if mode == 'warranty' else (
             order.coverage_started_at + timedelta(days=order.subscription_days)
             if mode == 'refund' and order.coverage_started_at else None)
-        return dict(order_id=order_id, error=eligibility(order, order.telegram_id),
+        error = eligibility(order, order.telegram_id)
+        missing = missing_metadata(order)
+        if missing:
+            error = 'The subscription or delivery date needs staff confirmation. You can still submit your issue and proof here.'
+        return dict(order_id=order_id, error=error, metadata_missing=missing,
+                    can_submit=not error or missing, invoice=(request.invoice_snapshot if request else None) or invoice(order),
                     reviewable=order.status == 'completed' and not order.refunded,
                     policy=mode, quote=refund_quote(order), expires=expires,
                     days=order.subscription_days if mode == 'refund' else order.warranty_days,
                     request=None if not request else dict(id=request.id, status=request.status, reason=request.reason,
                          evidence=request.evidence, resolution=request.resolution, admin=request.admin_id,
                          request_type=request.request_type, refund_amount=request.refund_amount,
-                         used_days=request.used_days, remaining_days=request.remaining_days, deactivated_at=request.deactivated_at))
+                         used_days=request.used_days, remaining_days=request.remaining_days, deactivated_at=request.deactivated_at,
+                         issue_type=request.issue_type, product_confirmed=bool(request.product_confirmed),
+                         proof_available=bool(request.proof_mime)))
 
 
-def submit(order_id, user_id, reason, evidence, deactivated_at=None, expected_refund=None):
+def submit(order_id, user_id, reason, evidence, deactivated_at=None, expected_refund=None, *,
+           issue_type='other', product_confirmed=True, proof_bytes=None):
     from config import ADMIN_IDS
     from database import transaction
     from models.order import Order
@@ -202,6 +238,8 @@ def submit(order_id, user_id, reason, evidence, deactivated_at=None, expected_re
     from services.input_forms import text_value, InputError
     from services.order_workflow import record_event
     from services.notification_outbox import enqueue
+    from services.claim_details import ISSUES, proof_mime, recover_delivery_date, missing_metadata, invoice
+    from services.notification_outbox import main_bot_id
     try:
         reason = text_value(reason, 1500, 10)
         if deactivated_at is not None:
@@ -214,10 +252,18 @@ def submit(order_id, user_id, reason, evidence, deactivated_at=None, expected_re
             evidence = {'kind': 'photo', 'file_id': text_value(evidence.get('file_id'), 500)}
     except InputError as error:
         return str(error)
+    if issue_type not in ISSUES or product_confirmed is not True:
+        return 'Confirm the purchased product and select the issue first.'
+    try:
+        mime = proof_mime(proof_bytes) if proof_bytes is not None else None
+    except ValueError as error:
+        return str(error)
     with transaction() as db:
         order = db.query(Order).filter(Order.id == order_id).with_for_update().first()
+        if order and order.telegram_id == user_id and policy(order) != 'skip':
+            recover_delivery_date(db,order)
         error = eligibility(order, user_id)
-        if error:
+        if error and not (order and order.telegram_id == user_id and missing_metadata(order)):
             return error
         if db.query(WarrantyRequest.id).filter_by(order_id=order_id).first():
             return 'A claim already exists. Open its status from this order.'
@@ -226,10 +272,17 @@ def submit(order_id, user_id, reason, evidence, deactivated_at=None, expected_re
         if mode == 'refund':
             if evidence['kind'] != 'photo' or not deactivated_at:
                 return 'Add a screenshot of deactivation and when it stopped working.'
-            if expected_refund is not None and str(quote['refund_amount']) != str(expected_refund):
+            if expected_refund is not None and (not quote or str(quote['refund_amount']) != str(expected_refund)):
                 return 'The refund estimate changed. Review the updated estimate and submit again.'
+        import config
+        saved_invoice = invoice(order)
+        saved_invoice.update(referral_commission_rate=str(getattr(config,'REFERRAL_COMMISSION_RATE','.05')),
+                             referral_credit_to_balance=bool(getattr(config,'REFERRAL_CREDIT_TO_BALANCE',True)))
         db.add(WarrantyRequest(order_id=order_id, telegram_id=user_id, reason=reason, evidence=evidence,
                               status='submitted', request_type=mode, deactivated_at=deactivated_at,
+                              issue_type=issue_type, product_confirmed=1, invoice_snapshot=saved_invoice,
+                              delivery_snapshot=order.delivered_account, proof_image=proof_bytes,
+                              proof_mime=mime, bot_id=main_bot_id(),
                               refund_amount=quote['refund_amount'] if quote else None,
                               used_days=quote['used_days'] if quote else None,
                               remaining_days=quote['remaining_days'] if quote else None))
@@ -296,7 +349,9 @@ def _approve_refund(db, order, request, admin_id):
     from services.notification_outbox import enqueue
     import config
     amount = request.refund_amount
-    if amount is None or not amount.is_finite() or not 0 < amount <= Decimal(str(order.amount)):
+    if amount is None:
+        return 'Confirm the saved subscription and delivery date before approving this refund.'
+    if not amount.is_finite() or not 0 < amount <= Decimal(str(order.amount)):
         return 'The saved refund calculation is invalid. No credit was made.'
     # Conditional writes also protect engines that do not honor FOR UPDATE.
     claimed = db.query(WarrantyRequest).filter(WarrantyRequest.id == request.id,
@@ -315,12 +370,15 @@ def _approve_refund(db, order, request, admin_id):
     db.query(User).filter(User.telegram_id == order.telegram_id).update(
         {User.balance: func.coalesce(User.balance, 0) + amount}, synchronize_session=False)
     if buyer.referred_by:
-        rate = Decimal(str(getattr(config, 'REFERRAL_COMMISSION_RATE', '.05')))
+        saved = request.invoice_snapshot or {}
+        rate = Decimal(str(saved.get('referral_commission_rate',getattr(config, 'REFERRAL_COMMISSION_RATE', '.05'))))
+        if not rate.is_finite() or not 0 <= rate <= 1:
+            raise RuntimeError('Invalid saved commission configuration; refund rolled back.')
         commission = (amount * rate).quantize(Decimal('.00000001'), rounding=ROUND_DOWN)
         if commission.is_finite() and commission > 0:
             earnings = func.coalesce(User.referral_earnings, 0)
             values = {User.referral_earnings: case((earnings > commission, earnings - commission), else_=0)}
-            if getattr(config, 'REFERRAL_CREDIT_TO_BALANCE', True):
+            if saved.get('referral_credit_to_balance',getattr(config, 'REFERRAL_CREDIT_TO_BALANCE', True)):
                 values[User.balance] = func.coalesce(User.balance, 0) - commission
             db.query(User).filter(User.telegram_id == buyer.referred_by).update(values, synchronize_session=False)
     request.status, request.admin_id = 'completed', admin_id
@@ -333,6 +391,89 @@ def _approve_refund(db, order, request, admin_id):
     enqueue(db, f'warranty:{order.id}:refund', order.telegram_id,
             f'💸 <b>Order #{order.id} · Refund approved</b>\n{request.resolution}')
     return None
+
+
+def correct_metadata(order_id, admin_id, days, delivered_at, note):
+    from config import ADMIN_IDS
+    from database import transaction
+    from models.order import Order
+    from models.bot_operations import WarrantyRequest
+    from models.admin_audit_log import AdminAuditLog
+    from services.order_workflow import record_event
+    from services.claim_details import metadata_invoice
+    from types import SimpleNamespace
+    if admin_id not in ADMIN_IDS:
+        return 'Access denied.'
+    if not isinstance(days,int) or not 1 <= days <= 3650 or not isinstance(note,str) or not 5 <= len(note.strip()) <= 500:
+        return 'Enter 1–3650 days and a short explanation for the correction.'
+    try:
+        from datetime import timezone
+        started = datetime.fromisoformat(delivered_at.replace('Z','+00:00'))
+        if started.tzinfo:
+            started = started.astimezone(timezone.utc).replace(tzinfo=None)
+    except (AttributeError,TypeError,ValueError):
+        return 'Use a valid delivery date/time in UTC.'
+    with transaction() as db:
+        order = db.query(Order).filter(Order.id == order_id).with_for_update().first()
+        if not order or order.refunded or order.status != 'completed' or policy(order) == 'skip':
+            return 'Only completed, non-refunded orders with a saved policy can be corrected.'
+        request = db.query(WarrantyRequest).filter_by(order_id=order_id).with_for_update().first()
+        if request and request.status != 'submitted':
+            return 'This claim has already been reviewed.'
+        if not order.created_at <= started <= (request.created_at if request else datetime.utcnow()):
+            return 'Delivery must be between purchase and claim submission (or now).'
+        mode = policy(order)
+        quote = refund_quote(SimpleNamespace(aftercare_policy=mode,subscription_days=days,
+                    coverage_started_at=started,amount=order.amount),request.created_at) if request and mode == 'refund' else None
+        if request and mode == 'refund' and (not quote or quote['refund_amount'] <= 0):
+            return 'No refundable amount remains at the saved submission date. Decline the claim with a reason.'
+        order.coverage_started_at = started
+        if mode == 'refund':
+            order.subscription_days = days
+            order.warranty_days,order.warranty_expires_at = 0,None
+        else:
+            order.subscription_days = 0
+            order.warranty_days, order.warranty_expires_at = days, started+timedelta(days=days)
+        if request:
+            request.invoice_snapshot = metadata_invoice(request.invoice_snapshot,order)
+            if quote:
+                request.refund_amount,request.used_days,request.remaining_days = quote['refund_amount'],quote['used_days'],quote['remaining_days']
+        record_event(db,order_id,'aftercare_metadata_confirmed','Team confirmed the subscription and delivery date.',actor_id=admin_id)
+        db.add(AdminAuditLog(admin_telegram_id=admin_id,action='aftercare_metadata',entity_type='order',
+                            entity_id=str(order_id),summary=f'{days} days; delivered {started.isoformat()} UTC; {note.strip()}'[:500]))
+    return None
+
+
+def delivery_details(order_id, user_id, admin=False):
+    from config import ADMIN_IDS
+    from database import SessionLocal
+    from models.order import Order
+    from models.bot_operations import WarrantyRequest
+    if admin and user_id not in ADMIN_IDS:
+        return None
+    with SessionLocal() as db:
+        order = db.get(Order,order_id)
+        if not order or (not admin and order.telegram_id != user_id):
+            return None
+        claim = db.query(WarrantyRequest).filter_by(order_id=order_id).first()
+        return (claim.delivery_snapshot if claim else None) or order.delivered_account or 'No delivery content recorded.'
+
+
+def cache_proof(order_id,user_id,data,admin=False):
+    from config import ADMIN_IDS
+    from database import transaction
+    from models.bot_operations import WarrantyRequest
+    from services.claim_details import proof_mime
+    if admin and user_id not in ADMIN_IDS:
+        return False
+    mime = proof_mime(data)
+    with transaction() as db:
+        claim = db.query(WarrantyRequest).filter_by(order_id=order_id).with_for_update().first()
+        if not claim or (not admin and claim.telegram_id != user_id):
+            return False
+        if not claim.proof_mime:
+            claim.proof_image,claim.proof_mime = data,mime
+    return True
 
 
 def pending(page=0):
