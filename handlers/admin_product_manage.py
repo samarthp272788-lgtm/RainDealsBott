@@ -449,191 +449,53 @@ async def _refresh_manage_panel(callback: CallbackQuery, pid: int):
 
 def _build_product_panel(product: Product):
     delivery_type = (product.delivery_type or "automatic").lower()
-    threshold = (
-        product.low_stock_threshold
-        if product.low_stock_threshold is not None
-        else DEFAULT_LOW_STOCK_THRESHOLD
+    threshold = product.low_stock_threshold if product.low_stock_threshold is not None else DEFAULT_LOW_STOCK_THRESHOLD
+    api_on = getattr(product, "api_enabled", True)
+    description = product.description or "No description"
+    preview = description[:180] + ("…" if len(description) > 180 else "")
+    text = (
+        f"{safe(product.icon or '📦')} <b>{safe(product.name)}</b>\n"
+        f"🆔 #{product.id} · {'🟢 Enabled' if product.is_active else '🔴 Disabled'}\n"
+        f"🏷 <b>Category:</b> {safe(product.category or 'General')}\n\n"
+        f"💰 <b>Price:</b> ${float(product.price or 0):.2f} · 📊 <b>Stock:</b> {product.stock}\n"
+        f"🚚 <b>Delivery:</b> {DELIVERY_LABELS.get(delivery_type, delivery_type)}\n"
+        f"📦 <b>Preorder:</b> {'ON' if product.preorder else 'OFF'} · 🌐 <b>API:</b> {'ON' if api_on else 'OFF'}\n"
+        f"⚠️ <b>Low-stock alert:</b> {threshold}\n"
+        f"{safe(policy_label(product))}\n"
+        f"📦 <b>Bulk pricing:</b> {'Configured' if product.bulk_pricing else 'Base price only'}\n"
     )
-
-    text = f"""
-🆔 <b>ID:</b> {product.id}
-
-📦 <b>Product:</b>
-{safe(product.icon or '📦')} {safe(product.name)}
-
-💰 <b>Base Price:</b>
-${float(product.price or 0):.2f}
-
-📊 <b>Stock:</b>
-{product.stock}
-
-⚠️ <b>Low Stock Alert At:</b>
-{threshold}
-
-🚚 <b>Delivery Type:</b>
-{DELIVERY_LABELS.get(delivery_type, delivery_type)}
-
-📦 <b>Preorder:</b>
-{"🟢 Enabled" if product.preorder else "🔴 Disabled"}
-
-🏷 <b>Category:</b>
-{safe(product.category or 'General')}
-
-<b>Status:</b>
-{"🟢 Enabled" if product.is_active else "🔴 Disabled"}
-
-🌐 <b>Reseller API:</b>
-{"🟢 Enabled" if getattr(product, "api_enabled", True) else "🔴 Disabled"}
-"""
-
-    # Add Provider / Reseller Details if configured
-    reseller_id = getattr(product, "reseller_service_id", None) or getattr(product, "provider_product_id", None)
-    reseller_name = getattr(product, "reseller_name", None)
-    reseller_cost = getattr(product, "reseller_cost", None)
-
+    reseller_id = getattr(product, 'reseller_service_id', None) or getattr(product, 'provider_product_id', None)
+    reseller_name = getattr(product, 'reseller_name', None)
+    reseller_cost = getattr(product, 'reseller_cost', None)
     if reseller_id or reseller_name:
-        cost_display = f"${float(reseller_cost):.2f}" if reseller_cost is not None else "N/A"
-        text += f"""
-🏪 <b>Reseller Provider:</b> {safe(reseller_name or 'Configured Provider')}
-🆔 <b>Provider Product ID:</b> <code>{safe(str(reseller_id))}</code>
-💸 <b>Wholesale Cost:</b> {cost_display}
-"""
+        cost = f"${float(reseller_cost):.2f}" if reseller_cost is not None else 'N/A'
+        text += (f"\n🏪 <b>Provider:</b> {safe(reseller_name or 'Configured Provider')}\n"
+                 f"🆔 <b>Service:</b> <code>{safe(str(reseller_id or 'Not set'))}</code> · <b>Cost:</b> {cost}\n")
+    text += f"\n📝 <b>Description:</b>\n{safe(preview)}\n\nChoose a tile below."
 
-    text += f"\n{_divider('─')}\n"
-    text += "📦 <b>Bulk Pricing:</b>\n"
-
-    if product.bulk_pricing:
-        display = _format_bulk_pricing_display(product.bulk_pricing)
-        if display:
-            text += display + "\n"
-        else:
-            text += "  ❌ <i>Not Available</i>\n"
-    else:
-        text += "  ❌ <i>Not Available</i>\n"
-        text += "  └ All quantities at base price\n"
-
-    text += f"""
-{_divider('─')}
-
-📝 <b>Description:</b>
-
-{safe(product.description or "No description")}
-"""
-
+    from services.warranty import policy
+    mode = policy(product)
+    aftercare = (f"🛡 Warranty: {product.warranty_days}d" if mode == 'warranty' else
+                 f"💸 Refund: {product.subscription_days}d" if mode == 'refund' else '🛡 Aftercare: OFF')
     has_accounts = bool(product.file_content and product.file_content.strip())
 
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✏️ Edit Product Name",
-                    callback_data=f"edit_name_{product.id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🏷 Edit Category",
-                    callback_data=f"edit_category_{product.id}"
-                )
-            ],
-            [InlineKeyboardButton(text=policy_label(product), callback_data=f"warranty_config_{product.id}")],
-            [InlineKeyboardButton(
-                text="🧾 Edit Buyer Information",
-                callback_data=f"edit_required_info_{product.id}"
-            )],
-            [
-                InlineKeyboardButton(
-                    text="🔗 Create Product Link",
-                    callback_data=f"create_product_link_{product.id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="➕ Add Accounts",
-                    callback_data=f"add_accounts_{product.id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="✏️ Edit Accounts" if has_accounts else "✏️ Edit Accounts (empty)",
-                    callback_data=f"edit_accounts_{product.id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔴 Disable" if product.is_active else "🟢 Enable",
-                    callback_data=f"toggle_{product.id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text=(
-                        "🌐 API: 🟢 ON"
-                        if getattr(product, "api_enabled", True)
-                        else "🌐 API: 🔴 OFF"
-                    ),
-                    callback_data=f"toggle_api_{product.id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="💰 Edit Price",
-                    callback_data=f"edit_price_{product.id}"
-                ),
-                InlineKeyboardButton(
-                    text="📦 Edit Stock",
-                    callback_data=f"edit_stock_{product.id}"
-                )
-            ],
-            [InlineKeyboardButton(
-                text="Manual fallback: ON" if product.manual_fallback else "Manual fallback: OFF",
-                callback_data=f"toggle_fallback_{product.id}")],
-            [
-                InlineKeyboardButton(
-                    text=f"🚚 Delivery: {DELIVERY_LABELS.get(delivery_type, delivery_type)}",
-                    callback_data=f"cycle_delivery_{product.id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📦 Preorder: 🟢 ON" if product.preorder else "📦 Preorder: 🔴 OFF",
-                    callback_data=f"toggle_preorder_{product.id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📦 Edit Bulk Pricing" if product.bulk_pricing else "📦 Add Bulk Pricing",
-                    callback_data=f"edit_bulk_{product.id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⚠️ Edit Low Stock Alert",
-                    callback_data=f"edit_threshold_{product.id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📝 Description",
-                    callback_data=f"desc_{product.id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🗑 Delete Product",
-                    callback_data=f"delete_product_{product.id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅ Back",
-                    callback_data="admin_products"
-                )
-            ]
-        ]
-    )
+    def tile(label, action, style='primary'):
+        return InlineKeyboardButton(text=label, callback_data=f'{action}_{product.id}', style=style)
 
-    return text, markup
+    rows = [
+        [tile('✏️ Name', 'edit_name'), tile('🏷 Category', 'edit_category')],
+        [tile('💰 Price', 'edit_price'), tile('📦 Stock', 'edit_stock')],
+        [tile('➕ Add Accounts', 'add_accounts', 'success'), tile('✏️ Edit Accounts' if has_accounts else '✏️ Accounts (empty)', 'edit_accounts')],
+        [tile('🧾 Buyer Details', 'edit_required_info'), tile(aftercare, 'warranty_config')],
+        [tile(DELIVERY_LABELS.get(delivery_type, delivery_type), 'cycle_delivery'), tile('Fallback: ON' if product.manual_fallback else 'Fallback: OFF', 'toggle_fallback')],
+        [tile('🔴 Disable' if product.is_active else '🟢 Enable', 'toggle', 'danger' if product.is_active else 'success'), tile('🌐 API: ON' if api_on else '🌐 API: OFF', 'toggle_api')],
+        [tile('📦 Preorder: ON' if product.preorder else '📦 Preorder: OFF', 'toggle_preorder'), tile('📦 Bulk Pricing', 'edit_bulk')],
+        [tile('⚠️ Stock Alert', 'edit_threshold'), tile('📝 Description', 'desc')],
+        [tile('🔗 Create Product Link', 'create_product_link')],
+        [tile('🗑 Delete Product', 'delete_product', 'danger')],
+        [InlineKeyboardButton(text='⬅ Back', callback_data='admin_products', style='primary')],
+    ]
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ==================================================
