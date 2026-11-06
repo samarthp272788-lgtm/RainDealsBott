@@ -192,13 +192,17 @@ async def customer_action(callback:CallbackQuery,state:FSMContext):
                 buttons.append([Button(text='Open Wallet',callback_data='deposit_start')])
             elif row['kind']=='support':
                 buttons.append([Button(text='Open Support',callback_data='support_ticket')])
+            elif row['kind']=='wallet':
+                buttons.append([Button(text='Open wallet',callback_data='deposit_start')])
             elif row['kind']=='restock':
                 buttons.append([Button(text='Open Shop',callback_data='products_menu')])
+            elif row['kind']=='order' and row.get('order') and row['order'].get('status')=='pending_info':
+                buttons.append([Button(text='🧾 Submit required information',callback_data=f"order_submit_info_{row['order_id']}")])
             elif row['kind'] in ('order','subscription'):
                 buttons.append([Button(text='My Orders',callback_data='orders_menu')])
             buttons.append([Button(text='⬅ Notifications',callback_data=f'ct_inbox_{max(0,int(page))}'),Button(text='Home',callback_data='main_menu')])
             detail=(f"🔔 <b>{escape(row['title'])}</b>\n<i>{row['created_at']:%d %b %Y %H:%M} UTC</i>\n\n"
-                    f"{escape(row['summary'])}")
+                    f"{escape(row.get('content') or row['summary'])}")
             await show(callback,detail,parse_mode='HTML',reply_markup=kb(buttons),replace_media=True)
         elif action=='readall':
             await asyncio.to_thread(inbox.mark_read,user_id,int(value),callback.bot.id)

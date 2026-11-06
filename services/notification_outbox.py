@@ -91,9 +91,13 @@ def enqueue(db, event, chat_id, body, bot_id=None, source_order_id=None, reply_m
     chat_id, unroutable_admin_notice = _normalise_destination(bot_id, chat_id)
     prefix = str(event).lower().split(':', 1)[0]
     category = ('admin' if admin_notice else
+                'broadcast' if prefix == 'broadcast' else
+                'wallet_adjustment' if prefix in ('wallet-adjustment', 'balance-adjustment') else
                 'subscription' if prefix == 'subscription' else
                 'restock' if prefix == 'restock' else
-                'order_progress' if prefix in ('delivery-start', 'manual-delivery', 'order-information', 'order-progress', 'cancel-result') else
+                'order_update' if prefix in ('delivery-start', 'manual-delivery', 'order-information',
+                                             'order-progress', 'order-update', 'order-delivery',
+                                             'required-info', 'order-info-submitted', 'cancel-result', 'upstream') else
                 'refund' if prefix in ('refund', 'manager-refund') or (prefix == 'warranty' and 'refund' in str(event).lower()) else
                 'warranty' if prefix == 'warranty' else
                 'deposit' if prefix.startswith('deposit') else
@@ -102,11 +106,12 @@ def enqueue(db, event, chat_id, body, bot_id=None, source_order_id=None, reply_m
         from services.customer_tools import allows
         if not allows(db, int(chat_id), category):
             return
-    if source_order_id is None and category in ('subscription','order_progress','refund','warranty'):
+    if source_order_id is None and category in ('subscription','order_progress','order_update','refund','warranty'):
         import re
         parts = str(event).split(':')
         order_event = parts[0].lower() in ('subscription','delivery-start','manual-delivery','order-information',
-                                           'order-progress','cancel-result','refund','warranty','manager-refund')
+                                           'order-progress','order-update','order-delivery','required-info',
+                                           'order-info-submitted','cancel-result','upstream','refund','warranty','manager-refund')
         if order_event and len(parts)>1 and parts[1].isdigit():
             source_order_id = int(parts[1])
         else:

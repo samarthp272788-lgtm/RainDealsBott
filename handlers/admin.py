@@ -1795,6 +1795,23 @@ async def send_broadcast(message: Message, state: FSMContext):
             await message.copy_to(chat_id=user_id)
             sent += 1
 
+            # Keep a retrievable inbox entry as well as the original broadcast
+            # message. If inbox persistence fails, do not count the successful
+            # Telegram delivery as a broadcast failure.
+            try:
+                from services.notification_outbox import queue_message
+                broadcast_text = (message.text or message.caption or
+                                  "A new announcement was sent to you. Open the original chat message to view its media and buttons.")
+                await queue_message(
+                    message.bot,
+                    f"broadcast:{message.chat.id}:{message.message_id}:{user_id}",
+                    user_id,
+                    broadcast_text,
+                    parse_mode=None,
+                )
+            except Exception:
+                logger.exception("Could not add broadcast to notification inbox for user %s", user_id)
+
             # Small delay to avoid hitting rate limits
             if i % 5 == 0:
                 await asyncio.sleep(0.1)
@@ -1994,7 +2011,21 @@ async def save_user_balance(message: Message, state: FSMContext):
         if new_balance < Decimal("0"):
             await answer_card(message, f"❌ Balance cannot be negative. Current: {_money(user.balance)}")
             return
+        delta = Decimal(str(new_balance)) - Decimal(str(old_balance))
         user.balance = new_balance
+        if delta:
+            from services.notification_outbox import enqueue
+            direction = "added" if delta > 0 else "removed"
+            changed_amount = f"{abs(delta):.8f}".rstrip("0").rstrip(".") or "0"
+            resulting_balance = f"{Decimal(str(new_balance)):.8f}".rstrip("0").rstrip(".") or "0"
+            enqueue(
+                db,
+                f"wallet-adjustment:{user.telegram_id}:{uuid.uuid4().hex}",
+                user.telegram_id,
+                f"💰 An administrator {direction} ${changed_amount} "
+                f"{'to' if delta > 0 else 'from'} your wallet balance. "
+                f"Your new balance is ${resulting_balance}.",
+            )
         db.commit()
         await answer_card(message,
             f"✅ <b>Balance updated</b>\n\n👤 {safe(user.full_name)}\n"

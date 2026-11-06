@@ -43,6 +43,15 @@ def _kind(row, plain):
     lower = plain.lower()
     if category == 'admin' or 'admin →' in lower:
         return 'admin'
+    if category == 'broadcast':
+        return 'broadcast'
+    if category == 'wallet_adjustment' or category in ('wallet', 'balance'):
+        return 'wallet'
+    if category in ('order_progress', 'order_update') and any(
+            marker in lower for marker in ('refund', 'reimbursed', 'returned to your bot balance')):
+        return 'refund'
+    if category in ('order_progress', 'order_update'):
+        return 'order'
     if category in ('refund', 'warranty') or 'refund' in lower or 'warranty' in lower or 'replacement' in lower:
         if 'refund' in lower:
             return 'refund'
@@ -55,7 +64,7 @@ def _kind(row, plain):
         return 'restock'
     if category == 'subscription' or 'subscription' in lower:
         return 'subscription'
-    if category == 'order_progress' or 'order' in lower or 'delivery' in lower or 'delivered' in lower:
+    if 'order' in lower or 'delivery' in lower or 'delivered' in lower:
         return 'order'
     return 'account'
 
@@ -88,6 +97,16 @@ def _summary(kind, plain, order=None, claim=None):
         return 'Your payment or invoice has an update. Open Wallet to review it.'
     if kind == 'support':
         return 'Support has replied or updated your ticket. Open Support to continue the conversation.'
+    if kind == 'wallet':
+        match = re.search(r'(?i)(added|increased|credited|removed|decreased|reduced)\s+(?:by\s+)?\$?([0-9]+(?:\.[0-9]{1,8})?)', plain)
+        if match:
+            verb = 'added' if match.group(1).lower() in ('added', 'increased', 'credited') else 'removed'
+            preposition = 'to' if verb == 'added' else 'from'
+            return f'An administrator {verb} ${match.group(2)} {preposition} your wallet balance.'
+        return 'An administrator updated your wallet balance.'
+    if kind == 'broadcast':
+        return (f'📢 {plain[:190]}' if plain else
+                'A new announcement was sent to you. Open the original chat message to view its media and buttons.')
     if kind == 'restock':
         return 'A product you follow may be available again. Open the shop to check current stock.'
     if kind == 'subscription':
@@ -95,8 +114,13 @@ def _summary(kind, plain, order=None, claim=None):
             return 'Your subscription has ended. Open the order to review it.'
         return 'Your subscription is nearing its end. Open the order for the saved expiry date.'
     if kind == 'order':
-        if 'information' in lower or 'submit' in lower:
+        if (('information' in lower or 'details' in lower)
+                and ('received' in lower or 'submitted' in lower)):
+            return 'Your requested information has been received.'
+        if any(word in lower for word in ('required information', 'information is needed', 'submit information', 'waiting for customer information')):
             return 'Information is needed for this order. Open it to submit the requested details.'
+        if 'ready' in lower and ('delivery' in lower or 'start the delivery bot' in lower):
+            return 'Your order is ready for delivery. Open My Orders to continue.'
         if 'deliver' in lower or 'completed' in lower:
             return 'Your order delivery status changed. Open the order to view delivery details.'
         return 'Your order status changed. Open the order to see the latest details.'
@@ -107,6 +131,9 @@ def _view_row(row, order=None, claim=None):
     plain = _plain(row.body)
     kind = _kind(row, plain)
     oid = _order_id(row, plain)
+    content = plain if kind in ('broadcast', 'wallet') else None
+    if kind == 'broadcast' and content and len(content) > 3500:
+        content = content[:3500].rstrip() + "…\n\nOpen the original broadcast message to view the full content."
     order_text = None
     if order:
         product_name = (order.product_name or 'Product').strip()
@@ -132,12 +159,15 @@ def _view_row(row, order=None, claim=None):
         'support': '💬 Support update',
         'restock': '📦 Restock alert',
         'subscription': '⏳ Subscription reminder',
+        'wallet': '💰 Balance update',
+        'broadcast': '📢 Announcement',
         'account': '👤 Account update',
     }.get(kind, '🔔 RainDeals update')
     return dict(
         id=row.id,
         title=title[:120],
         summary=_summary(kind, plain, order, claim),
+        content=content,
         kind=kind,
         order_id=order.id if order else oid,
         created_at=row.created_at,

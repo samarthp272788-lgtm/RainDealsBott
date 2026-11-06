@@ -27,7 +27,7 @@ from models.product import Product
 from models.order_requirement_submission import OrderRequirementSubmission
 from services.order_workflow import record_event
 from services.warranty import start_coverage
-from services.notification_outbox import queue_message
+from services.notification_outbox import enqueue, queue_message
 from services.input_forms import field_value, is_cancel, InputError
 from states.product_states import OrderRequirementStates
 import config
@@ -644,6 +644,14 @@ def _save_order_requirement_submission(order_id: int, telegram_id: int, values: 
         if order.status == 'completed':
             start_coverage(order)
             record_event(db, order.id, 'completed', 'Order completed.')
+        if order.status == 'completed':
+            notice = "The information for your order was received and delivery is complete. Open My Orders to view the result."
+        elif order.status == 'preorder':
+            notice = "The information for your preorder was received. Your order is waiting for stock; check My Orders for updates."
+        else:
+            notice = "The information for your order was received. Your order is waiting for fulfillment; check My Orders for updates."
+        enqueue(db, f"order-info-submitted:{order.id}", order.telegram_id, notice,
+                source_order_id=order.id)
         db.commit()
         return {"status": order.status, "delivery": order.delivered_account, "product_name": order.product_name}
     except Exception:

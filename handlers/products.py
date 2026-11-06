@@ -35,7 +35,7 @@ from services.checkout_actions import confirmation_token, action_key, claim_chec
 from services.order_workflow import record_event
 from services.warranty import start_coverage, policy_snapshot, policy_label
 from services.input_forms import quantity as parse_quantity, is_cancel, InputError
-from services.notification_outbox import enqueue_once
+from services.notification_outbox import enqueue, enqueue_once
 
 # Reseller Manager & Reseller Config imports
 try:
@@ -2329,6 +2329,23 @@ def _do_purchase(
         elif status == 'pending_manual':
             record_event(db, order.id, 'manual_pending', f'{plan.manual_quantity} unit(s) awaiting team delivery.')
 
+        if status == "pending_info":
+            enqueue(db, f"required-info:{order.id}", user.telegram_id,
+                    "Your order needs the requested information before delivery. Open Notifications and tap Submit required information.",
+                    source_order_id=order.id)
+        elif status == "completed":
+            enqueue(db, f"order-delivery:{order.id}", user.telegram_id,
+                    "Your order has been delivered. Open My Orders to view the delivery details.",
+                    source_order_id=order.id)
+        elif status == "pending_manual":
+            enqueue(db, f"order-update:{order.id}:manual-pending", user.telegram_id,
+                    "Your order is confirmed and waiting for manual fulfillment. Open My Orders to check its status.",
+                    source_order_id=order.id)
+        elif status == "preorder":
+            enqueue(db, f"order-update:{order.id}:preorder", user.telegram_id,
+                    "Your preorder is confirmed and is waiting for stock. Open My Orders to check its status.",
+                    source_order_id=order.id)
+
         referral_commission_paid = None
         if not is_preorder_order and user.referred_by:
             referrer = db.query(User).filter(User.telegram_id == user.referred_by).with_for_update().first()
@@ -2557,6 +2574,11 @@ async def _do_reseller_purchase(
             record_event(db, order.id, 'created', 'Supplier order received.', actor_id=telegram_id)
             record_event(db, order.id, 'supplier_pending' if is_async_provider_order else 'completed',
                          'Supplier is processing the order.' if is_async_provider_order else 'Supplier delivery completed.')
+
+            enqueue(db, f"order-update:{order.id}:supplier", u.telegram_id,
+                    "Your supplier order is being processed. Open My Orders to check its status." if is_async_provider_order
+                    else "Your order has been delivered. Open My Orders to view the delivery details.",
+                    source_order_id=order.id)
 
 
             referral_commission_paid = None

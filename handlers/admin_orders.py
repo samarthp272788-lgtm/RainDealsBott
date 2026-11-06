@@ -770,15 +770,21 @@ async def deliver_order_finish(message: Message, state: FSMContext):
                 )
                 return
             waiting = delivery_result.get("status") == "waiting_for_start"
-            if waiting and not result["is_api_order"] and config.DELIVERY_BOT_USERNAME:
+            if not result["is_api_order"]:
                 try:
-                    await queue_message(message.bot, f"delivery-start:{order_id}",
-                        destination_id,
-                        "📦 Your order is ready. Start the Delivery Bot to receive it here:\n"
-                        f"https://t.me/{escape(config.DELIVERY_BOT_USERNAME)}?start=order_{order_id}",
-                    )
+                    if waiting and config.DELIVERY_BOT_USERNAME:
+                        notice = ("📦 Your order is ready. Start the Delivery Bot to receive it here:\n"
+                                  f"https://t.me/{escape(config.DELIVERY_BOT_USERNAME)}?start=order_{order_id}")
+                        event = f"delivery-start:{order_id}"
+                    elif waiting:
+                        notice = "Your order is ready and waiting for delivery. Open My Orders to review the status."
+                        event = f"order-update:{order_id}:delivery-waiting"
+                    else:
+                        notice = "Your order was delivered. Open My Orders to view the delivery details."
+                        event = f"order-delivery:{order_id}"
+                    await queue_message(message.bot, event, destination_id, notice)
                 except Exception:
-                    logger.info("Could not send delivery-bot start link to buyer %s", destination_id)
+                    logger.info("Could not add delivery update to buyer inbox %s", destination_id, exc_info=True)
             status_text = (
                 f"⏳ Delivery is queued for {recipient_label}. The Delivery Bot will send it "
                 "automatically after the recipient opens it and sends /start."
