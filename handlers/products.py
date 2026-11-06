@@ -1898,6 +1898,10 @@ async def product_info(
         buttons.append([
             InlineKeyboardButton(text=button_text, callback_data=f"select_qty_{product_id}", style=button_style)
         ])
+        buttons.append([
+            InlineKeyboardButton(text="🛒 Add to cart",callback_data=f"ct_pick_{product_id}",style="primary"),
+            InlineKeyboardButton(text="View cart",callback_data="ct_cart",style="primary"),
+        ])
         if not real_stock_available:
             buttons.append([
                 InlineKeyboardButton(

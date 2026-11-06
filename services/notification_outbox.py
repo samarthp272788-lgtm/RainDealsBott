@@ -35,6 +35,19 @@ def legacy_admin_alert(row):
             or '<b>New Support Ticket #' in row.body)
 
 
+def _normalise_destination(bot_id, chat_id):
+    """Keep main-bot admin alerts out of private admin chats."""
+    unroutable = False
+    if int(bot_id) == main_bot_id() and str(chat_id).isdigit():
+        from config import ADMIN_IDS
+        if int(chat_id) in ADMIN_IDS:
+            destination = admin_destination()
+            if destination:
+                return destination, False
+            unroutable = True
+    return str(chat_id), unroutable
+
+
 def private_admin_alert_cards(user_id, bot_id):
     """Known old alerts can be cleaned without touching customer receipts."""
     from config import ADMIN_IDS
@@ -53,24 +66,25 @@ def reroute_pending_admin_alerts(bot_id):
     from database import transaction
     from models.bot_operations import NotificationJob
     destination = admin_destination()
-    if not destination:
-        return
     with transaction() as db:
         rows = db.query(NotificationJob).filter(NotificationJob.bot_id == bot_id,
                     NotificationJob.chat_id.in_([str(i) for i in ADMIN_IDS]),
                     NotificationJob.status.in_(['queued', 'failed'])).order_by(NotificationJob.id).limit(500).with_for_update().all()
         for row in rows:
-            if legacy_admin_alert(row):
-                digest = hashlib.sha256((row.body+str(row.reply_markup)).encode()).hexdigest()
-                enqueue(db, f'reroute-admin:{digest}', destination, row.body, bot_id, reply_markup=row.reply_markup)
-                db.flush()  # The next old per-admin copy must see this unique notification.
-                row.status = 'resolved'
-                row.error_code = 'moved_to_admin_notify'
+            if not destination:
+                row.status, row.error_code = 'failed', 'admin_notify_unconfigured'
+                continue
+            digest = hashlib.sha256((row.body+str(row.reply_markup)).encode()).hexdigest()
+            enqueue(db, f'reroute-admin:{digest}', destination, row.body, bot_id, reply_markup=row.reply_markup)
+            db.flush()  # The next old per-admin copy must see this unique notification.
+            row.status = 'resolved'
+            row.error_code = 'moved_to_admin_notify'
 
 
 def enqueue(db, event, chat_id, body, bot_id=None, source_order_id=None, reply_markup=None):
     from models.bot_operations import NotificationJob
     bot_id = bot_id or main_bot_id()
+    chat_id, unroutable_admin_notice = _normalise_destination(bot_id, chat_id)
     category = ('subscription' if str(event).startswith('subscription:') else
                 'restock' if str(event).startswith('restock:') else
                 'order_progress' if str(event).startswith(('delivery-start:', 'order-progress:')) else None)
@@ -82,11 +96,15 @@ def enqueue(db, event, chat_id, body, bot_id=None, source_order_id=None, reply_m
     # Callers hold their originating order/request lock. Unique key is an extra backstop.
     if db.query(NotificationJob.id).filter_by(event_key=key).first():
         return
+    if unroutable_admin_notice:
+        logger.warning('Admin notification retained in failed outbox: Admin Notify destination is not configured')
     if reply_markup is not None:
         from aiogram.types import InlineKeyboardMarkup
         reply_markup = InlineKeyboardMarkup.model_validate(reply_markup).model_dump(mode='json', exclude_none=True)
     db.add(NotificationJob(event_key=key, bot_id=bot_id, chat_id=str(chat_id), body=body,
-                           status='queued', attempts=0, next_attempt_at=datetime.utcnow(), source_order_id=source_order_id,
+                           status='failed' if unroutable_admin_notice else 'queued', attempts=0, next_attempt_at=datetime.utcnow(),
+                           error_code='admin_notify_unconfigured' if unroutable_admin_notice else None,
+                           source_order_id=source_order_id,
                            reply_markup=reply_markup, category=category))
 
 
@@ -95,11 +113,12 @@ def enqueue_once(event, chat_id, body, bot_id=None, reply_markup=None):
     from sqlalchemy.exc import IntegrityError
     from models.bot_operations import NotificationJob
     bot_id = bot_id or main_bot_id()
+    normalized_chat_id, _ = _normalise_destination(bot_id, chat_id)
     try:
         with transaction() as db:
             enqueue(db, event, chat_id, body, bot_id, reply_markup=reply_markup)
     except IntegrityError:
-        key = hashlib.sha256(f'{bot_id}:{event}:{chat_id}'.encode()).hexdigest()
+        key = hashlib.sha256(f'{bot_id}:{event}:{normalized_chat_id}'.encode()).hexdigest()
         with SessionLocal() as db:
             if not db.query(NotificationJob.id).filter_by(event_key=key).first():
                 raise
@@ -108,6 +127,9 @@ def enqueue_once(event, chat_id, body, bot_id=None, reply_markup=None):
 async def queue_message(bot, event, chat_id, text, reply_markup=None, parse_mode='HTML'):
     if parse_mode not in ('HTML', None):
         raise ValueError('The notification outbox accepts HTML messages only.')
+    if parse_mode is None:
+        from html import escape
+        text = escape(str(text))
     await asyncio.to_thread(enqueue_once, event, chat_id, text, bot.id, reply_markup)
 
 
@@ -129,6 +151,10 @@ def claim_next(bot_id):
             if not allows(db, int(row.chat_id), row.category):
                 row.status, row.error_code = 'resolved', 'preference_muted'
                 return {'skipped': True}
+        if bot_id==main_bot_id() and str(row.chat_id).isdigit() and int(row.chat_id)>0:
+            # The shop's private alerts live in Notifications, not extra chat cards.
+            row.status, row.error_code = 'inbox', None
+            return {'skipped':True,'inbox_user':int(row.chat_id)}
         attempts = row.attempts + 1
         claimed = db.query(Job).filter(Job.id == row.id, Job.status == 'queued').update(
             {Job.status: 'sending', Job.claimed_at: datetime.utcnow(), Job.attempts: attempts}, synchronize_session=False)
@@ -216,6 +242,9 @@ async def send_one(bot):
     if not job:
         return False
     if job.get('skipped'):
+        if job.get('inbox_user'):
+            from services.notification_inbox import refresh_home_badge
+            await refresh_home_badge(bot,job['inbox_user'])
         return True
     try:
         from aiogram.types import InlineKeyboardMarkup

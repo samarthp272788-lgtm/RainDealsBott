@@ -10,7 +10,6 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from html import escape
 
-from aiogram.exceptions import TelegramAPIError
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import func, or_
@@ -615,8 +614,10 @@ async def order_refund(request: Request, order_id: int):
         return RedirectResponse(f"/admin/orders?notice={core.quote(result['error'])}", status_code=303)
     buyer_id, amount = result["buyer_id"], result["amount"]
     try:
-        await request.app.state.main_bot.send_message(buyer_id, f"Your order was refunded. ${amount:.2f} returned to your balance.")
-    except TelegramAPIError:
+        from services.notification_outbox import queue_message
+        await queue_message(request.app.state.main_bot, f"manager-refund:{order_id}", buyer_id,
+                            f"Your order was refunded. ${amount:.2f} returned to your balance.")
+    except Exception:
         core.logger.exception("Refund notification failed for order %s", order_id)
     return RedirectResponse("/admin/orders?notice=Refund+completed", status_code=303)
 
@@ -769,7 +770,11 @@ async def ticket_respond(request: Request, ticket_id: int):
     finally:
         db.close()
     try:
-        await request.app.state.main_bot.send_message(telegram_id, "Support replied to your ticket:\n\n" + response_text)
-    except TelegramAPIError:
+        from services.notification_outbox import queue_message
+        response_key = hashlib.sha256(response_text.encode("utf-8")).hexdigest()[:20]
+        await queue_message(request.app.state.main_bot, f"manager-ticket:{ticket_id}:{response_key}",
+                            telegram_id, "Support replied to your ticket:\n\n" + response_text,
+                            parse_mode=None)
+    except Exception:
         core.logger.exception("Ticket reply notification failed for ticket %s", ticket_id)
     return RedirectResponse(f"/tickets?notice=Reply+saved", status_code=303)

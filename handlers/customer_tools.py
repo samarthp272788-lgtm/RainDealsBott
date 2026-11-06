@@ -1,7 +1,8 @@
 """Compact cart, wallet, order aftercare and customer notification controls."""
 import asyncio
-from html import escape
+from html import escape, unescape
 from io import BytesIO
+import re
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -10,6 +11,7 @@ from aiogram.types import CallbackQuery, Message, InlineKeyboardButton as Button
 
 from config import ADMIN_IDS
 from services import cart, customer_tools as tools
+from services import notification_inbox as inbox
 from utils.ui import answer_card, show, update_card, track_card
 
 router = Router()
@@ -30,6 +32,29 @@ def kb(rows):
 
 def home():
     return kb([[Button(text='🏠 Home',callback_data='main_menu')]])
+
+
+async def notifications_screen(target,page=0):
+    data=await asyncio.to_thread(inbox.listing,target.from_user.id,page,target.bot.id)
+    text=f"🔔 <b>Notifications</b> · {data['unread']} unread\n\n"
+    text+='Updates appear here. Tap one to read it and open its related action.\n'
+    buttons=[]
+    for row in data['rows']:
+        preview=' '.join(unescape(re.sub(r'<[^>]*>','',row['body'])).split())
+        marker='🔴' if row['unread'] else '✓'
+        text+=f"\n{marker} {escape(preview[:120])}\n<i>{row['created_at']:%d %b %H:%M} UTC</i>\n"
+        buttons.append([Button(text=f"{marker} {preview[:45] or 'Notification'}",callback_data=f"ct_notice_{row['id']}_{data['page']}")])
+    if not data['rows']:
+        text+='\nNo notifications yet.'
+    pagination=[]
+    if data['page']: pagination.append(Button(text='‹ Previous',callback_data=f"ct_inbox_{data['page']-1}"))
+    if data['has_more']: pagination.append(Button(text='Next ›',callback_data=f"ct_inbox_{data['page']+1}"))
+    if pagination: buttons.append(pagination)
+    if data['unread']:
+        buttons.append([Button(text='✓ Mark all as read',callback_data=f"ct_readall_{data['newest_id']}")])
+    buttons.append([Button(text='⚙ Preferences',callback_data='ct_preferences'),Button(text='Refresh',callback_data=f"ct_inbox_{data['page']}")])
+    buttons.append([Button(text='🧾 Wallet statement',callback_data='ct_wallet_0'),Button(text='🏠 Home',callback_data='main_menu')])
+    await answer_card(target,text,parse_mode='HTML',reply_markup=kb(buttons),replace_media=True)
 
 
 async def cart_screen(target,page=0,notice=''):
@@ -114,10 +139,14 @@ async def customer_action(callback:CallbackQuery,state:FSMContext):
                 await asyncio.to_thread(cart.clear,user_id)
             await state.clear()
             await cart_screen(callback,int(value) if action=='page' else 0,notice)
-        elif action=='qty':
+        elif action in ('qty','pick'):
+            await state.clear()
             await state.set_state(CustomerInput.quantity)
             await state.update_data(customer_product=int(value))
-            await show(callback,'Send the quantity (1–1,000), or 0 to remove.',state=state,reply_markup=kb([[Button(text='Cancel',callback_data='ct_cart')]]))
+            prompt=('🛒 Add to cart\n\nSend the quantity to keep in your cart (1–1,000). '
+                    'If this product is already in the cart, this replaces its quantity. No payment is taken.'
+                    if action=='pick' else 'Send the quantity (1–1,000), or 0 to remove.')
+            await show(callback,prompt,state=state,reply_markup=kb([[Button(text='Cancel',callback_data='ct_cart'),Button(text='Product',callback_data=f'product_{int(value)}')]]))
         elif action=='review':
             token,lines,total=await asyncio.to_thread(cart.prepare,user_id)
             text='🧾 <b>Review checkout</b>\n\n'+'\n'.join(f"{escape(x['name'][:60])} × {x['quantity']} · ${x['total']}" for x in lines)
@@ -130,12 +159,26 @@ async def customer_action(callback:CallbackQuery,state:FSMContext):
             await checkout_result(callback,value)
         elif action=='result':
             await checkout_result(callback,value)
+        elif action=='inbox':
+            await state.clear()
+            await notifications_screen(callback,max(0,int(value or '0')))
+        elif action=='notice':
+            job_id,page=(value.split('_',1)+['0'])[:2] if '_' in value else (value,'0')
+            row=await asyncio.to_thread(inbox.read,user_id,int(job_id),callback.bot.id)
+            markup=InlineKeyboardMarkup.model_validate(row['reply_markup']).inline_keyboard if row['reply_markup'] else []
+            buttons=[list(r) for r in markup]
+            buttons.append([Button(text='⬅ Notifications',callback_data=f'ct_inbox_{max(0,int(page))}'),Button(text='Home',callback_data='main_menu')])
+            await show(callback,f"🔔 <b>Notification</b>\n<i>{row['created_at']:%d %b %Y %H:%M} UTC</i>\n\n"+row['body'],parse_mode='HTML',reply_markup=kb(buttons),replace_media=True)
+        elif action=='readall':
+            await asyncio.to_thread(inbox.mark_read,user_id,int(value),callback.bot.id)
+            await notifications_screen(callback)
         elif action in ('preferences','toggle'):
+            await state.clear()
             prefs=await asyncio.to_thread(tools.preferences,user_id,value if action=='toggle' else None)
             buttons=[[Button(text=f"{'✅' if enabled else '◻'} {label}",callback_data=f'ct_toggle_{key}')]
                      for key,label in [('restock','Restock alerts'),('order_progress','Order progress'),('subscription','Subscription reminders')] for enabled in [prefs[key]]]
-            buttons+=[[Button(text='🧾 Wallet statement',callback_data='ct_wallet_0'),Button(text='Home',callback_data='main_menu')]]
-            await show(callback,'⚙ <b>Notification preferences</b>\n\nPayment receipts, completed deliveries and security messages remain enabled.',parse_mode='HTML',reply_markup=kb(buttons))
+            buttons+=[[Button(text='⬅ Notifications',callback_data='ct_inbox'),Button(text='Home',callback_data='main_menu')]]
+            await show(callback,'⚙ <b>Notification preferences</b>\n\nChoose optional updates for your inbox. Payment receipts, completed deliveries and security messages remain enabled.',parse_mode='HTML',reply_markup=kb(buttons))
         elif action=='wallet':
             page=max(0,int(value))
             balance,rows,more=await asyncio.to_thread(tools.wallet_statement,user_id,page)

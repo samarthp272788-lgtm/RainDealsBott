@@ -235,10 +235,12 @@ def _load_main_menu_data(
         user = db.query(User).filter(User.telegram_id == telegram_id).first()
         if not user:
             return None
+        from services.notification_inbox import unread_count
         return {
             "text": _build_start_welcome(user, full_name, telegram_id, username, bot_username),
             "chat_id": user.home_menu_chat_id,
             "message_id": user.home_menu_message_id,
+            "unread_notifications": unread_count(db,telegram_id),
         }
     finally:
         db.close()
@@ -350,7 +352,8 @@ async def main_menu_cb(callback: CallbackQuery, state: FSMContext):
         await answer_card(callback, "User record not found. Send /start to register again.")
         return
 
-    keyboard = get_admin_main_menu() if callback.from_user.id in ADMIN_IDS else get_main_menu()
+    unread = menu_data.get("unread_notifications",0)
+    keyboard = get_admin_main_menu(unread) if callback.from_user.id in ADMIN_IDS else get_main_menu(unread)
     target_chat_id = int(menu_data.get("chat_id") or callback.message.chat.id)
     target_message_id = int(menu_data.get("message_id") or callback.message.message_id)
     menu_card = await update_card(
@@ -588,8 +591,11 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
     user.username = username
     user.full_name = full_name
     text = _build_start_welcome(user, full_name, telegram_id, username, bot_username)
-    keyboard = get_admin_main_menu() if is_admin else get_main_menu()
-    deposit_action = await asyncio.to_thread(_load_start_deposit_action, telegram_id)
+    from services.notification_inbox import count as notification_count
+    unread,deposit_action = await asyncio.gather(
+        asyncio.to_thread(notification_count,telegram_id),
+        asyncio.to_thread(_load_start_deposit_action,telegram_id))
+    keyboard = get_admin_main_menu(unread) if is_admin else get_main_menu(unread)
     if deposit_action:
         if deposit_action["kind"] == "status":
             label = f"⏳ Payment checking · #{deposit_action['id']}"

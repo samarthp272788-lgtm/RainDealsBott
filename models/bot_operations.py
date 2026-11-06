@@ -36,6 +36,7 @@ class NotificationJob(Base):
     __table_args__ = (
         Index('ix_notification_destination_backoff', 'bot_id', 'chat_id', 'status', 'error_code', 'next_attempt_at'),
         Index('ix_notification_delivery_queue', 'bot_id', 'status', 'next_attempt_at', 'id'),
+        Index('ix_notification_inbox', 'bot_id', 'chat_id', 'inbox_read_at', 'id'),
     )
     id = Column(Integer, primary_key=True, autoincrement=True)
     event_key = Column(String(64), nullable=False, unique=True)
@@ -44,6 +45,7 @@ class NotificationJob(Base):
     body = Column(Text, nullable=False)
     reply_markup = Column(JSON, nullable=True)
     category = Column(String(24), nullable=True)
+    inbox_read_at = Column(DateTime, nullable=True)
     status = Column(String(20), nullable=False, default='queued', index=True)
     attempts = Column(Integer, nullable=False, default=0)
     next_attempt_at = Column(DateTime, nullable=False, server_default=func.now())

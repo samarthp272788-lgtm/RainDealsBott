@@ -1026,7 +1026,8 @@ async def admin_ticket_action(callback: CallbackQuery):
                         ]
                     )
 
-                    await callback.bot.send_message(
+                    from services.notification_outbox import queue_message
+                    await queue_message(callback.bot,f"ticket-status:{ticket_id}:{new_status}",
                         user.telegram_id,
                         notify_text,
                         reply_markup=notify_markup

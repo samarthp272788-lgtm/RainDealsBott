@@ -12,13 +12,15 @@ from models.bot_operations import WarrantyRequest, NotificationJob, ProviderHeal
 from models.api_key import ApiKey, ApiOrder
 
 
-def _ensure_column(connection, table: str, column: str, definition: str) -> None:
+def _ensure_column(connection, table: str, column: str, definition: str) -> bool:
     exists = connection.execute(text(
         "SELECT 1 FROM information_schema.COLUMNS "
         "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=:table AND COLUMN_NAME=:column"
     ), {"table": table, "column": column}).first()
     if not exists:
         connection.execute(text(f"ALTER TABLE `{table}` ADD COLUMN `{column}` {definition}"))
+        return True
+    return False
 
 
 def _ensure_unique_columns(connection, table, columns, name):
@@ -59,6 +61,10 @@ def ensure_order_requirements_schema() -> None:
         ],
     )
     with engine.begin() as connection:
+        if _ensure_column(connection,'bot_notification_jobs','inbox_read_at','DATETIME NULL'):
+            connection.execute(text("UPDATE bot_notification_jobs SET inbox_read_at=UTC_TIMESTAMP() "
+                                    "WHERE status IN ('sent','uncertain','resolved','failed')"))
+        _ensure_index(connection,'bot_notification_jobs',['bot_id','chat_id','inbox_read_at','id'],'ix_notification_inbox')
         _ensure_column(connection, 'bot_notification_jobs', 'category', 'VARCHAR(24) NULL')
         _ensure_column(connection, 'orders', 'received_at', 'DATETIME NULL')
         _ensure_column(connection, 'orders', 'subscription_expires_at', 'DATETIME NULL')

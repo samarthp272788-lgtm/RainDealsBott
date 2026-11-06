@@ -1,7 +1,8 @@
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 
-def get_main_menu() -> InlineKeyboardMarkup:
+def get_main_menu(unread_count=0) -> InlineKeyboardMarkup:
+    from services.notification_inbox import badge
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -11,7 +12,7 @@ def get_main_menu() -> InlineKeyboardMarkup:
                     style="primary",
                 )
             ],
-            [InlineKeyboardButton(text="🛒 Cart", callback_data="ct_cart", style="primary"), InlineKeyboardButton(text="⚙ Preferences", callback_data="ct_preferences")],
+            [InlineKeyboardButton(text="🛒 Cart", callback_data="ct_cart", style="primary"), InlineKeyboardButton(text=badge(unread_count), callback_data="ct_inbox", style="primary")],
             [
                 InlineKeyboardButton(
                     text="💳 Wallet",
@@ -66,7 +67,8 @@ def get_main_menu() -> InlineKeyboardMarkup:
     )
 
 
-def get_admin_main_menu() -> InlineKeyboardMarkup:
+def get_admin_main_menu(unread_count=0) -> InlineKeyboardMarkup:
+    from services.notification_inbox import badge
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -76,7 +78,7 @@ def get_admin_main_menu() -> InlineKeyboardMarkup:
                     style="primary",
                 )
             ],
-            [InlineKeyboardButton(text="🛒 Cart", callback_data="ct_cart", style="primary"), InlineKeyboardButton(text="⚙ Preferences", callback_data="ct_preferences")],
+            [InlineKeyboardButton(text="🛒 Cart", callback_data="ct_cart", style="primary"), InlineKeyboardButton(text=badge(unread_count), callback_data="ct_inbox", style="primary")],
             [
                 InlineKeyboardButton(
                     text="💳 Wallet",
