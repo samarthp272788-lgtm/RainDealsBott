@@ -120,7 +120,7 @@ async def render_warranty(target, order_id, admin=False):
         return
     request = ctx['request']
     refund = ctx['policy'] == 'refund'
-    text = warranty.summary_text(ctx)
+    text = warranty.summary_text(ctx, admin=admin)
     buttons = []
     buttons.append([Button(text='🧾 Order / product invoice',callback_data=f'warranty_invoice_{order_id}'),
                     Button(text='📦 Delivered information',callback_data=f'warranty_delivery_{order_id}')])
@@ -382,7 +382,7 @@ async def warranty_action(callback: CallbackQuery, state: FSMContext):
         if ctx and ctx['request'] and ctx['request']['request_type'] == 'refund':
             await callback.answer()
             await show(callback, 'Confirm you checked the deactivation screenshot and reported dates.\n\n'
-                       + warranty.summary_text(ctx)+'\n\nApproval credits the saved amount to the buyer wallet once.', parse_mode='HTML',
+                       + warranty.summary_text(ctx, admin=True)+'\n\nApproval credits the saved amount to the buyer wallet once.', parse_mode='HTML',
                        reply_markup=keyboard([[Button(text='Proof checked · Approve refund', callback_data=f'warranty_refundapprove_{order_id}', style='success')],
                                               [Button(text='Back', callback_data=f'warranty_admin_{order_id}')]]), replace_media=True)
             return

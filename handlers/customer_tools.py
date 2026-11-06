@@ -1,8 +1,8 @@
 """Compact cart, wallet, order aftercare and customer notification controls."""
 import asyncio
-from html import escape, unescape
+from html import escape
 from io import BytesIO
-import re
+from decimal import Decimal, ROUND_HALF_UP
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -34,21 +34,29 @@ def home():
     return kb([[Button(text='🏠 Home',callback_data='main_menu')]])
 
 
+def _cart_display_amount(value):
+    """Short display only; database and checkout amounts stay full precision."""
+    amount = Decimal(str(value or 0))
+    rounded = amount.quantize(Decimal('0.001'), rounding=ROUND_HALF_UP)
+    if amount and rounded == 0:
+        return f'{amount:.8f}'.rstrip('0').rstrip('.')
+    return f'{rounded:.3f}'.rstrip('0').rstrip('.') or '0'
+
+
 async def notifications_screen(target,page=0):
     data=await asyncio.to_thread(inbox.listing,target.from_user.id,page,target.bot.id)
     text=f"🔔 <b>Notifications</b> · {data['unread']} unread\n\n"
-    text+='Updates appear here. Tap one to read it and open its related action.\n'
+    text+=f"Page {data['page']+1} · Up to 7 updates\n"
     buttons=[]
     for row in data['rows']:
-        preview=' '.join(unescape(re.sub(r'<[^>]*>','',row['body'])).split())
         marker='🔴' if row['unread'] else '✓'
-        text+=f"\n{marker} {escape(preview[:120])}\n<i>{row['created_at']:%d %b %H:%M} UTC</i>\n"
-        buttons.append([Button(text=f"{marker} {preview[:45] or 'Notification'}",callback_data=f"ct_notice_{row['id']}_{data['page']}")])
+        text+=f"\n{marker} <b>{escape(row['title'])}</b>\n{escape(row['summary'])}\n<i>{row['created_at']:%d %b %H:%M} UTC</i>\n"
+        buttons.append([Button(text=f"{marker} {row['title'][:55]}",callback_data=f"ct_notice_{row['id']}_{data['page']}")])
     if not data['rows']:
         text+='\nNo notifications yet.'
     pagination=[]
     if data['page']: pagination.append(Button(text='‹ Previous',callback_data=f"ct_inbox_{data['page']-1}"))
-    if data['has_more']: pagination.append(Button(text='Next ›',callback_data=f"ct_inbox_{data['page']+1}"))
+    if data['has_more']: pagination.append(Button(text='Next · 7 more ›',callback_data=f"ct_inbox_{data['page']+1}"))
     if pagination: buttons.append(pagination)
     if data['unread']:
         buttons.append([Button(text='✓ Mark all as read',callback_data=f"ct_readall_{data['newest_id']}")])
@@ -65,12 +73,12 @@ async def cart_screen(target,page=0,notice=''):
     buttons=[]
     from decimal import Decimal
     for line in lines[page*6:page*6+6]:
-        text+=f"\n<b>{escape(line['name'][:80])}</b>\n{line['quantity']} × · ${Decimal(line['total']):.8f}"
+        text+=f"\n<b>{escape(line['name'][:80])}</b>\n{line['quantity']} × · ${_cart_display_amount(line['total'])}"
         if line['error']:
             text+=' · '+escape(line['error'])
         buttons.append([Button(text=f"✏ Qty · {line['quantity']}",callback_data=f"ct_qty_{line['product_id']}"),
                         Button(text='✕ Remove',callback_data=f"ct_remove_{line['product_id']}")])
-    text+=f"\n\nTotal: <b>${sum((Decimal(x['total']) for x in lines),Decimal(0)):.8f}</b>"
+    text+=f"\n\nTotal: <b>${_cart_display_amount(sum((Decimal(x['total']) for x in lines),Decimal(0)))}</b>"
     if not lines:
         text+='\nYour cart is empty.'
     if busy:
@@ -149,8 +157,8 @@ async def customer_action(callback:CallbackQuery,state:FSMContext):
             await show(callback,prompt,state=state,reply_markup=kb([[Button(text='Cancel',callback_data='ct_cart'),Button(text='Product',callback_data=f'product_{int(value)}')]]))
         elif action=='review':
             token,lines,total=await asyncio.to_thread(cart.prepare,user_id)
-            text='🧾 <b>Review checkout</b>\n\n'+'\n'.join(f"{escape(x['name'][:60])} × {x['quantity']} · ${x['total']}" for x in lines)
-            text+=f'\n\n<b>Total: ${total:.8f} USDT</b>\nReview expires in 5 minutes. Items process separately; successful orders remain purchased if another item fails.'
+            text='🧾 <b>Review checkout</b>\n\n'+'\n'.join(f"{escape(x['name'][:60])} × {x['quantity']} · ${_cart_display_amount(x['total'])}" for x in lines)
+            text+=f'\n\n<b>Total: ${_cart_display_amount(total)} USDT</b>\nReview expires in 5 minutes. Items process separately; successful orders remain purchased if another item fails.'
             await show(callback,text,parse_mode='HTML',reply_markup=kb([[Button(text='Pay from wallet',callback_data=f'ct_pay_{token}',style='success'),Button(text='Back',callback_data='ct_cart')]]))
         elif action=='pay':
             # Business work stays alive when navigation changes; stale rendering alone is discarded.
@@ -167,8 +175,36 @@ async def customer_action(callback:CallbackQuery,state:FSMContext):
             row=await asyncio.to_thread(inbox.read,user_id,int(job_id),callback.bot.id)
             markup=InlineKeyboardMarkup.model_validate(row['reply_markup']).inline_keyboard if row['reply_markup'] else []
             buttons=[list(r) for r in markup]
+            if row['order']:
+                if row['claim']:
+                    label='Open refund request' if row['claim']['request_type']=='refund' else 'Open warranty request'
+                    buttons.append([Button(text=label,callback_data=f"warranty_order_{row['order_id']}")])
+                buttons.append([Button(text='View order details',callback_data=f"order_detail_{row['order_id']}")])
+            elif row['kind']=='deposit':
+                buttons.append([Button(text='Open Wallet',callback_data='deposit_start')])
+            elif row['kind']=='support':
+                buttons.append([Button(text='Open Support',callback_data='support_ticket')])
+            elif row['kind']=='restock':
+                buttons.append([Button(text='Open Shop',callback_data='products_menu')])
+            order_info=''
+            if row['order']:
+                order=row['order']
+                order_info=(f"\n\n<b>Order details</b>\nProduct: {escape((order['product_name'] or 'Product')[:100])}"
+                            f"\nStatus: {escape(order['status'])} · Quantity: {order['quantity']}"
+                            f"\nPaid: ${_cart_display_amount(order['amount'])} USDT"
+                            f"\nPlaced: {order['created_at']:%d %b %Y %H:%M} UTC")
+            claim_info=''
+            if row['claim']:
+                claim=row['claim']
+                claim_info=f"\n\n<b>Request status</b>\n{escape(claim['request_type'].title())}: {escape(claim['status'])}"
+                if claim['refund_amount'] is not None:
+                    claim_info+=f"\nEstimated refund: ${_cart_display_amount(claim['refund_amount'])} USDT"
+                if claim['used_days'] is not None:
+                    claim_info+=f"\nDays used: {claim['used_days']} · Remaining: {claim['remaining_days']}"
             buttons.append([Button(text='⬅ Notifications',callback_data=f'ct_inbox_{max(0,int(page))}'),Button(text='Home',callback_data='main_menu')])
-            await show(callback,f"🔔 <b>Notification</b>\n<i>{row['created_at']:%d %b %Y %H:%M} UTC</i>\n\n"+row['body'],parse_mode='HTML',reply_markup=kb(buttons),replace_media=True)
+            detail=(f"🔔 <b>{escape(row['title'])}</b>\n<i>{row['created_at']:%d %b %Y %H:%M} UTC</i>\n\n"
+                    f"{escape(row['summary'])}{order_info}{claim_info}")
+            await show(callback,detail,parse_mode='HTML',reply_markup=kb(buttons),replace_media=True)
         elif action=='readall':
             await asyncio.to_thread(inbox.mark_read,user_id,int(value),callback.bot.id)
             await notifications_screen(callback)

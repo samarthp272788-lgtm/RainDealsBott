@@ -13,6 +13,12 @@ from models.user import User
 from models.order import Order
 
 
+def _reseller_stock(product):
+    """Use the same cached live-stock value shown by the shop."""
+    from handlers.products import _real_stock
+    return max(0, int(_real_stock(product)))
+
+
 def _locked_user(db, user_id):
     user = db.query(User).filter_by(telegram_id=user_id).with_for_update().first()
     if not user or user.is_banned:
@@ -39,8 +45,19 @@ def change(user_id, product_id, quantity):
         product = db.get(Product, product_id)
         if not product or not product.is_active:
             raise ValueError('Product is unavailable.')
-        if Decimal(str(product.price)) == 0:
+        is_free = Decimal(str(product.price)) == 0
+        if is_free:
             quantity = 1
+        if product.source == 'reseller':
+            available = _reseller_stock(product)
+            if quantity > available:
+                raise ValueError(f'Only {available} supplier units are currently available.')
+        else:
+            from services.fulfillment_policy import plan_delivery
+            try:
+                plan_delivery(product, quantity)
+            except ValueError as exc:
+                raise ValueError(str(exc)) from exc
         if item:
             item.quantity, item.revision = quantity, secrets.token_hex(12)
         else:
@@ -75,8 +92,10 @@ def _quote(db, user_id):
             try:
                 if product.source != 'reseller':
                     plan_delivery(product, item.quantity)
-                elif product.stock is not None and product.stock < item.quantity:
-                    error = 'Insufficient supplier stock'
+                else:
+                    available = _reseller_stock(product)
+                    if item.quantity > available:
+                        error = f'Only {available} supplier units are currently available'
             except ValueError as exc:
                 error = str(exc)
         lines.append(dict(product_id=item.product_id, name=product.name if product else 'Removed product',

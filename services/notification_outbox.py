@@ -26,7 +26,7 @@ def enqueue_admin(db, event, body, **kwargs):
     if not destination:
         logger.warning('Admin notification destination is not configured')
         return
-    enqueue(db, event, destination, body, **kwargs)
+    enqueue(db, f'admin:{event}', destination, body, **kwargs)
 
 
 def legacy_admin_alert(row):
@@ -72,26 +72,47 @@ def reroute_pending_admin_alerts(bot_id):
                     NotificationJob.status.in_(['queued', 'failed'])).order_by(NotificationJob.id).limit(500).with_for_update().all()
         for row in rows:
             if not destination:
-                row.status, row.error_code = 'failed', 'admin_notify_unconfigured'
+                row.status, row.error_code, row.category = 'failed', 'admin_notify_unconfigured', 'admin'
                 continue
             digest = hashlib.sha256((row.body+str(row.reply_markup)).encode()).hexdigest()
-            enqueue(db, f'reroute-admin:{digest}', destination, row.body, bot_id, reply_markup=row.reply_markup)
+            enqueue(db, f'admin:reroute-admin:{digest}', destination, row.body, bot_id, reply_markup=row.reply_markup)
             db.flush()  # The next old per-admin copy must see this unique notification.
-            row.status = 'resolved'
+            row.status, row.category = 'resolved', 'admin'
             row.error_code = 'moved_to_admin_notify'
 
 
 def enqueue(db, event, chat_id, body, bot_id=None, source_order_id=None, reply_markup=None):
     from models.bot_operations import NotificationJob
     bot_id = bot_id or main_bot_id()
+    admin_notice = str(event).lower().startswith('admin:')
+    if not admin_notice and int(bot_id) == main_bot_id() and str(chat_id).isdigit():
+        from config import ADMIN_IDS
+        admin_notice = int(chat_id) in ADMIN_IDS
     chat_id, unroutable_admin_notice = _normalise_destination(bot_id, chat_id)
-    category = ('subscription' if str(event).startswith('subscription:') else
-                'restock' if str(event).startswith('restock:') else
-                'order_progress' if str(event).startswith(('delivery-start:', 'order-progress:')) else None)
-    if category and str(chat_id).isdigit():
+    prefix = str(event).lower().split(':', 1)[0]
+    category = ('admin' if admin_notice else
+                'subscription' if prefix == 'subscription' else
+                'restock' if prefix == 'restock' else
+                'order_progress' if prefix in ('delivery-start', 'manual-delivery', 'order-information', 'order-progress', 'cancel-result') else
+                'refund' if prefix in ('refund', 'manager-refund') or (prefix == 'warranty' and 'refund' in str(event).lower()) else
+                'warranty' if prefix == 'warranty' else
+                'deposit' if prefix.startswith('deposit') else
+                'support' if prefix in ('ticket-status', 'manager-ticket', 'claim-reply') else None)
+    if category in ('subscription','restock','order_progress') and str(chat_id).isdigit():
         from services.customer_tools import allows
         if not allows(db, int(chat_id), category):
             return
+    if source_order_id is None and category in ('subscription','order_progress','refund','warranty'):
+        import re
+        parts = str(event).split(':')
+        order_event = parts[0].lower() in ('subscription','delivery-start','manual-delivery','order-information',
+                                           'order-progress','cancel-result','refund','warranty','manager-refund')
+        if order_event and len(parts)>1 and parts[1].isdigit():
+            source_order_id = int(parts[1])
+        else:
+            match = re.search(r'(?i)order\s*#\s*(\d{1,12})', str(body))
+            if match:
+                source_order_id = int(match.group(1))
     key = hashlib.sha256(f'{bot_id}:{event}:{chat_id}'.encode()).hexdigest()
     # Callers hold their originating order/request lock. Unique key is an extra backstop.
     if db.query(NotificationJob.id).filter_by(event_key=key).first():
@@ -146,12 +167,12 @@ def claim_next(bot_id):
                                    Job.next_attempt_at <= datetime.utcnow(), ~blocked).order_by(Job.id.asc()).with_for_update().first()
         if not row:
             return None
-        if row.category and str(row.chat_id).isdigit():
+        if row.category in ('subscription','restock','order_progress') and str(row.chat_id).isdigit():
             from services.customer_tools import allows
             if not allows(db, int(row.chat_id), row.category):
                 row.status, row.error_code = 'resolved', 'preference_muted'
                 return {'skipped': True}
-        if bot_id==main_bot_id() and str(row.chat_id).isdigit() and int(row.chat_id)>0:
+        if bot_id==main_bot_id() and row.category != 'admin' and str(row.chat_id).isdigit() and int(row.chat_id)>0:
             # The shop's private alerts live in Notifications, not extra chat cards.
             row.status, row.error_code = 'inbox', None
             return {'skipped':True,'inbox_user':int(row.chat_id)}

@@ -67,7 +67,7 @@ def quote_text(quote):
             'Subject to admin review of your deactivation proof.')
 
 
-def summary_text(ctx):
+def summary_text(ctx, admin=False):
     """Keep replacement details complete within one Telegram message."""
     expires = ctx['expires'].strftime('%d %b %Y %H:%M UTC') if ctx['expires'] else 'Not active'
     mode = ctx.get('policy', 'warranty')
@@ -100,7 +100,12 @@ def summary_text(ctx):
         value = evidence.get('value', '')
         text += '\nEvidence: ' + escape(value[:120]) + ('…' if len(value) > 120 else '')
     if request['resolution']:
-        text += '\n\nResponse / replacement:\n' + escape(request['resolution'])
+        if admin:
+            text += '\n\nResponse / replacement:\n' + escape(request['resolution'])
+        elif request['status'] in ('rejected', 'declined'):
+            text += '\n\nThe request was declined. Contact support if you need clarification.'
+        else:
+            text += '\n\nThe team updated this request. Open Support if you need clarification.'
     return text
 
 
@@ -335,9 +340,8 @@ def review(order_id, admin_id, operation, resolution=None):
                    'reject': request.request_type.title()+' request declined.', 'complete': 'Replacement delivered.'}[operation]
         record_event(db, order_id, request.request_type+'_'+request.status, summary, actor_id=admin_id)
         body = f'🛡 <b>Order #{order_id} · {request.request_type.title()}</b>\n{summary}'
-        if resolution:
-            body += '\n\n' + escape(resolution)
-        enqueue(db, f'warranty:{order_id}:{request.status}', order.telegram_id, body)
+        enqueue(db, f'warranty:{order_id}:{request.status}', order.telegram_id, body,
+                reply_markup={'inline_keyboard': [[{'text': 'Open request', 'callback_data': f'warranty_order_{order_id}'}]]})
     return None
 
 
