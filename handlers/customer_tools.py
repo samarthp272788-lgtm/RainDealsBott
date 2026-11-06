@@ -45,7 +45,11 @@ def _cart_display_amount(value):
 
 async def notifications_screen(target,page=0):
     data=await asyncio.to_thread(inbox.listing,target.from_user.id,page,target.bot.id)
-    text=f"🔔 <b>Notifications</b> · {data['unread']} unread\n\n"
+    text=f"🔔 <b>Notifications</b> · {data['unread']} unread\n"
+    text+=("Welcome back to RainDeals Notifications.\n"
+           "Stay up to date with your account, payments, wallet, and support.\n"
+           "Your recent updates are kept here so you can revisit them anytime.\n"
+           "Tap a message to open its available action.\n\n")
     text+=f"Page {data['page']+1} · Up to 7 updates\n"
     buttons=[]
     for row in data['rows']:
