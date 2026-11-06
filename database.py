@@ -494,3 +494,30 @@ def run_with_retry(
         raise last_exception
 
     raise RuntimeError("Database operation failed without an exception")
+
+
+# Wallet history participates in the writer's transaction. Raw SQL writers below
+# explicitly record their change; external services are reconciled by the statement.
+from sqlalchemy.orm import Session as _WalletSession
+from sqlalchemy import event as _wallet_event, inspect as _wallet_inspect
+
+@_wallet_event.listens_for(_WalletSession, 'before_flush')
+def _capture_wallet_changes(session, flush_context, instances):
+    from models.customer_tools import WalletEntry
+    from services.wallet_ledger import record_wallet
+    for user in list(session.dirty):
+        if getattr(user, '__tablename__', None) != 'users':
+            continue
+        history = _wallet_inspect(user).attrs.balance.history
+        if not history.has_changes() or not history.deleted or not history.added:
+            continue
+        # Explicit writers have already recorded this balance in the same transaction.
+        if any(isinstance(row, WalletEntry) and row.telegram_id == user.telegram_id and row.balance == user.balance for row in session.new):
+            continue
+        changed = _wallet_inspect(user).attrs
+        related_order = next((row for row in list(session.new)+list(session.dirty)
+                             if getattr(row,'__tablename__',None)=='orders' and row.telegram_id==user.telegram_id),None)
+        label = ('Referral earnings / reversal' if changed.referral_earnings.history.has_changes() else
+                 f'Refund · order #{related_order.id}' if related_order and related_order.refunded else
+                 'Purchase / refund' if changed.total_spent.history.has_changes() else 'Admin wallet adjustment')
+        record_wallet(session, user, session.info.get('wallet_label', label), history.deleted[0])

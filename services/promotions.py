@@ -36,6 +36,7 @@ def redeem(user_id, code):
                  PromoCode.is_active == True).update({PromoCode.used_count: used+1}, synchronize_session=False)
             if claimed != 1:
                 return False, 'The promocode changed while processing. Please try again.'
+            before_balance = Decimal(str(user.balance or 0))
             credited = db.query(User).filter(User.telegram_id == user_id).update(
                  {User.balance: func.coalesce(User.balance, 0)+amount}, synchronize_session=False)
             if credited != 1:
@@ -43,6 +44,8 @@ def redeem(user_id, code):
             db.add(Deposit(telegram_id=user_id, amount=amount, tx_hash=reference, network='PROMO', status='completed'))
             db.flush()
             db.refresh(user)
+            from services.wallet_ledger import record_wallet
+            record_wallet(db,user,f"Promocode {code}",before_balance)
             result = dict(code=code, amount=amount, balance=user.balance)
         return True, result
     except IntegrityError:

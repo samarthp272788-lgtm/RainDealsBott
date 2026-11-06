@@ -14,9 +14,70 @@ def main_bot_id():
     return int(BOT_TOKEN.split(':', 1)[0])
 
 
+def admin_destination():
+    import config
+    return str(getattr(config, 'ADMIN_ORDER_NOTIFICATION_CHANNEL_ID', '') or
+               getattr(config, 'NOTIFICATION_CHANNEL_ID', '')).strip()
+
+
+def enqueue_admin(db, event, body, **kwargs):
+    """Operational alerts go to Admin Notify, never private shop conversations."""
+    destination = admin_destination()
+    if not destination:
+        logger.warning('Admin notification destination is not configured')
+        return
+    enqueue(db, event, destination, body, **kwargs)
+
+
+def legacy_admin_alert(row):
+    markup = str(row.reply_markup or '')
+    return ('warranty_admin_' in markup or '<b>LOW STOCK ALERT</b>' in row.body
+            or '<b>New Support Ticket #' in row.body)
+
+
+def private_admin_alert_cards(user_id, bot_id):
+    """Known old alerts can be cleaned without touching customer receipts."""
+    from config import ADMIN_IDS
+    from database import SessionLocal
+    from models.bot_operations import NotificationJob
+    if user_id not in ADMIN_IDS:
+        return []
+    with SessionLocal() as db:
+        rows = db.query(NotificationJob).filter_by(bot_id=bot_id, chat_id=str(user_id), status='sent').filter(
+            NotificationJob.message_id.is_not(None)).order_by(NotificationJob.id.desc()).limit(100).all()
+        return [(user_id, row.message_id) for row in rows if legacy_admin_alert(row)]
+
+
+def reroute_pending_admin_alerts(bot_id):
+    from config import ADMIN_IDS
+    from database import transaction
+    from models.bot_operations import NotificationJob
+    destination = admin_destination()
+    if not destination:
+        return
+    with transaction() as db:
+        rows = db.query(NotificationJob).filter(NotificationJob.bot_id == bot_id,
+                    NotificationJob.chat_id.in_([str(i) for i in ADMIN_IDS]),
+                    NotificationJob.status.in_(['queued', 'failed'])).order_by(NotificationJob.id).limit(500).with_for_update().all()
+        for row in rows:
+            if legacy_admin_alert(row):
+                digest = hashlib.sha256((row.body+str(row.reply_markup)).encode()).hexdigest()
+                enqueue(db, f'reroute-admin:{digest}', destination, row.body, bot_id, reply_markup=row.reply_markup)
+                db.flush()  # The next old per-admin copy must see this unique notification.
+                row.status = 'resolved'
+                row.error_code = 'moved_to_admin_notify'
+
+
 def enqueue(db, event, chat_id, body, bot_id=None, source_order_id=None, reply_markup=None):
     from models.bot_operations import NotificationJob
     bot_id = bot_id or main_bot_id()
+    category = ('subscription' if str(event).startswith('subscription:') else
+                'restock' if str(event).startswith('restock:') else
+                'order_progress' if str(event).startswith(('delivery-start:', 'order-progress:')) else None)
+    if category and str(chat_id).isdigit():
+        from services.customer_tools import allows
+        if not allows(db, int(chat_id), category):
+            return
     key = hashlib.sha256(f'{bot_id}:{event}:{chat_id}'.encode()).hexdigest()
     # Callers hold their originating order/request lock. Unique key is an extra backstop.
     if db.query(NotificationJob.id).filter_by(event_key=key).first():
@@ -26,7 +87,7 @@ def enqueue(db, event, chat_id, body, bot_id=None, source_order_id=None, reply_m
         reply_markup = InlineKeyboardMarkup.model_validate(reply_markup).model_dump(mode='json', exclude_none=True)
     db.add(NotificationJob(event_key=key, bot_id=bot_id, chat_id=str(chat_id), body=body,
                            status='queued', attempts=0, next_attempt_at=datetime.utcnow(), source_order_id=source_order_id,
-                           reply_markup=reply_markup))
+                           reply_markup=reply_markup, category=category))
 
 
 def enqueue_once(event, chat_id, body, bot_id=None, reply_markup=None):
@@ -63,6 +124,11 @@ def claim_next(bot_id):
                                    Job.next_attempt_at <= datetime.utcnow(), ~blocked).order_by(Job.id.asc()).with_for_update().first()
         if not row:
             return None
+        if row.category and str(row.chat_id).isdigit():
+            from services.customer_tools import allows
+            if not allows(db, int(row.chat_id), row.category):
+                row.status, row.error_code = 'resolved', 'preference_muted'
+                return {'skipped': True}
         attempts = row.attempts + 1
         claimed = db.query(Job).filter(Job.id == row.id, Job.status == 'queued').update(
             {Job.status: 'sending', Job.claimed_at: datetime.utcnow(), Job.attempts: attempts}, synchronize_session=False)
@@ -149,6 +215,8 @@ async def send_one(bot):
     job = await asyncio.to_thread(claim_next, bot.id)
     if not job:
         return False
+    if job.get('skipped'):
+        return True
     try:
         from aiogram.types import InlineKeyboardMarkup
         markup = InlineKeyboardMarkup.model_validate(job['reply_markup']) if job.get('reply_markup') else None
@@ -179,12 +247,20 @@ async def send_one(bot):
 
 async def notification_loop(bot):
     from services.provider_health import flush_health
-    elapsed = 0
+    from time import monotonic
+    maintenance_at = reminders_at = 0
     while True:
         try:
-            if elapsed % 10 == 0:
+            now = monotonic()
+            if now >= maintenance_at:
+                await asyncio.to_thread(reroute_pending_admin_alerts, bot.id)
                 await asyncio.to_thread(recover_stale, bot.id)
                 await asyncio.to_thread(flush_health)
+                maintenance_at = now+10
+            if now >= reminders_at:
+                from services.customer_tools import subscription_reminders
+                await asyncio.to_thread(subscription_reminders)
+                reminders_at = now+60
             # Bound each tick; a broken recipient must not hold up other jobs.
             for _ in range(10):
                 if not await send_one(bot):
@@ -193,5 +269,4 @@ async def notification_loop(bot):
             raise
         except Exception:
             logger.warning('Notification/health service unavailable; will retry (no message bodies logged)')
-        elapsed += 1
         await asyncio.sleep(1)

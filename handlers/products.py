@@ -692,6 +692,9 @@ def _queue_restock_subscription(user_id, product_id, bot_id, text, keyboard):
         row = db.query(ProductEngagement).filter_by(telegram_id=user_id, product_id=product_id).with_for_update().first()
         if not row or not row.restock_enabled:
             return False
+        from services.customer_tools import allows
+        if not allows(db,user_id,'restock'):
+            return False
         enqueue(db, f'restock:{product_id}:{uuid4().hex}', user_id, text, bot_id, reply_markup=keyboard)
         row.restock_enabled = False
         if not row.is_favorite:
@@ -2001,6 +2004,7 @@ def _confirm_keyboard(product_id: int, is_free: bool = False, checkout_token: st
     confirm_text = "🎁 Claim Now! 🎁" if is_free else "✅ Confirm Purchase"
     buttons = [[InlineKeyboardButton(text=confirm_text, callback_data=f"confirm_buy_{product_id}_{checkout_token or 'expired'}", style="success")]]
 
+    buttons.append([InlineKeyboardButton(text="🛒 Add to cart", callback_data=f"ct_add_{product_id}", style="primary"), InlineKeyboardButton(text="View cart", callback_data="ct_cart")])
     if not is_free:
         buttons.append(
             [InlineKeyboardButton(text="🔄 Change Quantity", callback_data=f"select_qty_{product_id}", style="primary"),
@@ -2192,6 +2196,7 @@ def _do_purchase(
     quantity: int,
     delivery_telegram_id: int | None = None,
     checkout_key: str | None = None,
+    expected_total: str | None = None,
 ) -> dict:
     with transaction() as db:
         user = db.query(User).filter(User.telegram_id == telegram_id).with_for_update().first()
@@ -2249,6 +2254,8 @@ def _do_purchase(
                 price = _money(bulk_price)
 
         total_amount = _money(price * quantity)
+        if expected_total is not None and total_amount != _money(expected_total):
+            return {"error": "Price changed. Review your cart again. Customer not charged."}
         user_balance = _money(user.balance)
 
         if user_balance < total_amount:
@@ -2358,6 +2365,7 @@ async def _do_reseller_purchase(
     quantity: int,
     progress_callback=None,
     checkout_key: str | None = None,
+    expected_total: str | None = None,
 ) -> dict:
     async def report_progress(percent: int, stage: str) -> None:
         if progress_callback is None:
@@ -2403,6 +2411,8 @@ async def _do_reseller_purchase(
                 price = _money(bulk_price)
 
         total_amount = _money(price * quantity)
+        if expected_total is not None and total_amount != _money(expected_total):
+            return {"error": "Price changed. Review your cart again. Customer not charged."}
 
         user = db.query(User).filter(User.telegram_id == telegram_id).first()
         if not user:
@@ -2508,7 +2518,8 @@ async def _do_reseller_purchase(
             if _money(u.balance) < total_amount:
                 raise RuntimeError('Wallet changed after supplier confirmation; manual reconciliation required')
 
-            u.balance = _money(u.balance) - total_amount
+            previous_balance = _money(u.balance)
+            u.balance = previous_balance - total_amount
             u.total_orders += 1
             u.total_spent = _money(u.total_spent) + total_amount
 
@@ -2599,7 +2610,8 @@ async def _do_reseller_purchase(
 
 
 async def _notify_admins_low_stock(bot, alert: dict, order_id: int):
-    for admin_id in ADMIN_IDS:
+    from services.notification_outbox import admin_destination
+    for admin_id in filter(None, [admin_destination()]):
         try:
             await asyncio.to_thread(enqueue_once, f"low-stock:{order_id}", admin_id,
                                    f"⚠️ <b>LOW STOCK ALERT</b>\n\n{_divider('─', 24)}\n\n"

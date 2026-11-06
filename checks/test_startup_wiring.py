@@ -53,8 +53,37 @@ class StartupWiringTests(unittest.TestCase):
                 panel = _build_product_panel(product)
                 buttons = {b.callback_data for row in panel[1].inline_keyboard for b in row}
                 assert 'warranty_config_21' in buttons
+            # Real ORM money writes and ledger rows must commit / roll back together.
+            from sqlalchemy import create_engine
+            from sqlalchemy.orm import sessionmaker
+            from models.user import User
+            from models.customer_tools import WalletEntry
+            fixture_engine=create_engine('sqlite:///:memory:')
+            User.__table__.create(fixture_engine)
+            WalletEntry.__table__.create(fixture_engine)
+            factory=sessionmaker(bind=fixture_engine,expire_on_commit=False)
+            with factory.begin() as db:
+                db.add(User(telegram_id=7,full_name='Fixture',balance=Decimal('10')))
+            with factory.begin() as db:
+                user=db.query(User).filter_by(telegram_id=7).one()
+                user.balance=Decimal('8')
+                user.total_spent=Decimal('2')
+            with factory() as db:
+                entries=db.query(WalletEntry).order_by(WalletEntry.id).all()
+                assert [(x.amount,x.balance) for x in entries]==[(Decimal('10'),Decimal('10')),(Decimal('-2'),Decimal('8'))]
+            try:
+                with factory.begin() as db:
+                    user=db.query(User).filter_by(telegram_id=7).one()
+                    user.balance=Decimal('5')
+                    db.flush()
+                    raise ValueError('rollback fixture')
+            except ValueError: pass
+            with factory() as db:
+                assert db.query(User).one().balance==Decimal('8')
+                assert db.query(WalletEntry).count()==2
+            fixture_engine.dispose()
             asyncio.run(bot_app.bot.session.close())
         ''')
         result = subprocess.run([sys.executable, '-c', script], cwd=root, env=env,
-                                capture_output=True, text=True, encoding='utf-8', timeout=45)
+                                capture_output=True, text=True, encoding='utf-8', timeout=90)
         self.assertEqual(result.returncode, 0, result.stderr)

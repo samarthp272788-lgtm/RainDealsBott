@@ -1,10 +1,11 @@
+import { customerToolsRoute } from './customer_tools.js';
 import { page, forcedKillPage } from './ui.js';
 import { loginPage } from './login_v2.js';
 import { claimsRoute, ensureAftercareSchema, policy as aftercarePolicy } from './aftercare.js';
 
 const enc = new TextEncoder();
 const tables = {
-  products: {fields:'name,icon,description,category,price,delivery_instruction,delivery_type,manual_fallback,preorder,low_stock_threshold,bulk_pricing,is_active,api_enabled,source,provider_id,reseller_service_id,reseller_cost,reseller_name,aftercare_policy,warranty_days,subscription_days', required:['name','price'], defaults:{icon:'📦',category:'General',stock:0,is_active:1,api_enabled:1,source:'own',delivery_type:'automatic',manual_fallback:0,preorder:0,low_stock_threshold:3,aftercare_policy:'skip',warranty_days:0,subscription_days:0}},
+  products: {fields:'name,icon,description,category,price,delivery_instruction,delivery_type,manual_fallback,preorder,low_stock_threshold,bulk_pricing,is_active,api_enabled,source,provider_id,reseller_service_id,reseller_cost,reseller_name,aftercare_policy,warranty_days,subscription_days,term_days', required:['name','price'], defaults:{icon:'📦',category:'General',stock:0,is_active:1,api_enabled:1,source:'own',delivery_type:'automatic',manual_fallback:0,preorder:0,low_stock_threshold:3,aftercare_policy:'skip',warranty_days:0,subscription_days:0,term_days:0}},
   providers: {fields:'name,provider_key,base_url,api_type,auth_type,api_key,api_secret,configuration,is_active',required:['name','provider_key','base_url'],defaults:{api_type:'generic',auth_type:'header',is_active:1}},
   promocodes: {fields:'code,amount,max_uses,is_active',required:['code','amount'],defaults:{max_uses:1,used_count:0,is_active:1}},
   custom_rates: {fields:'telegram_id,product_id,price,is_active',required:['telegram_id','price'],read:true},
@@ -15,12 +16,12 @@ const tables = {
   product_rate_controls:{fields:'is_active',read:true}, rate_control_assignments:{fields:'is_active',read:true}
 };
 const responseFields={
- products:'id,name,icon,description,category,price,stock,delivery_instruction,delivery_type,manual_fallback,preorder,low_stock_threshold,bulk_pricing,is_active,api_enabled,source,provider_id,reseller_service_id,reseller_cost,reseller_name,aftercare_policy,warranty_days,subscription_days,created_at,updated_at',
+ products:'id,name,icon,description,category,price,stock,delivery_instruction,delivery_type,manual_fallback,preorder,low_stock_threshold,bulk_pricing,is_active,api_enabled,source,provider_id,reseller_service_id,reseller_cost,reseller_name,aftercare_policy,warranty_days,subscription_days,term_days,created_at,updated_at',
  providers:'id,name,provider_key,base_url,api_type,auth_type,configuration,is_active,created_at,updated_at',
  promocodes:'id,code,amount,max_uses,used_count,is_active,expires_at,created_at',
   custom_rates:'id,telegram_id,product_id,price,is_active,created_at,stopped_at',
  users:'id,telegram_id,username,full_name,balance,total_spent,membership,is_banned,created_at',
- orders:'id,telegram_id,user_id,product_id,product_name,service,quantity,amount,status,delivery_type,automatic_quantity,manual_pending_quantity,created_at,updated_at,delivered_at,aftercare_policy,warranty_days,subscription_days,coverage_started_at,warranty_expires_at',
+ orders:'id,telegram_id,user_id,product_id,product_name,service,quantity,amount,status,delivery_type,automatic_quantity,manual_pending_quantity,created_at,updated_at,delivered_at,aftercare_policy,warranty_days,subscription_days,term_days,subscription_expires_at,received_at,coverage_started_at,warranty_expires_at',
  deposits:'id,telegram_id,user_id,amount,currency,network,status,txid,payment_method,created_at,updated_at,verified_at',
  tickets:'id,telegram_id,user_id,subject,status,priority,admin_response,created_at,updated_at',
  api_keys:'id,telegram_id,name,key_prefix,is_active,created_at,last_used_at',
@@ -31,7 +32,7 @@ const responseFields={
  manager_audit:'id,admin_id,action,target_type,target_id,details,created_at'
 };
 const secretFields = /password|token|secret|key_hash|encrypted|api_key/i;
-const numeric = new Set('price,amount,max_uses,stock,manual_fallback,preorder,low_stock_threshold,is_active,api_enabled,provider_id,reseller_cost,telegram_id,product_id,is_banned,warranty_days,subscription_days'.split(','));
+const numeric = new Set('price,amount,max_uses,stock,manual_fallback,preorder,low_stock_threshold,is_active,api_enabled,provider_id,reseller_cost,telegram_id,product_id,is_banned,warranty_days,subscription_days,term_days'.split(','));
 const bools = new Set('manual_fallback,preorder,is_active,api_enabled,is_banned'.split(','));
 const sensitive = new Set(['api_key','api_secret']);
 const reply=(data,status=200)=>new Response(JSON.stringify(data),{status,headers:{'content-type':'application/json','cache-control':'no-store'}});
@@ -311,6 +312,8 @@ async function route(request,env){
   if(path==='/'&&request.method==='GET')return page(auth.csrf);
   if(path==='/manage/status'&&request.method==='GET')return reply(await status(env));
   if(path==='/manage/me'&&request.method==='GET')return reply({telegram_id:String(currentAdmin.telegram_id),display_name:currentAdmin.display_name,role_key:currentAdmin.role_key,is_owner:Number(currentAdmin.is_owner)===1,permissions:currentAdmin.permissions});
+  const customerResponse=await customerToolsRoute(request,env,url,auth,currentAdmin,{reply,tx,hasPermission,body});
+  if(customerResponse)return customerResponse;
   const claimResponse=await claimsRoute(request,env,url,auth,currentAdmin,{reply,tx,hasPermission,body});
   if(claimResponse)return claimResponse;
   if(path.startsWith('/manage/products')||/^\/manage\/orders\/\d+\/fulfill$/.test(path))await requireAftercareSchema(env);
@@ -375,7 +378,8 @@ async function route(request,env){
     const history=webHistory.map(r=>{const detail=jsonValue(r.details,{});return{admin_id:String(r.admin_id),admin_name:r.display_name||'',action:r.action,at:r.created_at,source:'Manager Web',session_started_at:detail.session_started_at||null,summary:r.action==='fulfill'?'Order fulfilled using '+(detail.mode==='inventory'?'uploaded stock':'entered delivery details'):r.action==='edit_delivery'?'Saved delivery details corrected; no Telegram resend':r.action==='retry_delivery'?'Delivery checked / retried':''}}).concat(botHistory.map(r=>({admin_id:String(r.admin_telegram_id),action:r.action,at:r.created_at,source:'Telegram bot',summary:r.summary}))).sort((a,b)=>String(b.at).localeCompare(String(a.at)));
     const canWrite=hasPermission(currentAdmin,'orders_write'),completed=String(order.status).toLowerCase()==='completed';
     const claim=(await optionalRows(env,'SELECT status,request_type FROM bot_warranty_requests WHERE order_id=? LIMIT 1',[id]))[0];
-    return reply({order,aftercare:{policy:aftercarePolicy(order),claim_status:claim?.status||null},submitted_details:{status:submission?'submitted':Array.isArray(requirements)&&requirements.length?'awaiting_customer':'not_required',submitted_by:submission?String(submission.telegram_id):null,submitted_at:submission?.submitted_at||null,fields:jsonValue(submission?.values,{}),requirements},delivery:job,delivered_identifiers:deliveredIdentifiers,history,operator_session:sessionInfo[0]||null,can_edit_delivery:canWrite&&hasPermission(currentAdmin,'delivery_secrets')&&completed&&!Number(order.refunded)&&!['queued','sending','uncertain'].includes(job?.status),can_retry_delivery:canWrite&&completed&&Number(order.has_delivery)===1&&!Number(order.refunded)&&['manual','hybrid'].includes(order.delivery_type)&&(!job||['failed','queued'].includes(job.status))});
+    const cancellation=(await optionalRows(env,'SELECT reason,status,resolution,admin_id,created_at FROM bot_cancellation_requests WHERE order_id=?',[id]))[0]||null;
+    return reply({order,cancellation,aftercare:{policy:aftercarePolicy(order),claim_status:claim?.status||null},submitted_details:{status:submission?'submitted':Array.isArray(requirements)&&requirements.length?'awaiting_customer':'not_required',submitted_by:submission?String(submission.telegram_id):null,submitted_at:submission?.submitted_at||null,fields:jsonValue(submission?.values,{}),requirements},delivery:job,delivered_identifiers:deliveredIdentifiers,history,operator_session:sessionInfo[0]||null,can_edit_delivery:canWrite&&hasPermission(currentAdmin,'delivery_secrets')&&completed&&!Number(order.refunded)&&!['queued','sending','uncertain'].includes(job?.status),can_retry_delivery:canWrite&&completed&&Number(order.has_delivery)===1&&!Number(order.refunded)&&['manual','hybrid'].includes(order.delivery_type)&&(!job||['failed','queued'].includes(job.status))});
   }
   const orderContent=path.match(/^\/manage\/orders\/(\d+)\/delivery-content$/);
   if(orderContent){
@@ -401,10 +405,10 @@ async function route(request,env){
     const suppliedRecipient=String(b.customer_telegram_id||'').trim();
     if(suppliedRecipient&&!/^\d{1,20}$/.test(suppliedRecipient))error('Customer Telegram ID must be a positive numeric ID.');
     const orderColumns=await columnsFor(env,'orders');
-    const splitSelect=['automatic_quantity','manual_pending_quantity','stock_deducted_quantity','assigned_admin_id','aftercare_policy','warranty_days','subscription_days'].filter(c=>orderColumns.includes(c)).map(c=>','+c).join('');
+    const splitSelect=['automatic_quantity','manual_pending_quantity','stock_deducted_quantity','assigned_admin_id','aftercare_policy','warranty_days','subscription_days','term_days'].filter(c=>orderColumns.includes(c)).map(c=>','+c).join('');
     const timelineEnabled=(await rows(env,"SELECT 1 AS present FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='order_events' LIMIT 1")).length>0;
     const orderTimestamp=orderColumns.includes('updated_at')?',updated_at=UTC_TIMESTAMP()':'';
-    const warrantyUpdate=(orderColumns.includes('warranty_days')&&orderColumns.includes('warranty_expires_at')?",warranty_expires_at=CASE WHEN warranty_days>0 AND warranty_expires_at IS NULL THEN DATE_ADD(UTC_TIMESTAMP(),INTERVAL warranty_days DAY) ELSE warranty_expires_at END":'')+(orderColumns.includes('coverage_started_at')?',coverage_started_at=COALESCE(coverage_started_at,UTC_TIMESTAMP())':'');
+    const warrantyUpdate=(orderColumns.includes('subscription_expires_at')?",subscription_expires_at=CASE WHEN term_days>0 AND subscription_expires_at IS NULL THEN DATE_ADD(UTC_TIMESTAMP(),INTERVAL term_days DAY) ELSE subscription_expires_at END":'')+(orderColumns.includes('warranty_days')&&orderColumns.includes('warranty_expires_at')?",warranty_expires_at=CASE WHEN warranty_days>0 AND warranty_expires_at IS NULL THEN DATE_ADD(UTC_TIMESTAMP(),INTERVAL warranty_days DAY) ELSE warranty_expires_at END":'')+(orderColumns.includes('coverage_started_at')?',coverage_started_at=COALESCE(coverage_started_at,UTC_TIMESTAMP())':'');
     const completed=await tx(env,async t=>{
       const order=(await t.execute('SELECT id,telegram_id,product_id,product_name,amount,quantity,status,delivery_type,is_preorder,refunded,delivery_telegram_id,delivered_account'+splitSelect+' FROM orders WHERE id=? FOR UPDATE',[orderId])).rows?.[0];
       if(!order)error('Order not found.',404);
@@ -638,8 +642,9 @@ async function route(request,env){
     return reply({rows:outputRows,has_more:pageRows.length>30,fields:meta.fields.split(',').filter(c=>c&&columns.includes(c)&&!secretFields.test(c)),required:meta.required||[],create:!meta.read,defaults:meta.defaults||{},page:pageNumber});
   }
   if(request.method==='POST'&&!action){const b=await body(request),values=validate(meta.fields,b,!id);if(!id){if(meta.read)error('Creation is unavailable for this section.');Object.assign(values,{...meta.defaults,...values});for(const f of meta.required||[])if(values[f]==null||values[f]==='')error(`${f} is required.`);if(name==='promocodes')values.created_by=auth.admin_id;}
-    if(name==='products'&&['aftercare_policy','warranty_days','subscription_days'].some(k=>k in values)){
-      const old=id?(await rows(env,'SELECT aftercare_policy,warranty_days,subscription_days FROM products WHERE id=?',[id]))[0]:null;
+    if(name==='products'&&'term_days' in values&&(!Number.isInteger(Number(values.term_days))||Number(values.term_days)<0||Number(values.term_days)>3650))error('Subscription term must be 0–3650 days.');
+    if(name==='products'&&['aftercare_policy','warranty_days','subscription_days','term_days'].some(k=>k in values)){
+      const old=id?(await rows(env,'SELECT aftercare_policy,warranty_days,subscription_days,term_days FROM products WHERE id=?',[id]))[0]:null;
       const p={...old,...values},mode=aftercarePolicy(p),days=Number(mode==='refund'?p.subscription_days:p.warranty_days);
       if(!['skip','warranty','refund'].includes(mode)||mode!=='skip'&&(!Number.isInteger(days)||days<1||days>3650))error('Choose Warranty / Refund / Skip and enter 1–3650 days for the selected policy.');
       Object.assign(values,{aftercare_policy:mode,warranty_days:mode==='warranty'?days:0,subscription_days:mode==='refund'?days:0});

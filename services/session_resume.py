@@ -32,7 +32,7 @@ ADMIN_FAMILIES = {'AddProduct', 'EditProduct', 'AddStock', 'DeleteProduct', 'Add
                   'AdminUserBalanceState', 'CustomRateState', 'ProviderSetupState',
                   'ProviderEditState', 'MaintenanceModeState', 'ManagerWebState',
                   'PromoCodeCreation', 'WorkInput'}
-EXTRA_USER_STATES = {'Inputs:reason', 'Inputs:deactivated', 'Inputs:evidence', 'Inputs:confirmation',
+EXTRA_USER_STATES = {'CustomerInput:quantity', 'CustomerInput:cancel_reason', 'CustomerInput:claim_reply', 'Inputs:reason', 'Inputs:deactivated', 'Inputs:evidence', 'Inputs:confirmation',
                      'Inputs:product_confirmation','Inputs:issue_type',
                      'RedeemState:waiting_for_code', 'OrderFilterStates:waiting_date_range',
                      'OrderFilterStates:waiting_export_format', 'OrderFilterStates:waiting_rating',
@@ -40,7 +40,7 @@ EXTRA_USER_STATES = {'Inputs:reason', 'Inputs:deactivated', 'Inputs:evidence', '
 
 
 def admin_state(state):
-    return bool(state and (state.split(':', 1)[0] in ADMIN_FAMILIES or state in {'Inputs:warranty_days', 'Inputs:resolution','Inputs:metadata'}))
+    return bool(state and (state.split(':', 1)[0] in ADMIN_FAMILIES or state in {'Inputs:warranty_days', 'Inputs:resolution','Inputs:metadata', 'CustomerInput:admin_reply', 'CustomerInput:term_days', 'CustomerInput:hold_resolution'}))
 
 
 @contextmanager

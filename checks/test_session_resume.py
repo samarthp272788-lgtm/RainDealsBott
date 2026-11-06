@@ -315,6 +315,36 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
             marker.edit_text.assert_not_awaited()
             self.assertEqual(ui.get_card_location(7, 7), (7, 30))
 
+    async def test_opening_review_retires_private_home_card(self):
+        from utils import ui
+        bot=AsyncMock()
+        review=SimpleNamespace(chat=SimpleNamespace(id=7),message_id=30,photo=None,
+                               edit_text=AsyncMock(),delete=AsyncMock(),bot=bot)
+        review.edit_text.return_value=review
+        callback=SimpleNamespace(message=review,from_user=SimpleNamespace(id=7),bot=bot)
+        with patch.dict(ui._CARD_LOCATIONS,{(7,7):(7,20)},clear=True):
+            await ui.show(callback,'Claim review',parse_mode='HTML')
+            bot.delete_message.assert_awaited_once_with(chat_id=7,message_id=20)
+            self.assertEqual(ui.get_card_location(7,7),(7,30))
+
+    async def test_home_retires_review_before_editing_durable_home_location(self):
+        from utils import ui
+        bot=AsyncMock()
+        incoming=message('/start').as_(bot)
+        fresh=incoming.model_copy(update={'message_id':20}).as_(bot)
+        bot.edit_message_text.return_value=fresh
+        with patch.dict(ui._CARD_LOCATIONS,{(7,7):(7,30)},clear=True):
+            await ui.update_card(incoming,text='Home',owner_id=7,chat_id=7,message_id=20,delete_input=False)
+            bot.delete_message.assert_awaited_once_with(chat_id=7,message_id=30)
+            self.assertEqual(ui.get_card_location(7,7),(7,20))
+
+    async def test_shared_admin_notify_card_never_deletes_another_admin_screen(self):
+        from utils import ui
+        bot=AsyncMock()
+        with patch.dict(ui._CARD_LOCATIONS,{(7,-100):( -100,20)},clear=True):
+            await ui.retire_previous_card(bot,7,-100,30)
+            bot.delete_message.assert_not_awaited()
+
     async def test_wipe_deletes_only_tracked_cards_and_keeps_draft(self):
         from utils import ui
         bot = AsyncMock()

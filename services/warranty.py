@@ -23,7 +23,7 @@ def policy(value):
 
 def policy_snapshot(product):
     mode = policy(product)
-    return dict(aftercare_policy=mode,
+    return dict(aftercare_policy=mode, term_days=max(0,int(getattr(product,"term_days",0) or 0)),
                 warranty_days=max(0, int(getattr(product, 'warranty_days', 0) or 0)) if mode == 'warranty' else 0,
                 subscription_days=max(0, int(getattr(product, 'subscription_days', 0) or 0)) if mode == 'refund' else 0)
 
@@ -120,6 +120,9 @@ def request_text(ctx):
 
 
 def start_coverage(order):
+    term_days = int(getattr(order, 'term_days', 0) or 0)
+    if term_days and not getattr(order, 'subscription_expires_at', None):
+        order.subscription_expires_at = (getattr(order, 'coverage_started_at', None) or datetime.utcnow()) + timedelta(days=term_days)
     mode = policy(order)
     if mode == 'skip':
         return
@@ -287,10 +290,10 @@ def submit(order_id, user_id, reason, evidence, deactivated_at=None, expected_re
                               used_days=quote['used_days'] if quote else None,
                               remaining_days=quote['remaining_days'] if quote else None))
         record_event(db, order_id, mode+'_requested', f'{mode.title()} requested for admin review.', actor_id=user_id)
-        for admin_id in set(ADMIN_IDS):
-            enqueue(db, f'warranty:{order_id}:submitted', admin_id,
-                    f'🛡 <b>{mode.title()} review needed</b>\nOrder #{order_id}\nAdmin → Warranty / refund requests.',
-                    reply_markup={'inline_keyboard': [[{'text': 'Review claim', 'callback_data': f'warranty_admin_{order_id}'}]]})
+        from services.notification_outbox import enqueue_admin
+        enqueue_admin(db, f'warranty:{order_id}:submitted',
+                      f'🛡 <b>{mode.title()} review needed</b>\nOrder #{order_id}\nAdmin → Warranty / refund requests.',
+                      reply_markup={'inline_keyboard': [[{'text': 'Review claim', 'callback_data': f'warranty_admin_{order_id}'}]]})
     return None
 
 
@@ -367,8 +370,12 @@ def _approve_refund(db, order, request, admin_id):
     buyer = db.query(User).filter(User.telegram_id == order.telegram_id).with_for_update().first()
     if not buyer:
         raise RuntimeError('Refund wallet unavailable; transaction rolled back.')
+    before_balance = Decimal(str(buyer.balance or 0))
     db.query(User).filter(User.telegram_id == order.telegram_id).update(
         {User.balance: func.coalesce(User.balance, 0) + amount}, synchronize_session=False)
+    db.refresh(buyer)
+    from services.wallet_ledger import record_wallet
+    record_wallet(db,buyer,f"Refund · order #{order.id}",before_balance)
     if buyer.referred_by:
         saved = request.invoice_snapshot or {}
         rate = Decimal(str(saved.get('referral_commission_rate',getattr(config, 'REFERRAL_COMMISSION_RATE', '.05'))))
@@ -482,7 +489,7 @@ def pending(page=0):
     from models.order import Order
     with SessionLocal() as db:
         query = db.query(Request).join(Order, Order.id == Request.order_id).filter(
-            Request.status.in_(('submitted', 'approved')), Order.status == 'completed', Order.refunded == False)
+            Request.status.in_(('submitted', 'needs_info', 'approved')), Order.status == 'completed', Order.refunded == False)
         count = query.count()
         rows = query.order_by(Request.created_at.asc()).offset(max(0,page)*8).limit(8).all()
         return count, [dict(order_id=r.order_id, status=r.status, request_type=r.request_type) for r in rows]

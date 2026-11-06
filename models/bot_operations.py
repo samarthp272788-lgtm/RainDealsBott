@@ -43,6 +43,7 @@ class NotificationJob(Base):
     chat_id = Column(String(128), nullable=False)
     body = Column(Text, nullable=False)
     reply_markup = Column(JSON, nullable=True)
+    category = Column(String(24), nullable=True)
     status = Column(String(20), nullable=False, default='queued', index=True)
     attempts = Column(Integer, nullable=False, default=0)
     next_attempt_at = Column(DateTime, nullable=False, server_default=func.now())

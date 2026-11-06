@@ -43,6 +43,7 @@ def _ensure_index(connection, table, columns, name):
 
 
 def ensure_order_requirements_schema() -> None:
+    from models.customer_tools import CartItem, CartCheckout, CustomerPreferences, CustomerJobCursor, ClaimMessage, CancellationRequest, WalletEntry
     Base.metadata.create_all(
         bind=engine,
         tables=[
@@ -53,9 +54,16 @@ def ensure_order_requirements_schema() -> None:
             CheckoutAttempt.__table__, OrderEvent.__table__, OrderWorkNote.__table__,
             WarrantyRequest.__table__, NotificationJob.__table__, ProviderHealth.__table__,
             ApiKey.__table__, ApiOrder.__table__,
+            CartItem.__table__, CartCheckout.__table__, CustomerPreferences.__table__, CustomerJobCursor.__table__,
+            ClaimMessage.__table__, CancellationRequest.__table__, WalletEntry.__table__,
         ],
     )
     with engine.begin() as connection:
+        _ensure_column(connection, 'bot_notification_jobs', 'category', 'VARCHAR(24) NULL')
+        _ensure_column(connection, 'orders', 'received_at', 'DATETIME NULL')
+        _ensure_column(connection, 'orders', 'subscription_expires_at', 'DATETIME NULL')
+        _ensure_column(connection, 'orders', 'term_days', 'INT NOT NULL DEFAULT 0')
+        _ensure_column(connection, 'products', 'term_days', 'INT NOT NULL DEFAULT 0')
         _ensure_column(connection, "bot_notification_jobs", "reply_markup", "JSON NULL")
         _ensure_column(connection, "bot_warranty_requests", "request_type", "VARCHAR(16) NOT NULL DEFAULT 'warranty'")
         _ensure_column(connection, "bot_warranty_requests", "refund_amount", "DECIMAL(20,8) NULL")

@@ -78,6 +78,9 @@ def _load_admin_order(order_id):
             return None, None, {}
         user = db.query(User).filter(User.telegram_id == order.telegram_id).first()
         submission = db.query(OrderRequirementSubmission).filter_by(order_id=order_id).first()
+        from models.customer_tools import CancellationRequest
+        cancellation = db.get(CancellationRequest,order_id)
+        order._cancellation_status = cancellation.status if cancellation else None
         return order, user, submission.values if submission else {}
 
 
@@ -214,6 +217,8 @@ Refunded:
     text += f"\nTeam owner: {order.assigned_admin_id or 'Unassigned'}\nAutomatic: {order.automatic_quantity or 0} · Remaining: {order.manual_pending_quantity or 0}\n"
     keyboard = [[InlineKeyboardButton(text="🕒 Timeline", callback_data=f"admin_timeline_{order.id}"),
                  InlineKeyboardButton(text="📋 Team workspace", callback_data=f"work_view_{order.id}")]]
+    if getattr(order,'_cancellation_status',None):
+        keyboard.append([InlineKeyboardButton(text=f"Cancellation · {order._cancellation_status}",callback_data=f'ct_cancelreview_{order.id}')])
     from services.warranty import policy
     if policy(order) != 'skip':
         keyboard.append([InlineKeyboardButton(text='🛡 Warranty / refund claim', callback_data=f'warranty_admin_{order.id}')])
@@ -259,7 +264,7 @@ Refunded:
 # ==========================================================
 
 @retry_on_write_conflict(max_attempts=3)
-def _do_refund(order_id: int, admin_id: int) -> dict:
+def _do_refund(order_id: int, admin_id: int, cancellation_only: bool = False) -> dict:
     with transaction() as db:
         order = (
             db.query(Order)
@@ -270,6 +275,12 @@ def _do_refund(order_id: int, admin_id: int) -> dict:
 
         if not order:
             return {"error": "Order not found."}
+        if cancellation_only:
+            from services.customer_tools import cancellable
+            from models.customer_tools import CancellationRequest
+            request = db.get(CancellationRequest, order_id)
+            if not request or request.status != 'submitted' or not cancellable(order):
+                return {"error": "Cancellation unavailable: delivery started or request resolved."}
         if order.refunded:
             return {"error": "Already refunded."}
         if order.status == "deleted":
@@ -381,6 +392,10 @@ def _do_refund(order_id: int, admin_id: int) -> dict:
                 f'💸 Your order #{order.id} was refunded.\n\nAmount returned to your balance: ${refund_amount:.2f}')
         order.refunded = True
         order.status = "refunded"
+        order.refund_amount = refund_amount
+        if cancellation_only:
+            request.status, request.admin_id = 'approved', admin_id
+            request.resolution = 'Cancellation approved; wallet refunded.'
         db.add(AdminAuditLog(
             admin_telegram_id=int(admin_id),
             action="refund_order",

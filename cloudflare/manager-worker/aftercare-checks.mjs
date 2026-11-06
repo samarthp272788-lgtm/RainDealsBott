@@ -10,7 +10,7 @@ let reader=false,failNotification=false,releaseLock=Promise.resolve();
 const initial={order:{id:12,telegram_id:'777',product_id:2,product_name:'Original product',amount:'30.00000000',quantity:1,status:'completed',refunded:0,delivery_type:'manual',created_at:date(6),aftercare_policy:'refund',subscription_days:30,warranty_days:0,warranty_expires_at:null,coverage_started_at:null,reseller_id:null,reseller_order_id:null,delivered_account:'original:PRIVATE_DELIVERY'},
  claim:{id:9,order_id:12,telegram_id:'777',status:'submitted',request_type:'refund',reason:'The account was deactivated.',issue_type:'deactivated',product_confirmed:1,evidence:'{"kind":"photo","file_id":"fixture"}',refund_amount:'21.60000000',used_days:3,remaining_days:27,deactivated_at:'Yesterday',created_at:date(2),updated_at:date(2),admin_id:null,resolution:null,invoice_snapshot:null,delivery_snapshot:'original:PRIVATE_DELIVERY',proof_mime:'image/jpeg',proof_image:new Uint8Array([255,216,255,1]),bot_id:12345},
  product:{id:2,name:'Current product',description:'Current description',price:'40.00',aftercare_policy:null,warranty_days:0,subscription_days:0,stock:10,required_info:null},
- buyer:{telegram_id:'777',referred_by:null,balance:'5.00000000'},events:[{kind:'completed',summary:'Original fulfillment',actor_id:'123',created_at:date(4)}],notifications:[],audit:[]};
+ buyer:{telegram_id:'777',referred_by:null,balance:'5.00000000'},events:[{kind:'completed',summary:'Original fulfillment',actor_id:'123',created_at:date(4)}],notifications:[],audit:[],messages:[]};
 let state=structuredClone(initial);
 function selected(sql,row){const part=sql.slice(7,sql.indexOf(' FROM '));if(part==='*')return {...row};return Object.fromEntries(part.split(',').map(s=>s.trim().replaceAll('`','')).filter(k=>k in row).map(k=>[k,row[k]]));}
 const env={MANAGER_ADMIN_IDS:'123',TIDB:{
@@ -20,6 +20,9 @@ const env={MANAGER_ADMIN_IDS:'123',TIDB:{
   if(sql.includes('FROM raindeals_web_manager_admins WHERE'))return {rows:[{telegram_id:'900',permissions_json:'["orders"]',is_active:1}]};
   if(sql.includes('COUNT(*) AS total FROM information_schema.tables'))return {rows:[{total:8}]};
   if(sql.startsWith('SHOW COLUMNS')){const table=sql.match(/FROM\s+`?(\w+)/)[1],value=table==='products'?state.product:table==='orders'?state.order:state.claim;return {rows:Object.keys(value).map(Field=>({Field}))};}
+  if(sql.includes('FROM bot_claim_messages'))return {rows:state.messages.map(m=>({...m}))};
+  if(sql.startsWith('INSERT INTO bot_claim_messages')){state.messages.push({id:state.messages.length+1,order_id:args[0],role:'admin',text:args[2],created_at:date(0)});return {rows:[]};}
+  if(sql.startsWith("UPDATE bot_warranty_requests SET status='needs_info'")){state.claim.status='needs_info';return {rows:[]};}
   if(sql.includes('TO_BASE64(proof_image)'))return {rows:[{content:state.claim.proof_image?Buffer.from(state.claim.proof_image).toString('base64'):null,proof_mime:state.claim.proof_mime}]};
   if(sql.includes('MIN(created_at) AS at FROM order_events'))return {rows:[{at:state.events.find(e=>e.kind==='completed')?.created_at}]};
   if(sql.includes('MIN('))return {rows:[]};
@@ -47,6 +50,19 @@ const env={MANAGER_ADMIN_IDS:'123',TIDB:{
 }};
 const request=(path,b,headers={})=>new Request('https://manager.example'+path,{method:b===undefined?'GET':'POST',headers:{cookie:'rd_manager='+'a'.repeat(64),origin:'https://manager.example','x-csrf-token':csrf,...headers},...(b===undefined?{}:{body:JSON.stringify(b)})});
 const review={operation:'approve',proof_reviewed:true,confirm:true};
+assert.equal((await worker.fetch(new Request('https://manager.example/manage/claims/12/conversation'),env)).status,401);
+reader=true;
+assert.equal((await worker.fetch(request('/manage/claims/12/conversation',{text:'Please add a login screenshot.'}),env)).status,403);
+reader=false;
+assert.equal((await worker.fetch(request('/manage/claims/12/conversation',{text:'Please add a login screenshot.'},{'x-csrf-token':'bad'}),env)).status,403);
+assert.equal((await worker.fetch(request('/manage/claims/12/conversation',{text:'Please add a login screenshot.'}),env)).status,200);
+assert.equal(state.claim.status,'needs_info');assert.equal(state.messages.length,1);
+const conversation=await(await worker.fetch(request('/manage/claims/12/conversation'),env)).json();
+assert.equal(conversation.messages[0].text,'Please add a login screenshot.');
+assert(!JSON.stringify(conversation).includes('PRIVATE_DELIVERY'));
+assert.equal(state.notifications[0].chat,'777');
+state=structuredClone(initial);
+
 assert.equal(units('0.00000001'),1n);
 for(const [days,expected] of [[0,'30.00000000'],[1,'30.00000000'],[2,'21.60000000'],[6,'18.40000000'],[7,'16.50000000']]){
  assert.equal(quote({...state.order,coverage_started_at:'2026-11-01 00:00:00'},new Date(Date.UTC(2026,10,1+days))).refund_amount,expected);

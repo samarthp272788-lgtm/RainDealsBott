@@ -126,6 +126,7 @@ async def render_warranty(target, order_id, admin=False):
                     Button(text='📦 Delivered information',callback_data=f'warranty_delivery_{order_id}')])
     buttons.append([Button(text='📋 Full order & submitted details',callback_data=f'order_{order_id}' if admin else f'order_detail_{order_id}')])
     if request:
+        buttons.append([Button(text='💬 Conversation / more proof', callback_data=f'ct_thread_{order_id}')])
         evidence = request['evidence']
         buttons.append([Button(text='🧾 Request details', callback_data=f'warranty_details_{order_id}')])
         if evidence.get('kind') == 'photo' and evidence.get('file_id'):

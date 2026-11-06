@@ -86,6 +86,11 @@ def credit_verified(db, original, amount, inr_amount=None, conversion_rate=None)
         db.rollback()
         fresh = db.get(Deposit, deposit_id)
         return bool(fresh and fresh.status == 'completed' and (fresh.tx_hash, fresh.network, fresh.telegram_id) == expected)
+    wallet = db.query(User).filter(User.telegram_id==deposit.telegram_id).populate_existing().with_for_update().first()
+    if not wallet:
+        db.rollback()
+        return False
+    before_balance = Decimal(str(wallet.balance or 0))
     # Increment at the database: two different deposits cannot lose a wallet update.
     credited = db.query(User).filter(User.telegram_id == deposit.telegram_id).update({
         User.balance: func.coalesce(User.balance, 0) + amount,
@@ -94,6 +99,9 @@ def credit_verified(db, original, amount, inr_amount=None, conversion_rate=None)
     if credited != 1:
         db.rollback()
         return False
+    db.refresh(wallet)
+    from services.wallet_ledger import record_wallet
+    record_wallet(db,wallet,f'Deposit #{deposit.id} · {deposit.network}',before_balance)
     deposit.amount = deposit.received_amount = amount
     deposit.status = 'completed'
     for name, value in extras.items():

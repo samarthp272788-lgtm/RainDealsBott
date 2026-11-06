@@ -523,6 +523,9 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
         (previous_card.get('_card_chat_id') or message.chat.id, previous_card.get(key))
         for key in ('_card_message_id', 'invoice_card_message_id', 'invoice_photo_message_id')
     ]
+    if message.from_user.id in ADMIN_IDS:
+        from services.notification_outbox import private_admin_alert_cards
+        previous_cards.extend(await asyncio.to_thread(private_admin_alert_cards,message.from_user.id,message.bot.id))
     # Reset only transient prompts. Any unpaid/pending invoice remains in the
     # database and is reused/reported by the deposit flow after /start.
     await state.clear()

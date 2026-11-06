@@ -870,6 +870,18 @@ async def order_detail(callback: CallbackQuery):
             style="success",
         )])
 
+    if order.status == 'completed' and not order.refunded:
+        action_buttons.append([
+            InlineKeyboardButton(text='✅ Received' if not order.received_at else '✅ Receipt confirmed', callback_data=f'ct_received_{order.id}', style='success'),
+            InlineKeyboardButton(text='⚠ Not working', callback_data=f'ct_issue_{order.id}', style='danger')])
+    from services.customer_tools import cancellable
+    if cancellable(order):
+        action_buttons.append([InlineKeyboardButton(text='Request cancellation', callback_data=f'ct_cancel_{order.id}')])
+    if order.subscription_expires_at:
+        text += f"\n📅 Subscription ends: {order.subscription_expires_at:%d %b %Y %H:%M} UTC"
+    if order.received_at:
+        text += f"\n✅ Receipt confirmed: {order.received_at:%d %b %Y %H:%M} UTC"
+
     # Delivery Instructions button — shows for completed orders that have instructions
     if order.status == "completed" and has_instruction:
         action_buttons.append([

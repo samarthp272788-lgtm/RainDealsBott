@@ -79,6 +79,20 @@ def get_card_location(user_id: int, chat_id: int):
     return _CARD_LOCATIONS.get((int(user_id), int(chat_id)))
 
 
+async def retire_previous_card(bot, user_id, chat_id, keep_id):
+    """A notification opened as a screen must replace the private menu too."""
+    if int(chat_id) != int(user_id):
+        return  # Never delete another admin's screen in a shared notification group.
+    previous = get_card_location(user_id, chat_id)
+    if previous and previous[1] != keep_id:
+        _cancel_scheduled_card_transition(*previous)
+        _cancel_scheduled_card_delete(*previous)
+        try:
+            await bot.delete_message(chat_id=previous[0], message_id=previous[1])
+        except Exception:
+            logger.debug('Previous conversation card could not be removed')
+
+
 @managed_screen
 async def begin_resumed_card(message: Message, state, previous_data: dict):
     """Wipe only the tracked conversation card/input, then start one new card."""
@@ -446,6 +460,13 @@ async def show(
                     )
                     msg = await callback.message.answer(text, **kwargs)
 
+    await retire_previous_card(getattr(callback, "bot", None) or getattr(callback.message, "bot", None), callback.from_user.id, msg.chat.id, msg.message_id)
+    if (msg.message_id != callback.message.message_id and not getattr(callback, 'resume_wipe_in', False)
+            and not (replace_media and callback.message.photo)):
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
     _remember_card(callback.from_user.id, msg.chat.id, msg.message_id)
     _cancel_scheduled_card_delete(msg.chat.id, msg.message_id)
     schedule_success_notice(msg, text, owner_id=callback.from_user.id)
@@ -502,6 +523,8 @@ async def update_card(
             pass
 
     card_owner_id = int(owner_id or (message.from_user.id if message.from_user else 0))
+    if not force_new_card and chat_id and message_id and card_owner_id:
+        await retire_previous_card(message.bot, card_owner_id, message.chat.id, message_id)
 
     if force_new_card:
         # A user may have cleared chat history while the database still points
@@ -581,6 +604,10 @@ async def update_card(
         except TelegramBadRequest as exc:
             if "message is not modified" in str(exc).lower():
                 _cancel_scheduled_card_delete(chat_id, message_id)
+                if card_owner_id:
+                    _remember_card(card_owner_id,chat_id,message_id)
+                if state is not None:
+                    await state.update_data(**{_CARD_CHAT_ID_KEY:chat_id,_CARD_MESSAGE_ID_KEY:message_id})
                 return None
             if "message is too long" in str(exc).lower():
                 logger.warning("update_card(): message too long (%d chars), truncating", len(text))
@@ -604,6 +631,10 @@ async def update_card(
                 except TelegramBadRequest as caption_exc:
                     if "message is not modified" in str(caption_exc).lower():
                         _cancel_scheduled_card_delete(chat_id, message_id)
+                        if card_owner_id:
+                            _remember_card(card_owner_id,chat_id,message_id)
+                        if state is not None:
+                            await state.update_data(**{_CARD_CHAT_ID_KEY:chat_id,_CARD_MESSAGE_ID_KEY:message_id})
                         return None
                     logger.info(
                         "update_card(): text/caption edit failed (%s / %s)",

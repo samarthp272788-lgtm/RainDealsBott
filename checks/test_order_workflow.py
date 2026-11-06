@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from sqlalchemy import Boolean, Column, Integer, String, create_engine, text
+from sqlalchemy import Boolean, Column, Integer, Numeric, Text, String, create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 from services.checkout_actions import action_key, claim_checkout, finish_checkout, recover_checkout
 from services.order_workflow import change_work, queue_orders, read_timeline, record_event, work_details
@@ -30,6 +30,207 @@ def fixture_module(path, name):
 
 
 class WorkflowTests(unittest.TestCase):
+    def customer_service(self):
+        return fixture_module('services/customer_tools.py','_customer_tools_service')
+
+    def customer_user(self,balance='10'):
+        with self.factory.begin() as db:
+            user=self.users.User(telegram_id=7,full_name='Buyer',balance=Decimal(balance))
+            db.add(user)
+
+    def test_customer_preferences_do_not_disable_financial_receipts(self):
+        self.customer_user()
+        service=self.customer_service()
+        self.assertFalse(service.preferences(7,'restock')['restock'])
+        from services.notification_outbox import enqueue
+        with self.transaction() as db:
+            enqueue(db,'restock:9:receipt',7,'Optional restock')
+            enqueue(db,'refund:9',7,'Mandatory money receipt')
+        with self.factory() as db:
+            self.assertEqual([r.body for r in db.query(self.operations.NotificationJob).all()],['Mandatory money receipt'])
+
+    def test_already_queued_optional_notification_is_skipped_after_muting(self):
+        self.customer_user()
+        service=self.customer_service()
+        from services.notification_outbox import enqueue,claim_next
+        with self.transaction() as db: enqueue(db,'restock:9:before-muting',7,'Optional')
+        service.preferences(7,'restock')
+        self.assertEqual(claim_next(12345),{'skipped':True})
+        with self.factory() as db:
+            self.assertEqual(db.query(self.operations.NotificationJob).one().status,'resolved')
+
+    def test_receipt_confirmation_is_owner_only_and_idempotent(self):
+        service=self.customer_service()
+        order_id=self.add_order(status='completed')
+        with self.assertRaises(ValueError): service.receive_order(8,order_id)
+        first=service.receive_order(7,order_id)
+        self.assertEqual(first,service.receive_order(7,order_id))
+        with self.factory() as db:
+            self.assertEqual(db.query(self.workflow.OrderEvent).filter_by(kind='received').count(),1)
+
+    def test_cancellation_stops_at_delivery_boundary_and_notifies_admin_group(self):
+        service=self.customer_service()
+        order_id=self.add_order(delivered_account=None,reseller_id=None)
+        self.assertEqual(service.request_cancellation(7,order_id,'Bought the wrong plan.'),'submitted')
+        self.assertEqual(service.request_cancellation(7,order_id,'Repeat request.'),'submitted')
+        with self.factory() as db:
+            jobs=db.query(self.operations.NotificationJob).all()
+            self.assertEqual([r.chat_id for r in jobs],['@AdminNotify'])
+        partial=self.add_order(delivered_account='one delivered')
+        with self.assertRaises(ValueError): service.request_cancellation(7,partial,'Do not want it.')
+        with self.assertRaises(ValueError): service.request_cancellation(8,order_id,'Another buyer.')
+
+    def test_claim_followup_preserves_original_quote_and_private_proof(self):
+        from services import warranty
+        service=self.customer_service()
+        order_id=self.add_order(status='completed',aftercare_policy='refund',subscription_days=30,amount=Decimal('3'),
+                                coverage_started_at=datetime.utcnow()-timedelta(days=4))
+        image=b'\xff\xd8\xff'+b'fixture'
+        self.assertIsNone(warranty.submit(order_id,7,'Account stopped working.',{'kind':'photo','file_id':'fixture'},
+                          'Today',proof_bytes=image))
+        with self.factory() as db:
+            original=db.query(self.operations.WarrantyRequest).one()
+            quote,submitted=original.refund_amount,original.created_at
+        service.claim_reply(101,order_id,'Please show the error after signing in.',True)
+        self.assertEqual(service.claim_conversation(7,order_id)[0],'needs_info')
+        with self.assertRaises(ValueError): service.claim_reply(8,order_id,'Forged reply.',False)
+        service.claim_reply(7,order_id,'Here is the error screenshot.',image=image)
+        with self.factory() as db:
+            claim=db.query(self.operations.WarrantyRequest).one()
+            self.assertEqual((claim.status,claim.refund_amount,claim.created_at),('submitted',quote,submitted))
+            reply=db.query(self.tools.ClaimMessage).filter_by(role='customer').one()
+            message_id=reply.id
+            jobs=db.query(self.operations.NotificationJob).all()
+            self.assertNotIn('101',[r.chat_id for r in jobs])
+            self.assertNotIn('102',[r.chat_id for r in jobs])
+        self.assertEqual(service.claim_reply_image(7,message_id)[0],image)
+        with self.assertRaises(ValueError): service.claim_reply_image(8,message_id)
+
+    def test_wallet_entry_and_reconciliation_do_not_change_the_wallet(self):
+        service=self.customer_service()
+        self.customer_user()
+        self.assertEqual(service.wallet_statement(7)[0],Decimal('10'))
+        with self.transaction() as db:
+            user=db.query(self.users.User).filter_by(telegram_id=7).one()
+            user.balance=Decimal('8')
+            service.record_wallet(db,user,'Purchase #1',Decimal('10'))
+        balance,rows,_=service.wallet_statement(7)
+        self.assertEqual(balance,Decimal('8'))
+        self.assertEqual(rows[0]['amount'],Decimal('-2'))
+        with self.factory.begin() as db:
+            db.query(self.users.User).filter_by(telegram_id=7).update({'balance':Decimal('9')})
+        balance,rows,_=service.wallet_statement(7)
+        self.assertEqual(rows[0]['amount'],Decimal('1'))
+        self.assertIn('reconciliation',rows[0]['label'])
+        with self.factory() as db: self.assertEqual(db.query(self.tools.WalletEntry).count(),3)
+
+    def test_subscription_reminder_deduplication_and_preferences(self):
+        service=self.customer_service()
+        self.customer_user()
+        self.add_order(status='completed',term_days=30,subscription_expires_at=datetime.utcnow()+timedelta(hours=12))
+        service.subscription_reminders()
+        service.subscription_reminders()
+        with self.factory() as db: self.assertEqual(db.query(self.operations.NotificationJob).count(),1)
+        service.preferences(7,'subscription')
+        self.add_order(status='completed',term_days=30,subscription_expires_at=datetime.utcnow()+timedelta(hours=12))
+        service.subscription_reminders()
+        with self.factory() as db: self.assertEqual(db.query(self.operations.NotificationJob).count(),1)
+
+    def cart_fixture(self):
+        self.customer_user()
+        with self.factory.begin() as db: db.add(self.products(id=10,name='Plan',price=Decimal('1'),stock=3))
+        service=fixture_module('services/cart.py','_cart_service')
+        namespace=SimpleNamespace(_active_custom_price=lambda *a:None,_get_bulk_price=lambda *a:None,
+                                  _money=lambda value:Decimal(str(value)).quantize(Decimal('.00000001')))
+        return service,namespace
+
+    def test_cart_review_rechecks_price_quantity_and_owner(self):
+        service,namespace=self.cart_fixture()
+        with patch.dict(sys.modules,{'handlers.products':namespace}):
+            service.change(7,10,2)
+            token,lines,total=service.prepare(7)
+            self.assertEqual(total,Decimal('2'))
+            with self.factory.begin() as db: db.get(self.products,10).price=Decimal('2')
+            with self.assertRaises(ValueError): service.claim(7,token)
+            with self.assertRaises(ValueError): service.result(8,token)
+            with self.factory() as db:
+                self.assertEqual(db.query(self.orders.Order).count(),0)
+                self.assertEqual(db.query(self.users.User).one().balance,Decimal('10'))
+
+    def test_cart_confirmation_claimed_once_and_success_removes_only_its_item(self):
+        service,namespace=self.cart_fixture()
+        with patch.dict(sys.modules,{'handlers.products':namespace}):
+            service.change(7,10,2)
+            token,_,_=service.prepare(7)
+            self.assertIsNotNone(service.claim(7,token))
+            self.assertIsNone(service.claim(7,token))
+            with self.assertRaises(ValueError): service.change(7,10,3)
+            service.save_result(7,token,0,{'order_id':55})
+            self.assertEqual(service.view(7)[0],[])
+            self.assertEqual(service.result(7,token)['results'][0]['order_id'],55)
+
+    def test_cart_supplier_uncertainty_holds_without_reordering(self):
+        service,namespace=self.cart_fixture()
+        with self.factory.begin() as db: db.get(self.products,10).source='reseller'
+        with patch.dict(sys.modules,{'handlers.products':namespace}):
+            service.change(7,10,1)
+            token,_,_=service.prepare(7)
+            service.claim(7,token)
+            service.save_result(7,token,0,{'needs_review':True})
+            self.assertEqual(service.result(7,token)['status'],'held')
+            with self.assertRaises(ValueError): service.prepare(7)
+
+    def test_recovery_stops_old_cart_worker_from_dispatching_another_item(self):
+        service,namespace=self.cart_fixture()
+        with patch.dict(sys.modules,{'handlers.products':namespace}):
+            service.change(7,10,1)
+            token,_,_=service.prepare(7)
+            service.claim(7,token)
+            with self.factory.begin() as db:
+                db.get(self.tools.CartCheckout,token).updated_at=datetime.utcnow()-timedelta(minutes=10)
+            self.assertEqual(service.result(7,token)['status'],'held')
+            self.assertFalse(service.save_result(7,token,0,{'order_id':55}))
+            self.assertEqual(service.result(7,token)['results'],[])
+
+    def test_cancellation_approval_checks_delivery_again_and_refunds_once(self):
+        from unittest.mock import Mock
+        from services.notification_outbox import enqueue
+        service=self.customer_service()
+        self.customer_user()
+        with self.factory.begin() as db: db.add(self.products(id=10,stock=2,file_content=None,delivery_type='manual'))
+        order_id=self.add_order(product_id=10,quantity=1,automatic_quantity=0,stock_deducted_quantity=1,amount=Decimal('2'))
+        service.request_cancellation(7,order_id,'Wrong plan, please cancel.')
+        refund=self.extract_function('handlers/admin_orders.py','_do_refund',dict(
+            transaction=self.transaction,Order=self.orders.Order,User=self.users.User,Product=self.products,
+            AdminAuditLog=self.audit.AdminAuditLog,Decimal=Decimal,_money=lambda v:Decimal(str(v or 0)),
+            enqueue=enqueue,record_event=record_event,logger=Mock()))
+        with patch.dict(sys.modules,{'services.customer_tools':service}):
+            self.assertNotIn('error',refund(order_id,101,True))
+            self.assertIn('error',refund(order_id,101,True))
+        with self.factory() as db:
+            self.assertEqual(db.query(self.users.User).one().balance,Decimal('12'))
+            self.assertEqual(db.get(self.products,10).stock,3)
+            self.assertEqual(db.get(self.tools.CancellationRequest,order_id).status,'approved')
+        late=self.add_order(product_id=10,quantity=1,automatic_quantity=0,amount=Decimal('2'))
+        service.request_cancellation(7,late,'Changed my mind, cancel.')
+        with self.factory.begin() as db:
+            order=db.get(self.orders.Order,late)
+            order.status,order.delivered_account='completed','already delivered'
+        with patch.dict(sys.modules,{'services.customer_tools':service}):
+            self.assertIn('error',refund(late,101,True))
+        with self.factory() as db: self.assertEqual(db.query(self.users.User).one().balance,Decimal('12'))
+
+    def test_pending_private_admin_alerts_move_to_notify_once(self):
+        from services.notification_outbox import enqueue,reroute_pending_admin_alerts
+        markup={'inline_keyboard':[[{'text':'Review','callback_data':'warranty_admin_15'}]]}
+        with self.transaction() as db:
+            enqueue(db,'warranty:15',101,'Review needed',reply_markup=markup)
+            enqueue(db,'warranty:15',102,'Review needed',reply_markup=markup)
+        reroute_pending_admin_alerts(12345)
+        reroute_pending_admin_alerts(12345)
+        with self.factory() as db:
+            self.assertEqual(db.query(self.operations.NotificationJob).filter_by(status='queued',chat_id='@AdminNotify').count(),1)
+            self.assertEqual(db.query(self.operations.NotificationJob).filter_by(status='resolved').count(),2)
     @classmethod
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory()
@@ -49,6 +250,18 @@ class WorkflowTests(unittest.TestCase):
             warranty_days = Column(Integer, nullable=False, default=0)
             aftercare_policy = Column(String(16), nullable=True)
             subscription_days = Column(Integer, nullable=False, default=0)
+            term_days = Column(Integer, nullable=False, default=0)
+            name = Column(String(100), nullable=False, default='Fixture product')
+            price = Column(Numeric(20,8), nullable=False, default=Decimal('1'))
+            stock = Column(Integer, nullable=False, default=3)
+            is_active = Column(Boolean, nullable=False, default=True)
+            source = Column(String(20), nullable=False, default='own')
+            delivery_type = Column(String(20), nullable=False, default='automatic')
+            file_content = Column(Text, nullable=True, default='one\ntwo\nthree')
+            bulk_pricing = Column(Text, nullable=True)
+            manual_fallback = Column(Boolean, nullable=False, default=False)
+            preorder = Column(Boolean, nullable=False, default=False)
+
         cls.products, cls.providers = Product, Provider
         cls.factory = sessionmaker(bind=cls.engine, autoflush=False, expire_on_commit=False)
         class SQLAdapter:
@@ -66,12 +279,13 @@ class WorkflowTests(unittest.TestCase):
                 yield SQLAdapter(session)
         cls.transaction = staticmethod(transaction)
         cls.modules = patch.dict(sys.modules, {'database': SimpleNamespace(Base=cls.Base, SessionLocal=cls.factory, transaction=transaction),
-                                               'config': SimpleNamespace(ADMIN_IDS=[101, 102], BOT_TOKEN='12345:fixture')})
+                                               'config': SimpleNamespace(ADMIN_IDS=[101, 102], BOT_TOKEN='12345:fixture', ADMIN_ORDER_NOTIFICATION_CHANNEL_ID='@AdminNotify')})
         cls.modules.start()
         cls.orders = fixture_module('models/order.py', '_test_orders')
         cls.workflow = fixture_module('models/order_workflow.py', '_test_order_workflow')
         cls.submissions = fixture_module('models/order_requirement_submission.py', '_test_submissions')
         cls.audit = fixture_module('models/admin_audit_log.py', '_test_audit')
+        cls.tools = fixture_module('models/customer_tools.py', '_test_customer_tools')
         cls.operations = fixture_module('models/bot_operations.py', '_test_operations')
         cls.deposits = fixture_module('models/deposit.py', '_test_deposits')
         cls.users = fixture_module('models/user.py', '_test_users')
@@ -83,7 +297,7 @@ class WorkflowTests(unittest.TestCase):
         cls.models = patch.dict(sys.modules, {'models.order': cls.orders, 'models.order_workflow': cls.workflow,
                                               'models.order_requirement_submission': cls.submissions,
                                               'models.admin_audit_log': cls.audit,
-                                              'models.bot_operations': cls.operations,
+                                              'models.bot_operations': cls.operations, 'models.customer_tools': cls.tools,
                                               'models.deposit': cls.deposits, 'models.user': cls.users,
                                               'models.product_engagement': cls.engagement, 'models.api_key': cls.api_keys,
                                               'models.manager_auth': cls.manager_auth,
@@ -250,7 +464,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIsNotNone(warranty.review(order_id, 102, 'complete', 'duplicate'))
         with self.factory() as db:
             self.assertEqual(db.query(self.operations.WarrantyRequest).count(), 1)
-            self.assertEqual(db.query(self.operations.NotificationJob).count(), 4)  # Two admins, approval, delivery.
+            self.assertEqual(db.query(self.operations.NotificationJob).count(), 3)  # One Admin Notify destination, approval, delivery.
         self.assertEqual(warranty.context(order_id, 7)['request']['status'], 'completed')
 
     def test_warranty_requires_eligible_order_and_evidence(self):
@@ -714,7 +928,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(order.refund_amount, Decimal('72'))
             self.assertEqual(db.query(self.users.User).one().balance, Decimal('77'))
             self.assertEqual(db.query(self.audit.AdminAuditLog).filter_by(action='policy_refund').count(), 1)
-            self.assertEqual(db.query(self.operations.NotificationJob).count(), 3)
+            self.assertEqual(db.query(self.operations.NotificationJob).count(), 2)
         self.assertEqual(warranty.pending()[0], 0)
         self.assertEqual(warranty.context(order_id, 7)['request']['status'], 'completed')
 

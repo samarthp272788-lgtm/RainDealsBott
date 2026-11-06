@@ -11,6 +11,7 @@ def get_main_menu() -> InlineKeyboardMarkup:
                     style="primary",
                 )
             ],
+            [InlineKeyboardButton(text="🛒 Cart", callback_data="ct_cart", style="primary"), InlineKeyboardButton(text="⚙ Preferences", callback_data="ct_preferences")],
             [
                 InlineKeyboardButton(
                     text="💳 Wallet",
@@ -75,6 +76,7 @@ def get_admin_main_menu() -> InlineKeyboardMarkup:
                     style="primary",
                 )
             ],
+            [InlineKeyboardButton(text="🛒 Cart", callback_data="ct_cart", style="primary"), InlineKeyboardButton(text="⚙ Preferences", callback_data="ct_preferences")],
             [
                 InlineKeyboardButton(
                     text="💳 Wallet",

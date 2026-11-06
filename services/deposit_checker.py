@@ -2264,21 +2264,6 @@ async def _notify_attempt_limit(bot, result_info: dict) -> None:
     except Exception:
         logger.exception("Failed to notify user %s about cancelled deposit", telegram_id)
 
-    for admin_id in getattr(config, "ADMIN_IDS", []):
-        try:
-            await queue_message(bot, f"deposit-attempt-limit:{result_info.get('deposit_id')}",
-                admin_id,
-                "⚠️ <b>Deposit Verification Cancelled</b>\n\n"
-                f"🆔 Deposit: <code>#{result_info.get('deposit_id')}</code>\n"
-                f"👤 User: <code>{telegram_id}</code>\n"
-                f"📡 Network: <code>{result_info.get('network') or 'Unknown'}</code>\n"
-                f"🔁 Checks used: <code>{result_info.get('attempts', MAX_CHECK_ATTEMPTS)}</code>\n\n"
-                "Automatic verification has stopped for this deposit.",
-                parse_mode="HTML",
-            )
-        except Exception:
-            logger.exception("Failed to alert admin %s about cancelled deposit", admin_id)
-
     notification_channel = getattr(config, "NOTIFICATION_CHANNEL_ID", "")
     if notification_channel:
         try:

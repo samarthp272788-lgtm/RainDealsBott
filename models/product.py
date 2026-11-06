@@ -75,6 +75,7 @@ class Product(Base):
     warranty_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default='0')
     # NULL preserves the earlier warranty_days policy; new setup explicitly chooses.
     aftercare_policy: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    term_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     subscription_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default='0')
 
     # DECIMAL(20, 8) — always compare/multiply as Decimal.

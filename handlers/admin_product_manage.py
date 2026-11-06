@@ -491,7 +491,7 @@ def _build_product_panel(product: Product):
         [tile('🔴 Disable' if product.is_active else '🟢 Enable', 'toggle', 'danger' if product.is_active else 'success'), tile('🌐 API: ON' if api_on else '🌐 API: OFF', 'toggle_api')],
         [tile('📦 Preorder: ON' if product.preorder else '📦 Preorder: OFF', 'toggle_preorder'), tile('📦 Bulk Pricing', 'edit_bulk')],
         [tile('⚠️ Stock Alert', 'edit_threshold'), tile('📝 Description', 'desc')],
-        [tile('🔗 Create Product Link', 'create_product_link')],
+        [tile('🔗 Create Product Link', 'create_product_link'), tile('📅 Subscription term', 'ct_term')],
         [tile('🗑 Delete Product', 'delete_product', 'danger')],
         [InlineKeyboardButton(text='⬅ Back', callback_data='admin_products', style='primary')],
     ]

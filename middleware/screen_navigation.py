@@ -14,7 +14,7 @@ def is_navigation(event):
     return value in exact or value.startswith((
         'products_cat_', 'product_', 'select_qty_', 'order_detail_', 'orders_page_',
         'order_timeline_', 'admin_timeline_', 'work_queue_', 'work_view_', 'admin_orders_page_',
-        'resume_deposit_', 'cancel_buy_', 'order_', 'admin_', 'warranty_', 'addcare_', 'ops_'))
+        'resume_deposit_', 'cancel_buy_', 'order_', 'admin_', 'warranty_', 'addcare_', 'ops_', 'ct_'))
 
 
 class ScreenNavigationMiddleware(BaseMiddleware):

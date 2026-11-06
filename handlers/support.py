@@ -784,7 +784,8 @@ async def create_ticket(message: Message, state: FSMContext):
     )
 
     # Notify admins
-    for admin in ADMIN_IDS:
+    from services.notification_outbox import admin_destination
+    for admin in filter(None, [admin_destination()]):
         try:
             username = (
                 f"@{message.from_user.username}"
@@ -827,7 +828,8 @@ async def create_ticket(message: Message, state: FSMContext):
                 ]
             )
 
-            await message.bot.send_message(
+            from services.notification_outbox import queue_message
+            await queue_message(message.bot, f"admin-ticket:{ticket_id}",
                 admin,
                 f"🔔 <b>New Support Ticket #{ticket_id}</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
