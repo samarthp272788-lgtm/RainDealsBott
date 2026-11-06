@@ -44,14 +44,14 @@ def _cart_display_amount(value):
 
 
 async def notifications_screen(target,page=0):
-    text=("🔔 <b>Notifications</b>\n\n"
-          "Welcome back to RainDeals Notifications.\n"
-          "Stay up to date with your account, payments, wallet, and support.\n"
-          "Your recent updates are kept here so you can revisit them anytime.\n"
-          "Tap a message to open its available action.")
+    text=("🔔 <b>RAINDEALS NOTIFICATIONS</b>\n\n"
+          "✨ Stay informed about your RainDeals account.\n"
+          "💳 Payment and wallet updates, support replies, claim decisions, and restock alerts keep you up to date.\n"
+          "📩 When an update needs action, use the button on its message to continue.\n"
+          "⚙️ Manage optional alerts below.")
     buttons=[
         [Button(text='⚙ Preferences',callback_data='ct_preferences')],
-        [Button(text='🏠 Home',callback_data='main_menu')],
+        [Button(text='🏠 Main Menu',callback_data='main_menu')],
     ]
     await answer_card(target,text,parse_mode='HTML',reply_markup=kb(buttons),replace_media=True)
 

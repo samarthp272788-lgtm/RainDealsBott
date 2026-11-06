@@ -229,7 +229,7 @@ def mark_read(user_id, through_id, bot_id=None):
 def badge(unread):
     count = max(0, int(unread))
     label = '99+' if count > 99 else str(count)
-    return '🔔 Notifications' + (f' · 🔴 {label}' if count else '')
+    return '🔔 Notifications' + (f' · {label} new' if count else '')
 
 
 async def refresh_home_badge(bot, user_id):
