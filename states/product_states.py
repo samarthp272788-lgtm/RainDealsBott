@@ -12,6 +12,8 @@ class AddProduct(StatesGroup):
     category = State()
     price = State()
     description = State()
+    aftercare_policy = State()
+    aftercare_days = State()
     delivery_type = State()
     manual_fallback = State()
     stock_capacity = State()

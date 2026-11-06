@@ -57,6 +57,16 @@ def ensure_order_requirements_schema() -> None:
     )
     with engine.begin() as connection:
         _ensure_column(connection, "bot_notification_jobs", "reply_markup", "JSON NULL")
+        _ensure_column(connection, "bot_warranty_requests", "request_type", "VARCHAR(16) NOT NULL DEFAULT 'warranty'")
+        _ensure_column(connection, "bot_warranty_requests", "refund_amount", "DECIMAL(20,8) NULL")
+        _ensure_column(connection, "bot_warranty_requests", "used_days", "INT NULL")
+        _ensure_column(connection, "bot_warranty_requests", "remaining_days", "INT NULL")
+        _ensure_column(connection, "bot_warranty_requests", "deactivated_at", "VARCHAR(200) NULL")
+        for table in ('products', 'orders'):
+            _ensure_column(connection, table, 'aftercare_policy', 'VARCHAR(16) NULL')
+            _ensure_column(connection, table, 'subscription_days', 'INT NOT NULL DEFAULT 0')
+        _ensure_column(connection, 'orders', 'coverage_started_at', 'DATETIME NULL')
+        _ensure_column(connection, 'orders', 'refund_amount', 'DECIMAL(20,8) NULL')
         _ensure_index(connection, 'bot_notification_jobs', ['bot_id','chat_id','status','error_code','next_attempt_at'], 'ix_notification_destination_backoff')
         _ensure_index(connection, 'bot_notification_jobs', ['bot_id','status','next_attempt_at','id'], 'ix_notification_delivery_queue')
         _ensure_unique_columns(connection, 'deposits', ['tx_hash'], 'uq_deposits_tx_hash')

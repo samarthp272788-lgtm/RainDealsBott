@@ -113,6 +113,10 @@ class Order(Base):
     fulfillment_priority: Mapped[str] = mapped_column(String(12), nullable=False, default='normal', server_default='normal')
     warranty_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default='0')
     warranty_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    aftercare_policy: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    subscription_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default='0')
+    coverage_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    refund_amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8), nullable=True)
     admin_notification_queued_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     # For a manual reseller API order, this is the reseller's end customer.

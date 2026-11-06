@@ -5,7 +5,7 @@ import sys
 from unittest.mock import AsyncMock, Mock, patch
 from types import SimpleNamespace
 
-from aiogram.types import Chat, Message, User
+from aiogram.types import Chat, Message, User, CallbackQuery
 from middleware.session_timeout import CallbackSessionTimeoutMiddleware
 from services.session_resume import make_snapshot
 import services.session_resume as resume
@@ -50,6 +50,40 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(make_snapshot('AddProvider:api_key', {'api_key': 'secret'}))
         self.assertIsNone(make_snapshot(None, {}, 'deposit_bep20'))  # Never replay creation.
         self.assertIsNone(make_snapshot(None, {}, 'confirm_buy_9'))
+
+    async def test_direct_prompt_recorder_preserves_keyboard_and_skips_expiry_notice(self):
+        from aiogram.methods import EditMessageText
+        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+        from services.screen_controller import current_screen, get_screen
+        from services.session_resume import DraftPromptRecorder, saved_prompt, without_prompt_capture
+        key = (71,71)
+        entry = get_screen(key)
+        token = current_screen.set((key,entry,entry.version))
+        try:
+            recorder = DraftPromptRecorder()
+            method = EditMessageText(chat_id=71,message_id=9,text='Choose category',reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text='Existing',callback_data='addproduct:existing_catalog')]]))
+            await recorder(AsyncMock(return_value=True),Mock(),method)
+            self.assertEqual(saved_prompt(key)['text'],'Choose category')
+            self.assertEqual(saved_prompt(key)['reply_markup']['inline_keyboard'][0][0]['callback_data'],'addproduct:existing_catalog')
+            with without_prompt_capture():
+                await recorder(AsyncMock(return_value=True),Mock(),method.model_copy(update={'text':'Session ended'}))
+            self.assertEqual(saved_prompt(key)['text'],'Choose category')
+        finally:
+            current_screen.reset(token)
+
+    async def test_refund_form_can_resume_but_does_not_submit_itself(self):
+        data = dict(warranty_order=21,warranty_reason='Account was deactivated',
+                    warranty_evidence={'kind':'photo','file_id':'fixture'},warranty_expected_refund='21.60000000')
+        snapshot = make_snapshot('Inputs:confirmation',data,prompt={'text':'Review claim','reply_markup':None})
+        state = State()
+        with patch('handlers.restart.load_resume',AsyncMock(return_value=snapshot)), \
+             patch('handlers.restart.save_resume'),patch('handlers.restart.answer_card',AsyncMock()) as answer:
+            await restart_cmd(message('/restart'),state)
+        self.assertEqual(state.state,'Inputs:confirmation')
+        self.assertEqual(state.data['warranty_order'],21)
+        self.assertEqual(state.data['warranty_evidence']['file_id'],'fixture')
+        self.assertEqual(answer.call_args.args[1],'Review claim')
 
     async def test_restart_restores_quantity_without_replaying_purchase(self):
         snapshot = make_snapshot('PurchaseStates:waiting_qty', {'pending_product_id': 9})
@@ -97,7 +131,7 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_idle_input_does_not_reach_payment_handler_until_restart(self):
         middleware = CallbackSessionTimeoutMiddleware()
-        middleware._sessions[(7, 7)] = (datetime.now().timestamp() - 500, 420)
+        middleware._sessions[(7, 7)] = (datetime.now().timestamp() - 1300, 1200)
         state = State('DepositState:waiting_txid', {'deposit_id': 55})
         handler = AsyncMock()
         with patch('utils.ui.answer_card', AsyncMock()) as answer:
@@ -108,7 +142,7 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_restart_command_passes_expiry_gate(self):
         middleware = CallbackSessionTimeoutMiddleware()
-        middleware._sessions[(7, 7)] = (datetime.now().timestamp() - 500, 420)
+        middleware._sessions[(7, 7)] = (datetime.now().timestamp() - 1300, 1200)
         handler = AsyncMock()
         with patch('middleware.session_timeout.save_resume'):
             await middleware(handler, message('/restart'), {'state': State('PurchaseStates:waiting_qty')})
@@ -164,6 +198,88 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
             await restart_cmd(message('/restart'), state)
         start.start_cmd.assert_awaited_once()
         self.begin_card.assert_not_awaited()
+
+    async def test_live_admin_product_draft_and_keyboard_resume_before_deferred_save(self):
+        from decimal import Decimal
+        state = State('AddProduct:aftercare_policy',dict(name='Fixture',price=Decimal('1.25'),draft_accounts=['fixture:user']))
+        prompt = dict(text='Choose aftercare',reply_markup={'inline_keyboard':[[{'text':'Refund','callback_data':'addcare_refund'}]]})
+        with patch('handlers.restart.is_admin',return_value=True), \
+             patch('handlers.restart.saved_prompt',return_value=prompt), \
+             patch('handlers.restart.load_resume',AsyncMock()) as load, \
+             patch('handlers.restart.save_resume'), patch('handlers.restart.answer_card',AsyncMock()) as answer:
+            await restart_cmd(message('/restart'),state)
+        load.assert_not_awaited()
+        self.assertEqual(state.state,'AddProduct:aftercare_policy')
+        self.assertEqual(state.data['price'],Decimal('1.25'))
+        self.assertEqual(state.data['draft_accounts'],['fixture:user'])
+        self.assertEqual(answer.call_args.args[1],'Choose aftercare')
+        self.assertEqual(answer.call_args.kwargs['reply_markup'].inline_keyboard[0][0].callback_data,'addcare_refund')
+
+    async def test_persisted_admin_draft_requires_current_admin_permission(self):
+        snapshot = make_snapshot('AddProduct:price',{'name':'Fixture'},admin=True,prompt={'text':'Send price'})
+        state = State()
+        with patch('handlers.restart.is_admin',return_value=False), \
+             patch('handlers.restart.load_resume',AsyncMock(return_value=snapshot)), \
+             patch('handlers.restart.save_resume') as save, patch('handlers.restart.answer_card',AsyncMock()) as answer:
+            await restart_cmd(message('/restart'),state)
+        self.assertIsNone(state.state)
+        self.begin_card.assert_not_awaited()
+        save.assert_called_once_with((7,7),None)
+        self.assertIn('access',answer.call_args.args[1])
+
+    async def test_admin_idle_draft_is_saved_without_separate_expiry_message(self):
+        middleware = CallbackSessionTimeoutMiddleware()
+        middleware._sessions[(7,7)] = (datetime.now().timestamp()-901,900)
+        state = State('AddProduct:price',{'name':'Fixture'})
+        callback = CallbackQuery(id='cb',from_user=User(id=7,is_bot=False,first_name='Admin'),
+                                 chat_instance='fixture',message=message('Send price'),data='addcare_refund').as_(Mock())
+        handler = AsyncMock()
+        with patch('middleware.session_timeout.is_admin',return_value=True), \
+             patch('middleware.session_timeout.save_resume') as save, \
+             patch.object(CallbackQuery,'answer',AsyncMock()) as popup, \
+             patch('utils.ui.show',AsyncMock()) as show:
+            await middleware(handler,callback,{'state':state})
+        handler.assert_not_awaited()
+        show.assert_not_awaited()
+        popup.assert_awaited_once()
+        self.assertTrue(popup.call_args.kwargs['show_alert'])
+        self.assertEqual(save.call_args.args[1]['state'],'AddProduct:price')
+        self.assertEqual(save.call_args.args[1]['data']['name'],'Fixture')
+
+    async def test_payment_idle_is_twenty_minutes_and_every_input_refreshes_it(self):
+        middleware = CallbackSessionTimeoutMiddleware()
+        state = State('DepositState:waiting_txid',{'deposit_id':55})
+        middleware._sessions[(7,7)] = (datetime.now().timestamp()-16*60,1200)
+        handler = AsyncMock()
+        with patch('middleware.session_timeout.save_resume'),patch('utils.ui.answer_card',AsyncMock()) as answer:
+            await middleware(handler,message('payment-reference'),{'state':state})
+        handler.assert_awaited_once()
+        answer.assert_not_awaited()
+        self.assertLess(abs(middleware._sessions[(7,7)][0]-datetime.now().timestamp()),2)
+        self.assertEqual(middleware._sessions[(7,7)][1],1200)
+
+    async def test_old_message_does_not_expire_a_recently_active_session(self):
+        middleware = CallbackSessionTimeoutMiddleware()
+        middleware._sessions[(7,7)] = (datetime.now().timestamp()-10,900)
+        old = message('Menu').model_copy(update={'date':datetime.now(timezone.utc)-timedelta(hours=2)})
+        callback = CallbackQuery(id='cb',from_user=old.from_user,chat_instance='fixture',message=old,data='products_menu').as_(Mock())
+        handler = AsyncMock()
+        with patch('middleware.session_timeout.save_resume'),patch.object(CallbackQuery,'answer',AsyncMock()) as popup:
+            await middleware(handler,callback,{'state':State()})
+        handler.assert_awaited_once()
+        popup.assert_not_awaited()
+
+    async def test_saved_activity_after_process_restart_is_used_instead_of_message_age(self):
+        middleware = CallbackSessionTimeoutMiddleware()
+        old = message('Products').model_copy(update={'date':datetime.now(timezone.utc)-timedelta(hours=2)})
+        callback = CallbackQuery(id='cb',from_user=old.from_user,chat_instance='fixture',message=old,data='products_menu').as_(Mock())
+        snapshot = make_snapshot(None,{},'products_menu',last_activity=datetime.now().timestamp()-10)
+        handler = AsyncMock()
+        with patch('middleware.session_timeout.load_resume',AsyncMock(return_value=snapshot)), \
+             patch('middleware.session_timeout.save_resume'),patch.object(CallbackQuery,'answer',AsyncMock()) as popup:
+            await middleware(handler,callback,{'state':State()})
+        handler.assert_awaited_once()
+        popup.assert_not_awaited()
 
     async def test_saved_product_page_is_restored_with_wipe_in_flag(self):
         snapshot = make_snapshot(None, {'_card_chat_id': 7, '_card_message_id': 11}, 'product_9')

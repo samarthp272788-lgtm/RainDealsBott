@@ -1267,122 +1267,8 @@ async def product_price(message: Message, state: FSMContext):
 
     await state.update_data(price=price)
 
-    # If reseller product, finalize and save/update database record immediately
     if data.get("source") == "reseller":
-        reseller_name = data.get("reseller_name", "Reseller")
-        reseller_service_id = data.get("reseller_service_id")
-        reseller_cost = data.get("reseller_cost")
-        reseller_stock = data.get("reseller_import_quantity", 0)
-
-        db = SessionLocal()
-        try:
-            reseller_id_val = data.get("reseller_id")
-            parsed_provider_id = None
-
-            if reseller_id_val is not None:
-                try:
-                    parsed_provider_id = int(reseller_id_val)
-                except (ValueError, TypeError):
-                    if Provider is not None:
-                        db_prov = db.query(Provider).filter(
-                            (Provider.name == str(reseller_id_val)) |
-                            (getattr(Provider, "id", None) == reseller_id_val)
-                        ).first()
-                        if db_prov:
-                            parsed_provider_id = db_prov.id
-
-            # Locate existing database record if product was previously imported
-            existing_product = None
-            if parsed_provider_id is not None and reseller_service_id:
-                existing_product = db.query(Product).filter(
-                    Product.provider_id == parsed_provider_id,
-                    Product.reseller_service_id == str(reseller_service_id)
-                ).first()
-
-            if not existing_product and reseller_service_id:
-                existing_product = db.query(Product).filter(
-                    Product.reseller_service_id == str(reseller_service_id)
-                ).first()
-
-            if existing_product:
-                existing_product.name = data["name"]
-                existing_product.price = price
-                existing_product.reseller_cost = reseller_cost
-                existing_product.reseller_name = reseller_name
-                existing_product.stock = reseller_stock
-                existing_product.is_active = True
-                product = existing_product
-                action_str = "Updated"
-            else:
-                product = Product(
-                    name=data["name"],
-                    source="reseller",
-                    provider_id=parsed_provider_id,
-                    reseller_service_id=str(reseller_service_id) if reseller_service_id is not None else None,
-                    reseller_cost=reseller_cost,
-                    reseller_name=reseller_name,
-                    icon=data.get("icon", "📦"),
-                    category=data.get("category", "reseller"),
-                    description=data.get("description", f"Imported from reseller: {data['name']}"),
-                    price=price,
-                    stock=reseller_stock,
-                    file_content=None,
-                    is_active=True,
-                    delivery_type=data.get("delivery_type", "automatic"),
-                    delivery_instruction=data.get("delivery_instruction", None),
-                    required_info=None,
-                    preorder=False,
-                    bulk_pricing=None,
-                    low_stock_threshold=3,
-                )
-                db.add(product)
-                action_str = "Created"
-
-            db.commit()
-            invalidate_products_cache()
-            db.refresh(product)
-            pid = product.id
-
-            logger.info(
-                "Reseller Product Saved (%s) | Product ID: %d | Provider Service ID: %s | Name: %s | Price: %s | Cost: %s | Stock: %d",
-                action_str,
-                pid,
-                reseller_service_id,
-                product.name,
-                product.price,
-                reseller_cost,
-                product.stock,
-            )
-        finally:
-            db.close()
-
-        await state.clear()
-
-        stock_display = f"{product.stock}" if product.stock < 999999 else "🟢 In Stock"
-
-        text = (
-            f"✅ <b>Reseller Product {action_str}</b>\n\n"
-            f"🔗 <b>{_esc(product.name)}</b>\n\n"
-            f"💰 <b>Reseller Cost:</b>\n${float(reseller_cost or 0.0):.2f}\n\n"
-            f"💵 <b>Selling Price:</b>\n${float(product.price):.2f}\n\n"
-            f"📦 <b>Stock:</b>\n{stock_display}\n\n"
-            f"🔗 <b>Reseller:</b>\n{_esc(reseller_name)}\n\n"
-            f"🆔 <b>Service:</b>\n<code>{_esc(str(reseller_service_id))}</code>\n\n"
-            f"🆔 <b>Product ID:</b> #{pid}"
-        )
-
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="📦 Product Manager", callback_data="admin_products")],
-                [InlineKeyboardButton(text="➕ Create Another", callback_data="create_product")]
-            ]
-        )
-
-        await answer_card(message,
-            text,
-            parse_mode="HTML",
-            reply_markup=keyboard
-        )
+        await _ask_product_aftercare(message, state)
         return
 
     # Own product sequence continues
@@ -1400,6 +1286,129 @@ async def product_price(message: Message, state: FSMContext):
     )
 
 
+
+
+async def _save_reseller_product(message, state, data, price):
+    reseller_name = data.get("reseller_name", "Reseller")
+    reseller_service_id = data.get("reseller_service_id")
+    reseller_cost = data.get("reseller_cost")
+    reseller_stock = data.get("reseller_import_quantity", 0)
+
+    db = SessionLocal()
+    try:
+        reseller_id_val = data.get("reseller_id")
+        parsed_provider_id = None
+
+        if reseller_id_val is not None:
+            try:
+                parsed_provider_id = int(reseller_id_val)
+            except (ValueError, TypeError):
+                if Provider is not None:
+                    db_prov = db.query(Provider).filter(
+                        (Provider.name == str(reseller_id_val)) |
+                        (getattr(Provider, "id", None) == reseller_id_val)
+                    ).first()
+                    if db_prov:
+                        parsed_provider_id = db_prov.id
+
+        # Locate existing database record if product was previously imported
+        existing_product = None
+        if parsed_provider_id is not None and reseller_service_id:
+            existing_product = db.query(Product).filter(
+                Product.provider_id == parsed_provider_id,
+                Product.reseller_service_id == str(reseller_service_id)
+            ).first()
+
+        if not existing_product and reseller_service_id:
+            existing_product = db.query(Product).filter(
+                Product.reseller_service_id == str(reseller_service_id)
+            ).first()
+
+        if existing_product:
+            existing_product.name = data["name"]
+            existing_product.price = price
+            existing_product.reseller_cost = reseller_cost
+            existing_product.reseller_name = reseller_name
+            existing_product.stock = reseller_stock
+            existing_product.is_active = True
+            product = existing_product
+            action_str = "Updated"
+        else:
+            product = Product(
+                name=data["name"],
+                source="reseller",
+                provider_id=parsed_provider_id,
+                reseller_service_id=str(reseller_service_id) if reseller_service_id is not None else None,
+                reseller_cost=reseller_cost,
+                reseller_name=reseller_name,
+                icon=data.get("icon", "📦"),
+                category=data.get("category", "reseller"),
+                description=data.get("description", f"Imported from reseller: {data['name']}"),
+                price=price,
+                stock=reseller_stock,
+                file_content=None,
+                is_active=True,
+                delivery_type=data.get("delivery_type", "automatic"),
+                delivery_instruction=data.get("delivery_instruction", None),
+                required_info=None,
+                preorder=False,
+                bulk_pricing=None,
+                low_stock_threshold=3,
+            )
+            db.add(product)
+            action_str = "Created"
+
+        for field in ("aftercare_policy", "warranty_days", "subscription_days"):
+            setattr(product, field, data.get(field, "skip" if field == "aftercare_policy" else 0))
+        db.commit()
+        invalidate_products_cache()
+        db.refresh(product)
+        pid = product.id
+
+        logger.info(
+            "Reseller Product Saved (%s) | Product ID: %d | Provider Service ID: %s | Name: %s | Price: %s | Cost: %s | Stock: %d",
+            action_str,
+            pid,
+            reseller_service_id,
+            product.name,
+            product.price,
+            reseller_cost,
+            product.stock,
+        )
+    finally:
+        db.close()
+
+    await state.clear()
+
+    stock_display = f"{product.stock}" if product.stock < 999999 else "🟢 In Stock"
+
+    text = (
+        f"✅ <b>Reseller Product {action_str}</b>\n\n"
+        f"🔗 <b>{_esc(product.name)}</b>\n\n"
+        f"💰 <b>Reseller Cost:</b>\n${float(reseller_cost or 0.0):.2f}\n\n"
+        f"💵 <b>Selling Price:</b>\n${float(product.price):.2f}\n\n"
+        f"📦 <b>Stock:</b>\n{stock_display}\n\n"
+        f"🔗 <b>Reseller:</b>\n{_esc(reseller_name)}\n\n"
+        f"🆔 <b>Service:</b>\n<code>{_esc(str(reseller_service_id))}</code>\n\n"
+        f"🆔 <b>Product ID:</b> #{pid}"
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📦 Product Manager", callback_data="admin_products")],
+            [InlineKeyboardButton(text="➕ Create Another", callback_data="create_product")]
+        ]
+    )
+
+    await answer_card(message,
+        text,
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+    return
+
+
+
 @router.message(AddProduct.description)
 async def product_description(message: Message, state: FSMContext):
     """Step 6/10: Ask for delivery type."""
@@ -1415,19 +1424,81 @@ async def product_description(message: Message, state: FSMContext):
         desc = ""
 
     await state.update_data(description=desc)
-    await state.set_state(AddProduct.delivery_type)
+    await _ask_product_aftercare(message, state)
 
-    await answer_card(message,
-        f"✅ <b>Description:</b> {_esc(desc) if desc else '(empty)'}\n\n"
-        f"{_divider('─')}\n\n"
-        f"✏️ <b>Step 6/10: Delivery Type</b>\n\n"
-        f"Choose delivery type:\n"
-        f"• 🟢 <b>automatic</b> — Instant auto-delivery\n"
-        f"• 🟡 <b>manual</b> — Manual by admin team\n"
-        f"• 🔵 <b>hybrid</b> — Auto + manual\n\n"
-        f"<i>Send: automatic, manual, or hybrid</i>",
-        parse_mode="HTML"
-    )
+
+async def _ask_product_aftercare(target, state):
+    await state.set_state(AddProduct.aftercare_policy)
+    await answer_card(target, 'Choose what buyers can claim after delivery.\n'
+                      'Warranty: replacement within your coverage period.\n'
+                      'Refund: your usage-based formula, reviewed by an admin.\n'
+                      'Skip: no warranty/refund button.', reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                          [InlineKeyboardButton(text='🛡 Warranty', callback_data='addcare_warranty')],
+                          [InlineKeyboardButton(text='💸 Refund', callback_data='addcare_refund')],
+                          [InlineKeyboardButton(text='Skip', callback_data='addcare_skip')],
+                          [InlineKeyboardButton(text='Cancel', callback_data='admin_products')]]))
+
+
+@router.callback_query(F.data.startswith('addcare_'))
+async def product_aftercare_choice(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer('Admin only.', show_alert=True)
+        return
+    mode = callback.data.removeprefix('addcare_')
+    if await state.get_state() != AddProduct.aftercare_policy.state or mode not in ('warranty', 'refund', 'skip'):
+        await callback.answer('Start product setup again.', show_alert=True)
+        return
+    await callback.answer()
+    await state.update_data(aftercare_policy=mode, warranty_days=0, subscription_days=0)
+    if mode == 'skip':
+        await _continue_aftercare_product(callback, state)
+        return
+    await state.set_state(AddProduct.aftercare_days)
+    from services.warranty import REFUND_RULES
+    prompt = 'Enter replacement warranty days (1–3650).' if mode == 'warranty' else (
+        REFUND_RULES+'\n\nEnter subscription length in days (1–3650).')
+    await answer_card(callback, prompt, parse_mode='HTML')
+
+
+@router.message(AddProduct.aftercare_policy)
+async def product_aftercare_prompt(message: Message, state: FSMContext):
+    if message.from_user.id in ADMIN_IDS:
+        from services.input_forms import is_cancel
+        if is_cancel(message.text):
+            await state.clear()
+            await answer_card(message, 'Product setup cancelled.')
+            return
+        await _ask_product_aftercare(message, state)
+
+
+@router.message(AddProduct.aftercare_days)
+async def product_aftercare_days(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    from services.input_forms import is_cancel
+    if is_cancel(message.text):
+        await state.clear()
+        await answer_card(message, 'Product setup cancelled.')
+        return
+    raw = (message.text or '').strip()
+    if not raw.isascii() or not raw.isdigit() or len(raw) > 4 or not 1 <= int(raw) <= 3650:
+        await answer_card(message, 'Send 1–3650 days, or /cancel.')
+        return
+    data = await state.get_data()
+    field = 'warranty_days' if data['aftercare_policy'] == 'warranty' else 'subscription_days'
+    await state.update_data(**{field: int(raw)})
+    await _continue_aftercare_product(message, state)
+
+
+async def _continue_aftercare_product(target, state):
+    data = await state.get_data()
+    if data.get('source') == 'reseller':
+        await _save_reseller_product(target, state, data, data['price'])
+        return
+    await state.set_state(AddProduct.delivery_type)
+    await answer_card(target, '✅ Aftercare saved.\n\nChoose delivery type:\n'
+                      'automatic — instant delivery\nmanual — admin team\nhybrid — accounts first, then admin\n\n'
+                      'Send: automatic, manual, or hybrid.')
 
 
 @router.message(AddProduct.delivery_type)
@@ -1805,6 +1876,9 @@ async def _finish_own_product(message, state):
             delivery_type=data.get("delivery_type", "automatic"),
             delivery_instruction=data.get("delivery_instruction", None),
             required_info=data.get("required_info"),
+            aftercare_policy=data.get("aftercare_policy", "skip"),
+            warranty_days=data.get("warranty_days", 0),
+            subscription_days=data.get("subscription_days", 0),
             preorder=data.get("preorder", False),
             bulk_pricing=data.get("bulk_pricing", None),
             low_stock_threshold=3,

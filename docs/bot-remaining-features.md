@@ -3,36 +3,21 @@
 Implemented in `E:\BotCodex\RainDealsBott`, alongside the previous five-feature
 update. No production deployment or real payment/order test was performed.
 
-## Warranty and replacement requests
+## Warranty and refund requests
 
-- Admin → Products → Manage product → Warranty. Enter 0–365 days. Zero is
-  disabled by default; existing orders are not retroactively granted coverage.
-- New Python-bot purchases capture that product's warranty duration. The expiry
-  starts once the order is completed/fulfilled, including after required buyer
-  information, a supplier callback or final hybrid/manual fulfillment. It is
-  not reset by refreshing, editing the product policy or retrying delivery.
-- My Orders → order → Warranty / replacement: submit a reason and photo or
-  written evidence while coverage is active. One request per order prevents
-  repeated claims. The server checks ownership, status, refund state and expiry
-  again when the evidence is submitted.
-- Admin → Warranty requests: view evidence, approve or decline with a reason,
-  then enter replacement details for an approved claim. Repeated approval or
-  delivery taps cannot create another replacement notification. A request made
-  within coverage can still be reviewed after its expiry.
-- Approval does not debit a wallet or consume uploaded stock automatically.
-  Replacement details are provided by the admin and remain accessible in the
-  request. The customer receives a queued status/delivery notification.
-- Warranty content and photos are owner/admin only. Do not put passwords in
-  evidence or diagnostic notes.
-- Full reasons/evidence have a separate details card so long evidence does not
-  push replacement credentials out of the warranty summary. Completed requests
-  remain available from the customer's order and the admin's order details.
+Admin product setup now chooses Warranty, Refund, or Skip. New purchases save
+that policy and the configured duration. Claim forms collect the problem,
+reported deactivation time, evidence and confirmation. Refunds require a
+screenshot and use the requested 1–2 / 3–7 / 8+ day computation. Approval credits
+the saved amount once to the bot wallet; replacements remain admin-provided.
+See [the aftercare guide](aftercare-policy.md) for the calculation, review and
+migration details. Existing orders are not rewritten when product settings change.
 
 ## Provider health
 
-Admin → Provider health displays observed HTTP request/failure counts, consecutive
-failures, last successful request, last successful catalog sync, and a safe error
-classification. Catalog stock is marked stale after 120 seconds without a
+Provider observations record HTTP request/failure counts, consecutive failures,
+last successful requests/catalog syncs, and safe error classifications internally.
+The Provider Health button and dashboard callback were removed from the bot. Catalog stock is marked stale after 120 seconds without a
 successful sync. Observations come from existing traffic; the dashboard does
 not place orders or repeatedly probe suppliers.
 
@@ -48,8 +33,8 @@ response bodies are not stored by the health feature.
 Quantity entry and required order fields share validation helpers with the new
 warranty forms. They validate integer quantity/range, email, phone, text length,
 photo and Telegram contact inputs. Cancellation clears the draft without placing
-an order or submitting a claim. Warranty drafts are intentionally not included
-in the persisted `/restart` whitelist; reopen their order if the draft expires.
+an order or submitting a claim. Warranty/refund forms and admin drafts can now
+resume through `/restart`; see [sessions and invoices](sessions-and-invoices.md).
 
 ## Notification management
 
@@ -86,9 +71,9 @@ records are bot-scoped, so a staging bot cannot consume production bot jobs.
 
 ## Performance diagnostics
 
-Admin → Diagnostics shows process-local totals, failures, average latency and
+Internal diagnostics record process-local totals, failures, average latency and
 P95 for database execution, supplier operations, Telegram methods and handler
-groups. Database samples carry safe operation names such as product/category;
+groups. The Diagnostics button and dashboard callback were removed from the bot. Database samples carry safe operation names such as product/category;
 SQL text, parameters and user input are not retained. Telegram `getUpdates`
 long-poll waiting time is excluded. Pool acquisition delay is not separately
 measured. P95 uses the latest 200 samples per operation; the entire registry is

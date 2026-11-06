@@ -17,7 +17,9 @@ router = Router()
 class Inputs(StatesGroup):
     warranty_days = State()
     reason = State()
+    deactivated = State()
     evidence = State()
+    confirmation = State()
     resolution = State()
 
 
@@ -36,9 +38,40 @@ async def configure_warranty(callback: CallbackQuery, state: FSMContext):
         return
     product_id = int(callback.data.rsplit('_', 1)[1])
     await callback.answer()
-    await state.set_state(Inputs.warranty_days)
+    await state.clear()
     await state.update_data(warranty_product=product_id)
-    await show(callback, '🛡 Send warranty days for new purchases (0–365).\n0 disables warranty. Existing orders keep their saved policy.\n/cancel to stop.',
+    await show(callback, 'Choose aftercare for new purchases. Existing orders keep their saved policy.',
+               reply_markup=keyboard([
+                   [Button(text='🛡 Warranty / replacement', callback_data=f'warranty_policy_{product_id}_warranty')],
+                   [Button(text='💸 Refund computation', callback_data=f'warranty_policy_{product_id}_refund')],
+                   [Button(text='Skip · no claim button', callback_data=f'warranty_policy_{product_id}_skip')],
+                   [Button(text='Cancel', callback_data=f'warranty_cancelconfig_{product_id}')]]))
+
+
+@router.callback_query(F.data.startswith('warranty_policy_'))
+async def choose_warranty_policy(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer('Access denied.', show_alert=True)
+        return
+    _, _, product_id, mode = callback.data.split('_')
+    product_id = int(product_id)
+    if mode not in ('warranty', 'refund', 'skip'):
+        await callback.answer('Invalid policy.', show_alert=True)
+        return
+    await callback.answer()
+    await state.update_data(warranty_product=product_id, warranty_mode=mode)
+    if mode == 'skip':
+        error = await asyncio.to_thread(warranty.configure_policy, product_id, mode, 0, callback.from_user.id)
+        from handlers.products import invalidate_products_cache
+        invalidate_products_cache()
+        await state.clear()
+        await show(callback, error or '✅ Aftercare skipped for new purchases. No claim button.',
+                   reply_markup=keyboard([[Button(text='Back to product', callback_data=f'manage_{product_id}')]]))
+        return
+    await state.set_state(Inputs.warranty_days)
+    prompt = ('💸 Enter subscription length in days (1–3650).\n\n'+warranty.REFUND_RULES if mode == 'refund'
+              else '🛡 Enter replacement warranty length in days (1–3650).')
+    await show(callback, prompt+'\n\n/cancel to stop.', parse_mode='HTML',
                reply_markup=keyboard([[Button(text='Cancel', callback_data=f'warranty_cancelconfig_{product_id}')]]))
 
 
@@ -63,17 +96,17 @@ async def warranty_policy_input(message: Message, state: FSMContext):
         await answer_card(message, 'Cancelled.')
         return
     raw = (message.text or '').strip()
-    if not raw.isascii() or not raw.isdigit() or len(raw) > 3 or int(raw) > 365:
-        await answer_card(message, 'Send 0–365 days, or /cancel.')
+    if not raw.isascii() or not raw.isdigit() or len(raw) > 4 or not 1 <= int(raw) <= 3650:
+        await answer_card(message, 'Send 1–3650 days, or /cancel.')
         return
-    error = await asyncio.to_thread(warranty.configure, data['warranty_product'], int(raw), message.from_user.id)
+    error = await asyncio.to_thread(warranty.configure_policy, data['warranty_product'], data['warranty_mode'], int(raw), message.from_user.id)
     if error:
         await answer_card(message, error)
         return
     from handlers.products import invalidate_products_cache
     invalidate_products_cache()
     await state.clear()
-    await answer_card(message, '✅ Warranty policy saved for new purchases.', reply_markup=keyboard([
+    await answer_card(message, '✅ Aftercare policy saved for new purchases.', reply_markup=keyboard([
         [Button(text='Back to product', callback_data=f"manage_{data['warranty_product']}")]]))
 
 
@@ -83,6 +116,7 @@ async def render_warranty(target, order_id, admin=False):
         await answer_card(target, 'Order not found.')
         return
     request = ctx['request']
+    refund = ctx['policy'] == 'refund'
     text = warranty.summary_text(ctx)
     buttons = []
     if request:
@@ -91,12 +125,13 @@ async def render_warranty(target, order_id, admin=False):
         if evidence.get('kind') == 'photo' and evidence.get('file_id'):
             buttons.append([Button(text='📷 View evidence', callback_data=f'warranty_photo_{order_id}')])
         if admin and ctx['reviewable'] and request['status'] == 'submitted':
-            buttons.append([Button(text='Approve replacement', callback_data=f'warranty_approve_{order_id}', style='success'),
+            label = f"Approve refund ${request['refund_amount']:.8f}" if refund else 'Approve replacement'
+            buttons.append([Button(text=label, callback_data=f'warranty_approve_{order_id}', style='success'),
                             Button(text='Decline', callback_data=f'warranty_reject_{order_id}', style='danger')])
         elif admin and ctx['reviewable'] and request['status'] == 'approved':
             buttons.append([Button(text='Deliver replacement', callback_data=f'warranty_complete_{order_id}', style='success')])
     elif not ctx['error']:
-        buttons.append([Button(text='Request replacement', callback_data=f'warranty_request_{order_id}', style='primary')])
+        buttons.append([Button(text='💸 Ask for refund' if refund else '🛡 Claim warranty', callback_data=f'warranty_request_{order_id}', style='primary')])
     buttons.append([Button(text='Refresh', callback_data=f'warranty_admin_{order_id}' if admin else f'warranty_order_{order_id}'),
                     Button(text='⬅ Back', callback_data='warranty_queue_0' if admin else f'order_detail_{order_id}')])
     await answer_card(target, text, parse_mode='HTML', reply_markup=keyboard(buttons), replace_media=True)
@@ -136,36 +171,97 @@ async def request_warranty(callback: CallbackQuery, state: FSMContext):
         return
     await callback.answer()
     await state.set_state(Inputs.reason)
-    await state.update_data(warranty_order=order_id)
-    await show(callback, 'Describe the problem (10–1500 characters).\nNext, add evidence. /cancel to stop.', reply_markup=back(order_id))
+    await state.update_data(warranty_order=order_id, warranty_mode=ctx['policy'])
+    text = 'Describe what stopped working or was deactivated (10–1500 characters).\nDo not send passwords. /cancel to stop.'
+    if ctx['policy'] == 'refund':
+        text = warranty.REFUND_RULES+'\n\n'+warranty.quote_text(ctx['quote'])+'\n\n'+text
+    await show(callback, text, parse_mode='HTML', reply_markup=back(order_id))
 
 
 @router.message(Inputs.reason)
+@router.message(Inputs.deactivated)
 @router.message(Inputs.evidence)
 async def warranty_input(message: Message, state: FSMContext):
     data = await state.get_data()
     order_id = data.get('warranty_order')
     if not order_id or is_cancel(message.text):
         await state.clear()
-        await answer_card(message, 'Cancelled. Your order is unchanged.')
+        if order_id:
+            await render_warranty(message, order_id)
+        else:
+            await answer_card(message, 'Cancelled. Your order is unchanged.')
         return
     try:
         if await state.get_state() == Inputs.reason.state:
             reason = text_value(message.text, 1500, 10)
             await state.update_data(warranty_reason=reason)
-            await state.set_state(Inputs.evidence)
-            await answer_card(message, 'Upload a photo or describe evidence (10–2000 characters). Do not send passwords.\n/cancel to stop.', reply_markup=back(order_id))
+            await state.set_state(Inputs.deactivated)
+            await answer_card(message, 'When was it deactivated or last working? Include date, time and timezone if known.\nExample: 6 Nov, 2 PM IST. Send unknown if unsure.\n/cancel to stop.', reply_markup=back(order_id))
             return
+        if await state.get_state() == Inputs.deactivated.state:
+            await state.update_data(warranty_deactivated=text_value(message.text, 200))
+            await state.set_state(Inputs.evidence)
+            await answer_card(message, '📷 Upload a screenshot showing deactivation or the error. Hide passwords and unrelated personal details.\n'
+                              + ('A screenshot is required for a refund.' if data['warranty_mode'] == 'refund' else 'You may also describe supporting evidence (10–2000 characters).')
+                              + '\n/cancel to stop.', reply_markup=back(order_id))
+            return
+        if data['warranty_mode'] == 'refund' and not message.photo:
+            raise InputError('Please upload a screenshot of the deactivation or error as a photo.')
         evidence = field_value(message, 'photo') if message.photo else {'kind': 'text', 'value': text_value(message.text, 2000, 10)}
     except InputError as error:
         await answer_card(message, str(error), reply_markup=back(order_id))
         return
-    error = await asyncio.to_thread(warranty.submit, order_id, message.from_user.id, data['warranty_reason'], evidence)
-    await state.clear()
-    if error:
-        await answer_card(message, error, reply_markup=back(order_id))
+    await state.update_data(warranty_evidence=evidence)
+    await state.set_state(Inputs.confirmation)
+    await claim_confirmation(message, state)
+
+
+async def claim_confirmation(target, state, notice=''):
+    data = await state.get_data()
+    order_id = data['warranty_order']
+    ctx = await asyncio.to_thread(warranty.context, order_id, target.from_user.id)
+    if not ctx or ctx['error'] or ctx['request']:
+        await state.clear()
+        await render_warranty(target, order_id)
         return
-    await render_warranty(message, order_id)
+    refund = ctx['policy'] == 'refund'
+    await state.update_data(warranty_expected_refund=str(ctx['quote']['refund_amount']) if refund else None)
+    text = (escape(notice)+'\n\n' if notice else '') + f'🧾 <b>Review claim · Order #{order_id}</b>\n\n'
+    text += 'Problem: '+escape(data['warranty_reason'][:600])+'\nDeactivated (reported): '+escape(data['warranty_deactivated'])
+    text += '\nProof: screenshot attached.' if data['warranty_evidence']['kind'] == 'photo' else '\nProof: description attached.'
+    if refund:
+        text += '\n\n'+warranty.quote_text(ctx['quote'])
+    text += '\n\nSubmit for admin review? No credit or replacement is issued before approval.'
+    await answer_card(target, text, parse_mode='HTML', reply_markup=keyboard([
+        [Button(text='Submit claim', callback_data=f'warranty_submit_{order_id}', style='success')],
+        [Button(text='Cancel', callback_data=f'warranty_order_{order_id}')]]), replace_media=True)
+
+
+@router.callback_query(F.data.startswith('warranty_submit_'))
+async def submit_claim(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    order_id = int(callback.data.rsplit('_', 1)[1])
+    if await state.get_state() != Inputs.confirmation.state or data.get('warranty_order') != order_id:
+        await callback.answer('This form has expired. Open your order again.', show_alert=True)
+        return
+    await callback.answer()
+    error = await asyncio.to_thread(warranty.submit, order_id, callback.from_user.id,
+        data['warranty_reason'], data['warranty_evidence'], data['warranty_deactivated'], data.get('warranty_expected_refund'))
+    if error:
+        await claim_confirmation(callback, state, error)
+        return
+    await state.clear()
+    await render_warranty(callback, order_id)
+
+
+@router.message(Inputs.confirmation)
+async def claim_confirmation_input(message: Message, state: FSMContext):
+    if is_cancel(message.text):
+        data = await state.get_data()
+        await state.clear()
+        await render_warranty(message, data['warranty_order'])
+        return
+    await claim_confirmation(message, state, 'Use Submit claim, or /cancel.')
 
 
 @router.callback_query(F.data.startswith('warranty_queue_'))
@@ -177,7 +273,7 @@ async def warranty_queue(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     page = max(0, int(callback.data.rsplit('_', 1)[1]))
     total, rows = await asyncio.to_thread(warranty.pending, page)
-    buttons = [[Button(text=f"#{r['order_id']} · {r['status']}", callback_data=f"warranty_admin_{r['order_id']}")] for r in rows]
+    buttons = [[Button(text=f"#{r['order_id']} · {r['request_type']} · {r['status']}", callback_data=f"warranty_admin_{r['order_id']}")] for r in rows]
     nav = []
     if page:
         nav.append(Button(text='⬅ Previous', callback_data=f'warranty_queue_{page-1}'))
@@ -186,7 +282,7 @@ async def warranty_queue(callback: CallbackQuery, state: FSMContext):
     if nav:
         buttons.append(nav)
     buttons.append([Button(text='⬅ Admin', callback_data='admin_panel')])
-    await show(callback, f'🛡 <b>Warranty requests</b>\n{total} awaiting review/delivery · Page {page+1}',
+    await show(callback, f'🛡 <b>Warranty / refund requests</b>\n{total} awaiting review/delivery · Page {page+1}',
                parse_mode='HTML', reply_markup=keyboard(buttons), replace_media=True)
 
 
@@ -198,6 +294,14 @@ async def warranty_action(callback: CallbackQuery, state: FSMContext):
     _, operation, order_id = callback.data.split('_')
     order_id = int(order_id)
     if operation == 'approve':
+        ctx = await asyncio.to_thread(warranty.context, order_id, callback.from_user.id, True)
+        if ctx and ctx['request'] and ctx['request']['request_type'] == 'refund':
+            await callback.answer()
+            await show(callback, 'Confirm you checked the deactivation screenshot and reported dates.\n\n'
+                       + warranty.summary_text(ctx)+'\n\nApproval credits the saved amount to the buyer wallet once.', parse_mode='HTML',
+                       reply_markup=keyboard([[Button(text='Proof checked · Approve refund', callback_data=f'warranty_refundapprove_{order_id}', style='success')],
+                                              [Button(text='Back', callback_data=f'warranty_admin_{order_id}')]]), replace_media=True)
+            return
         error = await asyncio.to_thread(warranty.review, order_id, callback.from_user.id, operation)
         await callback.answer(error or 'Approved.', show_alert=bool(error))
         await render_warranty(callback, order_id, True)
@@ -207,6 +311,22 @@ async def warranty_action(callback: CallbackQuery, state: FSMContext):
     await state.update_data(warranty_order=order_id, warranty_operation=operation)
     prompt = 'Send replacement details (up to 3000 characters).' if operation == 'complete' else 'Send the reason for declining this request.'
     await show(callback, prompt+'\n/cancel to stop.', reply_markup=back(order_id, True))
+
+
+@router.callback_query(F.data.startswith('warranty_refundapprove_'))
+async def approve_refund(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer('Access denied.', show_alert=True)
+        return
+    order_id = int(callback.data.rsplit('_', 1)[1])
+    ctx = await asyncio.to_thread(warranty.context, order_id, callback.from_user.id, True)
+    if not ctx or not ctx['request'] or ctx['request']['request_type'] != 'refund':
+        await callback.answer('Refund claim not found.', show_alert=True)
+        return
+    error = await asyncio.to_thread(warranty.review, order_id, callback.from_user.id, 'approve')
+    await callback.answer(error or 'Refund credited.', show_alert=bool(error))
+    await state.clear()
+    await render_warranty(callback, order_id, True)
 
 
 @router.message(Inputs.resolution)
@@ -259,36 +379,8 @@ async def operations(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.clear()
     buttons = []
-    if callback.data == 'ops_performance':
-        from services.performance import snapshot
-        rows = snapshot()[:18]
-        text = '⏱ <b>Performance · this process</b>\nP95 uses the latest 200 observations per operation.\n\n'
-        for row in rows:
-            text += f"{escape(row['category'])}/{escape(row['label'])}: {row['count']} calls, {row['failed']} failed\nAvg {row['average_ms']} ms · P95 {row['p95_ms']} ms\n\n"
-        if not rows:
-            text += 'No observations yet.'
-        buttons.append([Button(text='Refresh', callback_data='ops_performance')])
-    elif callback.data.startswith('ops_providers_'):
-        from services.provider_health import dashboard, flush_health
-        await asyncio.to_thread(flush_health)
-        rows = await asyncio.to_thread(dashboard)
-        page = max(0, int(callback.data.rsplit('_', 1)[1]))
-        text = '📡 <b>Provider health</b>\nStock is stale after 120 seconds without a successful sync.\n\n'
-        def at(value):
-            return value.strftime('%d %b %H:%M UTC') if value else 'Not recorded'
-        for row in rows[page*5:page*5+5]:
-            text += (f"<b>{escape(row['name'])}</b> · {'⚠ Stale stock' if row['stale'] else '✅ Recent sync'}\n"
-                     f"Requests: {row['requests']} · Failed: {row['failures']} · Consecutive: {row['consecutive']}\n"
-                     f"Last success: {at(row['last_success'])}\nLast sync: {at(row['last_sync'])}\n"
-                     f"Reason: {escape(row['error'] or 'No recent error')}\n\n")
-        buttons.append([Button(text='Refresh', callback_data=f'ops_providers_{page}')])
-        nav = []
-        if page:
-            nav.append(Button(text='Previous', callback_data=f'ops_providers_{page-1}'))
-        if (page+1)*5 < len(rows):
-            nav.append(Button(text='Next', callback_data=f'ops_providers_{page+1}'))
-        if nav:
-            buttons.append(nav)
+    if callback.data == 'ops_performance' or callback.data.startswith('ops_providers_'):
+        text = 'This tool is not available in the bot.'
     elif callback.data.startswith('ops_resolveconfirm_'):
         job_id = int(callback.data.rsplit('_', 1)[1])
         text = 'Check the recipient’s chat first. This closes the uncertain send without resending it or claiming confirmed Telegram delivery.'

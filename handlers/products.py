@@ -33,7 +33,7 @@ from models.rate_control import ProductRateControl, RateControlAssignment
 from services.fulfillment_policy import order_capacity, manual_allowed, plan_delivery
 from services.checkout_actions import confirmation_token, action_key, claim_checkout, finish_checkout, recover_checkout
 from services.order_workflow import record_event
-from services.warranty import start_coverage
+from services.warranty import start_coverage, policy_snapshot, policy_label
 from services.input_forms import quantity as parse_quantity, is_cancel, InputError
 from services.notification_outbox import enqueue_once
 
@@ -1849,8 +1849,8 @@ async def product_info(
         f"  {delivery_info['icon']} <b>Delivery:</b> {delivery_info['label']}\n"
     )
 
-    if getattr(product, "warranty_days", 0):
-        text += f"  🛡 <b>Replacement warranty:</b> {product.warranty_days} day(s) after delivery\n"
+    if policy_snapshot(product)['aftercare_policy'] != 'skip':
+        text += f"  <b>{policy_label(product)}</b> after delivery\n"
 
     if delivery_info['desc']:
         text += f"  └ <i>{delivery_info['desc']}</i>\n"
@@ -2302,7 +2302,8 @@ def _do_purchase(
             is_preorder=is_preorder_order, status=status, refunded=False,
             delivery_telegram_id=delivery_telegram_id, checkout_key=checkout_key,
         )
-        order.warranty_days = max(0, int(getattr(product, "warranty_days", 0) or 0))
+        for field, value in policy_snapshot(product).items():
+            setattr(order, field, value)
         if status == "completed":
             start_coverage(order)
         db.add(order)
@@ -2417,7 +2418,7 @@ async def _do_reseller_purchase(
                 "balance": float(user_balance)
             }
 
-        warranty_days = max(0, int(getattr(product, "warranty_days", 0) or 0))
+        saved_aftercare = policy_snapshot(product)
         product_name = product.name
         product_icon = product.icon
         delivery_instruction = product.delivery_instruction
@@ -2534,7 +2535,8 @@ async def _do_reseller_purchase(
             )
             db.add(order)
             db.flush()
-            order.warranty_days = warranty_days
+            for field, value in saved_aftercare.items():
+                setattr(order, field, value)
             if order.status == "completed":
                 start_coverage(order)
             record_event(db, order.id, 'created', 'Supplier order received.', actor_id=telegram_id)

@@ -2,11 +2,12 @@
 import asyncio
 from datetime import datetime
 import logging
+import time
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.fsm.context import FSMContext
-from services.session_resume import load_resume, make_snapshot, save_resume
+from services.session_resume import load_resume, make_snapshot, save_resume, saved_prompt, restore_data, is_admin, admin_state
 from services.checkout_actions import confirmation_token
 from utils.ui import answer_card, begin_resumed_card, finish_resumed_card, get_card_location
 
@@ -52,7 +53,17 @@ async def restart_cmd(message: Message, state: FSMContext):
 async def _restart_saved_screen(message: Message, state: FSMContext):
     key = (message.from_user.id, message.chat.id)
     try:
-        snapshot = await load_resume(key)
+        allowed_admin = is_admin(key[0])
+        live_state = await state.get_state()
+        if admin_state(live_state) and not allowed_admin:
+            await state.clear()
+            save_resume(key,None)
+            await answer_card(message,'Admin access is no longer available. Send /start.')
+            return
+        # Use current input first: a quick /restart may precede the deferred DB save.
+        snapshot = make_snapshot(live_state,await state.get_data(),admin=allowed_admin,prompt=saved_prompt(key)) if live_state else None
+        if not snapshot:
+            snapshot = await load_resume(key)
     except Exception:
         logger.exception('Could not load resume session for %s', key[0])
         await answer_card(message, 'Could not load your last step. Try /restart again or /start for Home.')
@@ -62,7 +73,13 @@ async def _restart_saved_screen(message: Message, state: FSMContext):
         await start_cmd(message, None, state)
         return
     # Revalidate persisted state against the current allowlist.
-    snapshot = make_snapshot(snapshot.get('state'), snapshot.get('data', {}), snapshot.get('navigation'))
+    if snapshot.get('admin') and not allowed_admin:
+        await state.clear()
+        save_resume(key,None)
+        await answer_card(message,'Admin access is no longer available. Send /start.')
+        return
+    snapshot = make_snapshot(snapshot.get('state'), snapshot.get('data', {}), snapshot.get('navigation'),
+                             admin=allowed_admin,prompt=snapshot.get('prompt'))
     if not snapshot:
         await answer_card(message, 'This step cannot be resumed. Send /start.')
         return
@@ -75,9 +92,10 @@ async def _restart_saved_screen(message: Message, state: FSMContext):
 
 async def _restore_snapshot(message, state, snapshot):
     key = (message.from_user.id, message.chat.id)
-    await state.set_data(snapshot['data'])
+    restored_data = restore_data(snapshot['data'],message.bot)
+    await state.set_data(restored_data)
     await state.set_state(snapshot['state'])
-    card = await begin_resumed_card(message, state, snapshot['data'])
+    card = await begin_resumed_card(message, state, restored_data)
     callback = ResumeCallback(id='restart', from_user=message.from_user, chat_instance='restart',
                               message=card, data=snapshot.get('navigation') or '').as_(message.bot)
     saved_state = snapshot['state'] or ''
@@ -126,6 +144,18 @@ async def _restore_snapshot(message, state, snapshot):
             return
         await state.update_data(order_requirement_fields=requirements)
         await answer_card(message, _requirement_prompt(requirements[index], index, len(requirements)), state=state, parse_mode='HTML')
+    elif snapshot.get('prompt') and (saved_state or not snapshot.get('navigation')):
+        prompt = snapshot['prompt']
+        markup = InlineKeyboardMarkup.model_validate(prompt['reply_markup']) if prompt.get('reply_markup') else None
+        if prompt.get('photo'):
+            from utils.ui import track_card
+            shown = await message.bot.send_photo(message.chat.id,prompt['photo'],caption=prompt['text'],
+                                                  parse_mode=prompt.get('parse_mode','HTML'),reply_markup=markup)
+            track_card(key[0],shown.chat.id,shown.message_id)
+            await state.update_data(_card_chat_id=shown.chat.id,_card_message_id=shown.message_id)
+            await finish_resumed_card(message,state,card)
+        else:
+            await answer_card(message,prompt['text'],state=state,parse_mode=prompt.get('parse_mode','HTML'),reply_markup=markup)
     elif saved_state:
         prompts = {'SearchStates:waiting_query': 'Continue searching. Send a product name.',
                    'DepositState:waiting_promo_code': 'Continue. Send your promo code.',
@@ -137,7 +167,8 @@ async def _restore_snapshot(message, state, snapshot):
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[
                               InlineKeyboardButton(text='Payment methods', callback_data='deposit_start'),
                               InlineKeyboardButton(text='Home', callback_data='main_menu')]]) if saved_state.startswith('DepositState:') else None
-        await answer_card(message, prompts.get(saved_state, 'Continue the payment step. Choose your method below.'), state=state, reply_markup=keyboard)
+        fallback = 'Continue this step. Send '+saved_state.rsplit(':',1)[-1].replace('_',' ')+'. /start opens Home.'
+        await answer_card(message, prompts.get(saved_state, fallback), state=state, reply_markup=keyboard)
     else:
         from handlers.products import products_menu, products_all, products_category, product_info
         from handlers.orders import my_orders, order_detail
@@ -162,7 +193,8 @@ async def _restore_snapshot(message, state, snapshot):
     location = get_card_location(*key)
     if location:
         await state.update_data(_card_chat_id=location[0], _card_message_id=location[1])
-    save_resume(key, make_snapshot(await state.get_state(), await state.get_data(), snapshot.get('navigation')))
+    save_resume(key, make_snapshot(await state.get_state(), await state.get_data(), snapshot.get('navigation'),
+                                  admin=is_admin(key[0]),prompt=saved_prompt(key),last_activity=time.time()))
 
 
 @router.callback_query(F.data.in_({'session_resume', 'session_home'}))

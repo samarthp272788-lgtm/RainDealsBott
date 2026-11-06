@@ -17,6 +17,7 @@ class Screen:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     active: int = 0
     owner: object = None
+    prompt: dict | None = None
 
 
 screens = OrderedDict()

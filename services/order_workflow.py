@@ -55,7 +55,7 @@ def timeline_text(timeline, admin=False):
              f"Automatic: {timeline['automatic']} · Pending: {timeline['remaining']}", '']
     for event in timeline['events']:
         at = event['at'].strftime('%d %b %H:%M UTC') if event['at'] else 'Time not recorded'
-        role = 'User' if event['kind'] in ('created', 'information', 'warranty_requested') else 'Admin'
+        role = 'User' if event['kind'] in ('created', 'information', 'warranty_requested', 'refund_requested') else 'Admin'
         actor = f" · {role} {event['actor']}" if admin and event.get('actor') else ''
         lines.append(f"• <b>{at}</b>{actor}\n  {escape(event['summary'])}")
     return '\n'.join(lines)

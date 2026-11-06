@@ -209,10 +209,8 @@ def _get_admin_panel_with_providers() -> InlineKeyboardMarkup:
         else:
             rows.append([provider_btn])
 
-    rows.insert(-1, [InlineKeyboardButton(text="🛡 Warranty requests", callback_data="warranty_queue_0"),
-                     InlineKeyboardButton(text="📡 Provider health", callback_data="ops_providers_0")])
-    rows.insert(-1, [InlineKeyboardButton(text="🔔 Notifications", callback_data="ops_notifications_0"),
-                     InlineKeyboardButton(text="⏱ Diagnostics", callback_data="ops_performance")])
+    rows.insert(-1, [InlineKeyboardButton(text="🛡 Warranty / refund requests", callback_data="warranty_queue_0")])
+    rows.insert(-1, [InlineKeyboardButton(text="🔔 Notifications", callback_data="ops_notifications_0")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

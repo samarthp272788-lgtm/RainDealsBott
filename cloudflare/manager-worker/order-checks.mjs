@@ -5,7 +5,7 @@ import {page} from './src/ui.js';
 // Isolated fixtures: no live database writes or Telegram messages.
 const csrf='c'.repeat(64),calls=[];
 let viewer=false,jobStatus='sent';
-const order={id:12,telegram_id:'777',product_id:2,product_name:'Example',quantity:1,automatic_quantity:0,manual_pending_quantity:0,stock_deducted_quantity:null,assigned_admin_id:null,assigned_at:null,warranty_days:7,warranty_expires_at:null,amount:'1.00000000',status:'completed',delivery_type:'manual',refunded:0,created_at:'2026-11-01 10:00:00'};
+const order={id:12,telegram_id:'777',product_id:2,product_name:'Example',quantity:1,automatic_quantity:0,manual_pending_quantity:0,stock_deducted_quantity:null,assigned_admin_id:null,assigned_at:null,warranty_days:7,warranty_expires_at:null,coverage_started_at:null,amount:'1.00000000',status:'completed',delivery_type:'manual',refunded:0,created_at:'2026-11-01 10:00:00'};
 const env={MANAGER_ADMIN_IDS:'123',TIDB:{
   async execute(sql,args=[]){
     calls.push({sql,args});
@@ -90,6 +90,7 @@ assert.equal(completion.args[0],'a:1\nb:2\nc:3');
 assert(completion.sql.includes('manual_pending_quantity=0'));
 assert(completion.sql.includes('warranty_days>0 AND warranty_expires_at IS NULL'));
 assert(completion.sql.includes('DATE_ADD(UTC_TIMESTAMP(),INTERVAL warranty_days DAY)'));
+assert(completion.sql.includes('coverage_started_at=COALESCE(coverage_started_at,UTC_TIMESTAMP())'));
 assert(completion.sql.includes('assigned_admin_id=COALESCE(assigned_admin_id,?)'));
 assert.equal(String(completion.args.at(-2)),'123');
 assert(calls.some(c=>c.sql.includes('INSERT INTO order_events')&&c.sql.includes("'completed'")));

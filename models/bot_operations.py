@@ -1,5 +1,5 @@
 """Persistent customer aftercare, provider observations and notification outbox."""
-from sqlalchemy import Column, Integer, BigInteger, String, Text, DateTime, JSON, Index, func
+from sqlalchemy import Column, Integer, BigInteger, String, Text, DateTime, JSON, Index, Numeric, func
 from database import Base
 
 
@@ -11,6 +11,11 @@ class WarrantyRequest(Base):
     status = Column(String(20), nullable=False, default='submitted')
     reason = Column(Text, nullable=False)
     evidence = Column(JSON, nullable=False)
+    request_type = Column(String(16), nullable=False, default='warranty', server_default='warranty')
+    refund_amount = Column(Numeric(20, 8), nullable=True)
+    used_days = Column(Integer, nullable=True)
+    remaining_days = Column(Integer, nullable=True)
+    deactivated_at = Column(String(200), nullable=True)
     admin_id = Column(BigInteger, nullable=True)
     resolution = Column(Text, nullable=True)
     created_at = Column(DateTime, nullable=False, server_default=func.now())

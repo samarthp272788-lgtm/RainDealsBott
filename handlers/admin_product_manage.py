@@ -24,6 +24,7 @@ from config import ADMIN_IDS
 from database import SessionLocal
 from models.product import Product
 from services.fulfillment_policy import manual_allowed
+from services.warranty import policy_label
 from models.admin_audit_log import AdminAuditLog
 from states.product_states import AddAccounts, EditAccounts, EditBulkPricing, EditProduct
 from handlers.products import (
@@ -535,7 +536,7 @@ ${float(product.price or 0):.2f}
                     callback_data=f"edit_category_{product.id}"
                 )
             ],
-            [InlineKeyboardButton(text=f"🛡 Warranty: {getattr(product, 'warranty_days', 0)} days", callback_data=f"warranty_config_{product.id}")],
+            [InlineKeyboardButton(text=policy_label(product), callback_data=f"warranty_config_{product.id}")],
             [InlineKeyboardButton(
                 text="🧾 Edit Buyer Information",
                 callback_data=f"edit_required_info_{product.id}"

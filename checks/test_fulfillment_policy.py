@@ -5,7 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from services.warranty import start_coverage
+from services.warranty import start_coverage, policy_snapshot
 from services.fulfillment_policy import plan_delivery, order_capacity, manual_allowed
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -89,7 +89,7 @@ class CheckoutTests(unittest.TestCase):
                   Decimal=Decimal, _money=lambda v: Decimal(str(v)).quantize(Decimal('.00000001')),
                   _active_custom_price=lambda *args: None, _get_bulk_price=lambda *args: None,
                   plan_delivery=plan_delivery, order_capacity=order_capacity, manual_allowed=manual_allowed,
-                  DEFAULT_LOW_STOCK_THRESHOLD=3, invalidate_products_cache=lambda: None, enqueue=lambda *args, **kwargs: None, record_event=lambda *args, **kwargs: None, start_coverage=start_coverage)
+                  DEFAULT_LOW_STOCK_THRESHOLD=3, invalidate_products_cache=lambda: None, enqueue=lambda *args, **kwargs: None, record_event=lambda *args, **kwargs: None, start_coverage=start_coverage, policy_snapshot=policy_snapshot)
         exec(compile(ast.Module(body=[node], type_ignores=[]), '<checkout>', 'exec'), ns)
         result = ns['_do_purchase'](7, 1, quantity, None, 'e'*64 if replay else None)
         if replay:
@@ -104,6 +104,24 @@ class CheckoutTests(unittest.TestCase):
         self.assertEqual(user.total_orders, 1)
         self.assertEqual(p.stock, 997)
         self.assertEqual(len(orders), 1)
+
+    def test_checkout_saves_selected_refund_policy_before_delivery(self):
+        p = product(aftercare_policy='refund', subscription_days=30)
+        result, _, orders = self.checkout(p, 3)
+        self.assertEqual(orders[0].aftercare_policy, 'refund')
+        self.assertEqual(orders[0].subscription_days, 30)
+        self.assertEqual(orders[0].warranty_days, 0)
+        self.assertFalse(getattr(orders[0], 'coverage_started_at', None))
+
+    def test_auto_delivery_starts_saved_refund_clock_and_skip_has_no_policy(self):
+        p = product(aftercare_policy='refund', subscription_days=30)
+        _, _, orders = self.checkout(p, 2)
+        self.assertIsNotNone(orders[0].coverage_started_at)
+        p = product(aftercare_policy='skip', warranty_days=7)
+        _, _, orders = self.checkout(p, 2)
+        self.assertEqual(orders[0].aftercare_policy, 'skip')
+        self.assertEqual(orders[0].warranty_days, 0)
+        self.assertIsNone(getattr(orders[0], 'coverage_started_at', None))
 
     def test_hybrid_two_ready_one_manual_and_one_wallet_charge(self):
         p = product()

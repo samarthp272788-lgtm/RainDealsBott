@@ -373,6 +373,7 @@ async def show(
     parse_mode: str | None = None,
     state=None,
     replace_media: bool = False,
+    preserve_prompt: bool = False,
     **extra,
 ):
     """
@@ -384,6 +385,9 @@ async def show(
     follow-up message handler knows which card to keep editing.
     """
     kwargs = _kwargs(reply_markup, parse_mode, extra)
+    if not preserve_prompt:
+        from services.session_resume import remember_prompt
+        remember_prompt(callback.from_user.id, callback.message.chat.id, text, reply_markup, parse_mode)
     _cancel_scheduled_card_transition(callback.message.chat.id, callback.message.message_id)
     _cancel_scheduled_card_delete(callback.message.chat.id, callback.message.message_id)
 
@@ -467,6 +471,7 @@ async def update_card(
     replace_media: bool = False,
     force_new_card: bool = False,
     cleanup_cards=None,
+    preserve_prompt: bool = False,
     **extra,
 ):
     """
@@ -486,6 +491,10 @@ async def update_card(
     there's nothing to edit yet, or the old card can't be edited
     anymore.
     """
+    if not preserve_prompt:
+        from services.session_resume import remember_prompt
+        remember_prompt(int(owner_id or (message.from_user.id if message.from_user else 0)),
+                        message.chat.id, text, reply_markup, parse_mode)
     if delete_input:
         try:
             await message.delete()

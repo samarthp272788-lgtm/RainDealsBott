@@ -73,6 +73,9 @@ class Product(Base):
     # List entries: {"type": "email|phone|photo|contact|text", "label": "..."}.
     required_info: Mapped[Optional[list]] = mapped_column(JSON, nullable=True, default=None)
     warranty_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default='0')
+    # NULL preserves the earlier warranty_days policy; new setup explicitly chooses.
+    aftercare_policy: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    subscription_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default='0')
 
     # DECIMAL(20, 8) — always compare/multiply as Decimal.
     price: Mapped[Decimal] = mapped_column(
@@ -223,6 +226,9 @@ class Product(Base):
             "description": self.description,
             "category": self.category,
             "delivery_instruction": self.delivery_instruction,
+            "aftercare_policy": self.aftercare_policy,
+            "warranty_days": self.warranty_days,
+            "subscription_days": self.subscription_days,
             "price": str(self.price) if self.price is not None else "0.00000000",
             "stock": self.stock,
             "is_active": self.is_active,

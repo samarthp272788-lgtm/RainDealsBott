@@ -47,6 +47,8 @@ class WorkflowTests(unittest.TestCase):
             __tablename__ = 'products'
             id = Column(Integer, primary_key=True)
             warranty_days = Column(Integer, nullable=False, default=0)
+            aftercare_policy = Column(String(16), nullable=True)
+            subscription_days = Column(Integer, nullable=False, default=0)
         cls.products, cls.providers = Product, Provider
         cls.factory = sessionmaker(bind=cls.engine, autoflush=False, expire_on_commit=False)
         class SQLAdapter:
@@ -77,6 +79,7 @@ class WorkflowTests(unittest.TestCase):
         cls.api_keys = fixture_module('models/api_key.py', '_test_api_keys')
         cls.manager_auth = fixture_module('models/manager_auth.py', '_test_manager_auth')
         cls.promos = fixture_module('models/promocode.py', '_test_promos')
+        cls.resume = fixture_module('models/bot_resume_session.py', '_test_resume')
         cls.models = patch.dict(sys.modules, {'models.order': cls.orders, 'models.order_workflow': cls.workflow,
                                               'models.order_requirement_submission': cls.submissions,
                                               'models.admin_audit_log': cls.audit,
@@ -85,6 +88,7 @@ class WorkflowTests(unittest.TestCase):
                                               'models.product_engagement': cls.engagement, 'models.api_key': cls.api_keys,
                                               'models.manager_auth': cls.manager_auth,
                                               'models.promocode': cls.promos,
+                                              'models.bot_resume_session': cls.resume,
                                               'models.product': SimpleNamespace(Product=Product),
                                               'models.provider': SimpleNamespace(Provider=Provider)})
         cls.models.start()
@@ -667,3 +671,135 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(redeem(7, 'LEGACY')[0])
         with self.factory() as db:
             self.assertEqual(db.query(self.users.User).one().balance, Decimal('0'))
+
+    def refund_order(self, **changes):
+        values = dict(status='completed', aftercare_policy='refund', subscription_days=30,
+                      coverage_started_at=datetime.utcnow()-timedelta(days=2, hours=1), amount=Decimal('100'))
+        values.update(changes)
+        with self.factory.begin() as db:
+            if not db.query(self.users.User).filter_by(telegram_id=7).first():
+                db.add(self.users.User(id=7, telegram_id=7, full_name='Fixture', balance=Decimal('5')))
+        return self.add_order(**values)
+
+    def test_refund_requires_deactivation_time_and_screenshot(self):
+        from services import warranty
+        order_id = self.refund_order()
+        reason = 'The supplied account was deactivated.'
+        self.assertIsNotNone(warranty.submit(order_id, 7, reason, {'kind':'text','value':'The login fails with an error.'}, 'Today'))
+        self.assertIsNotNone(warranty.submit(order_id, 7, reason, {'kind':'photo','file_id':'fixture'}))
+        self.assertIsNotNone(warranty.submit(order_id, 8, reason, {'kind':'photo','file_id':'fixture'}, 'Today'))
+        self.assertIsNone(warranty.submit(order_id, 7, reason, {'kind':'photo','file_id':'fixture'}, '6 Nov 2026, 2 PM IST'))
+        self.assertIsNotNone(warranty.submit(order_id, 7, reason, {'kind':'photo','file_id':'fixture'}, 'Today'))
+        ctx = warranty.context(order_id, 7)
+        self.assertEqual(ctx['request']['refund_amount'], Decimal('72'))
+        self.assertEqual(ctx['request']['used_days'], 3)
+        self.assertIn('2 PM IST', warranty.request_text(ctx))
+
+    def test_refund_approval_credits_saved_calculation_once_and_closes_order(self):
+        from services import warranty
+        order_id = self.refund_order()
+        self.assertIsNone(warranty.submit(order_id, 7, 'The account was deactivated.', {'kind':'photo','file_id':'fixture'}, 'Unknown'))
+        self.assertIsNotNone(warranty.review(order_id, 999, 'approve'))
+        self.assertIsNotNone(warranty.review(order_id, 101, 'complete', 'Not an approval'))
+        with self.factory.begin() as db:
+            # Approval delay must not reduce the amount already requested.
+            db.get(self.orders.Order, order_id).coverage_started_at -= timedelta(days=5)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda admin: warranty.review(order_id, admin, 'approve'), (101,102)))
+        self.assertEqual(sum(result is None for result in results), 1)
+        with self.factory() as db:
+            order = db.get(self.orders.Order, order_id)
+            self.assertTrue(order.refunded)
+            self.assertEqual(order.status, 'refunded')
+            self.assertEqual(order.refund_amount, Decimal('72'))
+            self.assertEqual(db.query(self.users.User).one().balance, Decimal('77'))
+            self.assertEqual(db.query(self.audit.AdminAuditLog).filter_by(action='policy_refund').count(), 1)
+            self.assertEqual(db.query(self.operations.NotificationJob).count(), 3)
+        self.assertEqual(warranty.pending()[0], 0)
+        self.assertEqual(warranty.context(order_id, 7)['request']['status'], 'completed')
+
+    def test_refund_failure_rolls_back_wallet_order_request_and_notifications(self):
+        from services import warranty
+        order_id = self.refund_order()
+        self.assertIsNone(warranty.submit(order_id, 7, 'The account was deactivated.', {'kind':'photo','file_id':'fixture'}, 'Today'))
+        with patch('services.notification_outbox.enqueue', side_effect=RuntimeError('fixture failed write')):
+            with self.assertRaises(RuntimeError):
+                warranty.review(order_id, 101, 'approve')
+        with self.factory() as db:
+            self.assertEqual(db.query(self.users.User).one().balance, Decimal('5'))
+            self.assertFalse(db.get(self.orders.Order, order_id).refunded)
+            self.assertEqual(db.query(self.operations.WarrantyRequest).one().status, 'submitted')
+            self.assertEqual(db.query(self.audit.AdminAuditLog).count(), 0)
+
+    def test_refund_decline_does_not_credit_or_change_delivery(self):
+        from services import warranty
+        order_id = self.refund_order(delivered_account='Already used credentials')
+        self.assertIsNone(warranty.submit(order_id, 7, 'The account was deactivated.', {'kind':'photo','file_id':'fixture'}, 'Today'))
+        self.assertIsNone(warranty.review(order_id, 101, 'reject', 'Evidence does not match this order.'))
+        with self.factory() as db:
+            self.assertEqual(db.query(self.users.User).one().balance, Decimal('5'))
+            self.assertEqual(db.get(self.orders.Order, order_id).delivered_account, 'Already used credentials')
+            self.assertFalse(db.get(self.orders.Order, order_id).refunded)
+        self.assertIsNotNone(warranty.review(order_id, 101, 'approve'))
+
+    def test_changed_quote_requires_customer_to_review_again(self):
+        from services import warranty
+        order_id = self.refund_order()
+        error = warranty.submit(order_id, 7, 'The account was deactivated.', {'kind':'photo','file_id':'fixture'}, 'Today', '100.00000000')
+        self.assertIn('estimate changed', error)
+        with self.factory() as db:
+            self.assertEqual(db.query(self.operations.WarrantyRequest).count(), 0)
+
+    def test_product_policy_choice_and_snapshot_survive_later_edits(self):
+        from services import warranty
+        with self.factory.begin() as db:
+            db.add(self.products(id=4, warranty_days=0))
+        self.assertIsNone(warranty.configure_policy(4, 'refund', 30, 101))
+        with self.factory() as db:
+            snapshot = warranty.policy_snapshot(db.get(self.products, 4))
+        order_id = self.refund_order(**snapshot)
+        self.assertIsNone(warranty.configure_policy(4, 'skip', 0, 101))
+        with self.factory() as db:
+            self.assertEqual(warranty.policy(db.get(self.products,4)), 'skip')
+            self.assertEqual(warranty.policy(db.get(self.orders.Order, order_id)), 'refund')
+            self.assertEqual(db.get(self.orders.Order, order_id).subscription_days, 30)
+        self.assertIsNotNone(warranty.configure_policy(4, 'refund', 0, 101))
+        self.assertIsNotNone(warranty.configure_policy(4, 'refund', 30, 999))
+
+    def test_admin_resume_draft_is_encrypted_and_bound_to_user_and_chat(self):
+        from services.session_resume import make_snapshot, _persist, _load, open_snapshot
+        snapshot = make_snapshot('AddProduct:accounts',dict(name='Fixture', draft_accounts=['fixture:user'],
+                                 price=Decimal('1.25'), password='not retained'),admin=True,
+                                 prompt={'text':'Upload accounts','reply_markup':None})
+        key = (101,101)
+        _persist(key,snapshot)
+        with self.factory() as db:
+            stored = db.get(self.resume.BotResumeSession,key).snapshot
+        self.assertNotIn('fixture:user',str(stored))
+        self.assertNotIn('Upload accounts',str(stored))
+        self.assertEqual(_load(key),snapshot)
+        self.assertIsNone(open_snapshot((102,101),stored))
+        tampered = {**stored,'ciphertext':'x'+stored['ciphertext'][1:]}
+        self.assertIsNone(open_snapshot(key,tampered))
+        self.assertNotIn('password',snapshot['data'])
+
+    def test_invoice_is_one_hour_and_switching_network_reuses_original_expiry(self):
+        from unittest.mock import Mock
+        with self.factory.begin() as db:
+            db.add(self.users.User(id=7,telegram_id=7,full_name='Fixture'))
+        create = self.extract_function('handlers/deposit.py','_create_invoice',dict(
+            SessionLocal=self.factory,User=self.users.User,Deposit=self.deposits.Deposit,
+            Decimal=Decimal,datetime=datetime,timedelta=timedelta,INVOICE_LIFETIME_SECONDS=3600,
+            secrets=SimpleNamespace(randbelow=Mock(side_effect=[0,1,2])),_submitted_invoice_from_db=lambda *args:None))
+        before = datetime.utcnow()
+        first = create(7,Decimal('0'),'BEP20')
+        self.assertLess(abs((datetime.fromisoformat(first['expires_at'])-before).total_seconds()-3600),3)
+        second = create(7,Decimal('0'),'POLYGON')
+        self.assertEqual(first['id'],second['id'])
+        self.assertEqual(first['expires_at'],second['expires_at'])
+        with self.factory.begin() as db:
+            db.get(self.deposits.Deposit,first['id']).invoice_expires_at = datetime.utcnow()-timedelta(seconds=1)
+        third = create(7,Decimal('0'),'BINANCE')
+        self.assertNotEqual(first['id'],third['id'])
+        with self.factory() as db:
+            self.assertEqual(db.query(self.deposits.Deposit).count(),2)

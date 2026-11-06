@@ -10,11 +10,11 @@ validation, not the separate larger platform proposal or a production deployment
 | Duplicate-action protection | Persistent checkout keys; immutable owner-bound payment references; locked/conditional credits; shared promo redemption; API response-loss recovery. | Parallel clicks, parallel credits, changed references, promo limits/replays, same API client ID. |
 | Order timeline | Customer-safe purchase, information, partial delivery, team assignment, completion and warranty events. | Ownership, private-note redaction, event order for equal timestamps. |
 | Admin fulfillment queue | Ready/waiting-info/mine/unassigned views; priorities, remaining units, assignment and private notes. | Closed orders, assignment/release, cross-admin delivery rejection in bot and manager. |
-| Warranty/replacements | Product policy captured on purchase, owner evidence, admin review and replacement details. | Expiry, refunds, duplicate requests/actions, long evidence, transactional notification. |
-| Provider health | Failed HTTP requests, last success/sync, stale stock and safe error categories. | Buffering, sync failures, stale timestamps, credential redaction. |
+| Warranty/refunds | Saved Warranty / Refund / Skip policy, deactivation evidence, admin review and guarded wallet credit. | Expiry, refunds, duplicate requests/actions, long evidence, transactional notification. |
+| Provider health | Internal observations only; the bot dashboard/menu was removed on request. | Buffering, sync failures, stale timestamps, credential redaction. |
 | Shared input forms | Common quantity/email/phone/text/photo/contact validation and cancellation handling. | Invalid/oversized input, cancellation, correct return card. |
 | Notification management | Durable queue, keyboard preservation, destination isolation, known-failure retries and uncertain-send review. | Concurrent claims, rate limits, process interruption, transactional restock/refund/supplier notifications. |
-| Performance diagnostics | Safe aggregate DB/supplier/Telegram/handler latency and failure counts. | No SQL parameters/user text retained, bounded memory, excludes long-poll waiting. |
+| Performance diagnostics | Internal aggregate timings only; the bot dashboard/menu was removed on request. | No SQL parameters/user text retained, bounded memory, excludes long-poll waiting. |
 
 ## Duplicate-payment and API behavior
 
@@ -52,3 +52,6 @@ Automated checks use temporary fixture databases, synthetic settings and mocked
 Telegram calls. They do not establish live provider correctness, zero network
 latency, or exactly-once Telegram delivery after an ambiguous timeout. No live
 orders, payments or production data were changed during this implementation.
+
+The 6 November aftercare update supersedes the original warranty-only setup. See
+[Warranty / Refund / Skip setup and proof form](aftercare-policy.md).

@@ -396,7 +396,7 @@ async function route(request,env){
     const splitSelect=['automatic_quantity','manual_pending_quantity','stock_deducted_quantity','assigned_admin_id'].filter(c=>orderColumns.includes(c)).map(c=>','+c).join('');
     const timelineEnabled=(await rows(env,"SELECT 1 AS present FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='order_events' LIMIT 1")).length>0;
     const orderTimestamp=orderColumns.includes('updated_at')?',updated_at=UTC_TIMESTAMP()':'';
-    const warrantyUpdate=orderColumns.includes('warranty_days')&&orderColumns.includes('warranty_expires_at')?",warranty_expires_at=CASE WHEN warranty_days>0 AND warranty_expires_at IS NULL THEN DATE_ADD(UTC_TIMESTAMP(),INTERVAL warranty_days DAY) ELSE warranty_expires_at END":'';
+    const warrantyUpdate=(orderColumns.includes('warranty_days')&&orderColumns.includes('warranty_expires_at')?",warranty_expires_at=CASE WHEN warranty_days>0 AND warranty_expires_at IS NULL THEN DATE_ADD(UTC_TIMESTAMP(),INTERVAL warranty_days DAY) ELSE warranty_expires_at END":'')+(orderColumns.includes('coverage_started_at')?',coverage_started_at=COALESCE(coverage_started_at,UTC_TIMESTAMP())':'');
     const completed=await tx(env,async t=>{
       const order=(await t.execute('SELECT id,telegram_id,product_id,product_name,amount,quantity,status,delivery_type,is_preorder,refunded,delivery_telegram_id,delivered_account'+splitSelect+' FROM orders WHERE id=? FOR UPDATE',[orderId])).rows?.[0];
       if(!order)error('Order not found.',404);

@@ -89,6 +89,8 @@ bot = Bot(
 # ============================================================
 
 bot.session.middleware(TelegramTimings())
+from services.session_resume import DraftPromptRecorder
+bot.session.middleware(DraftPromptRecorder())
 
 
 dp = Dispatcher(

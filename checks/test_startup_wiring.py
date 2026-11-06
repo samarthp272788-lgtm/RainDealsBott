@@ -44,7 +44,8 @@ class StartupWiringTests(unittest.TestCase):
                 assert router in bot_app.dp.sub_routers
                 from handlers.admin import _get_admin_panel_with_providers
                 buttons = {b.callback_data for row in _get_admin_panel_with_providers().inline_keyboard for b in row}
-                assert {'warranty_queue_0','ops_providers_0','ops_notifications_0','ops_performance'} <= buttons
+                assert {'warranty_queue_0','ops_notifications_0'} <= buttons
+                assert not {'ops_providers_0','ops_performance'} & buttons
                 from models.product import Product
                 from handlers.admin_product_manage import _build_product_panel
                 product = Product(id=21, name='Fixture product', price=Decimal('1'), stock=2,

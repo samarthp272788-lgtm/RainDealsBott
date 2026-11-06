@@ -2,6 +2,7 @@ from services.screen_controller import managed_screen
 from services.payment_submissions import bind_reference
 from services.notification_outbox import queue_message
 from services.input_forms import is_cancel
+from services.session_policy import INVOICE_LIFETIME_SECONDS
 # handlers/deposit.py
 
 import re
@@ -616,7 +617,7 @@ async def deposit_menu(callback: CallbackQuery, state: FSMContext):
 
         text = (
             f"💰 <b>DEPOSIT FUNDS</b>\n\n"
-            f"<b>Choose a payment method.</b> You will create one 5-minute invoice and can switch methods without creating another invoice.\n\n"
+            f"<b>Choose a payment method.</b> One invoice lasts 1 hour. Switching methods reuses it without resetting its expiry.\n\n"
             f"{_divider('─', 28)}\n\n"
             f"🟡 <b>USDT (BEP20)</b>\n"
             f"   └ Fast & low fees · Binance Smart Chain\n\n"
@@ -1016,7 +1017,7 @@ async def resume_deposit(callback: CallbackQuery, state: FSMContext):
 # ╚══════════════════════════════════════════════════════════════╝
 
 def _create_invoice(telegram_id: int, amount_usdt: Decimal, network: str) -> dict:
-    """Create one five-minute invoice shared by all payment methods."""
+    """Create one one-hour invoice shared by all payment methods."""
     db = SessionLocal()
     try:
         # Serialize invoice creation per user. Simultaneous taps then observe
@@ -1057,7 +1058,7 @@ def _create_invoice(telegram_id: int, amount_usdt: Decimal, network: str) -> dic
                 break
         if not code:
             raise RuntimeError("Could not allocate a unique invoice code")
-        expires = datetime.utcnow() + timedelta(minutes=5)
+        expires = datetime.utcnow() + timedelta(seconds=INVOICE_LIFETIME_SECONDS)
         deposit = Deposit(
             telegram_id=telegram_id,
             order_id=code,
@@ -1520,7 +1521,7 @@ async def process_txid(message: Message, state: FSMContext):
     if result == "expired":
         await state.clear()
         await update_card(message, None,
-            "⏰ <b>Invoice expired</b>\n\nThis five-minute invoice has expired. Start a new deposit to get a fresh invoice.",
+            "⏰ <b>Invoice expired</b>\n\nThis one-hour invoice has expired. Start a new deposit to get a fresh invoice.",
             chat_id=card_chat_id, message_id=card_message_id,
             parse_mode="HTML", reply_markup=_status_kb("failure", network))
         return
