@@ -18,6 +18,7 @@ from aiogram.types import (
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
+from sqlalchemy import JSON, String, cast
 from sqlalchemy.exc import SQLAlchemyError
 
 import config
@@ -784,6 +785,61 @@ def invalidate_products_cache() -> None:
         _products_cache["timestamp"] = 0
 
 
+def _load_product_models_safely(query) -> list[Product]:
+    """Materialize product rows without letting one malformed JSON value abort the query."""
+    product_columns = list(Product.__table__.columns)
+    json_fields = {
+        column.name
+        for column in product_columns
+        if isinstance(column.type, JSON)
+    }
+    selected = [
+        cast(getattr(Product, column.name), String).label(column.name)
+        if column.name in json_fields
+        else getattr(Product, column.name)
+        for column in product_columns
+    ]
+    rows = query.with_entities(*selected).all()
+    expected_json_shapes = {
+        "required_info": list,
+        "bulk_pricing": dict,
+    }
+    products = []
+    for row in rows:
+        values = {
+            column.name: row[index]
+            for index, column in enumerate(product_columns)
+        }
+        invalid_fields = []
+        for field in json_fields:
+            raw_value = values[field]
+            if raw_value is None:
+                continue
+            try:
+                parsed = (
+                    json.loads(raw_value)
+                    if isinstance(raw_value, (str, bytes, bytearray))
+                    else raw_value
+                )
+            except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+                invalid_fields.append(field)
+                continue
+            expected_shape = expected_json_shapes.get(field)
+            if expected_shape and not isinstance(parsed, expected_shape):
+                invalid_fields.append(field)
+                continue
+            values[field] = parsed
+        if invalid_fields:
+            logger.error(
+                "Skipping product with invalid JSON configuration product_id=%s fields=%s",
+                values.get("id"),
+                ",".join(sorted(invalid_fields)),
+            )
+            continue
+        products.append(Product(**values))
+    return products
+
+
 async def _refresh_active_products():
     """Refresh the catalog snapshot without blocking readers of stale data."""
     async with _products_cache_lock:
@@ -800,11 +856,12 @@ async def _refresh_active_products():
             def _query():
                 db = SessionLocal()
                 try:
-                    return (
+                    # Read JSON columns as text first so an invalid legacy
+                    # product is isolated instead of crashing the catalog.
+                    return _load_product_models_safely(
                         db.query(Product)
                         .filter(Product.is_active == True, Product.price > 0)
                         .order_by(Product.id.asc())
-                        .all()
                     )
                 finally:
                     db.close()
@@ -845,7 +902,10 @@ async def _fetch_active_products():
 def _fetch_product(product_id: int):
     db = SessionLocal()
     try:
-        return db.query(Product).filter(Product.id == product_id).first()
+        products = _load_product_models_safely(
+            db.query(Product).filter(Product.id == product_id).limit(1)
+        )
+        return products[0] if products else None
     finally:
         db.close()
 
@@ -853,10 +913,9 @@ def _fetch_product(product_id: int):
 def _fetch_products_by_ids(product_ids: list[int]) -> list:
     db = SessionLocal()
     try:
-        return (
+        return _load_product_models_safely(
             db.query(Product)
             .filter(Product.id.in_(product_ids), Product.is_active == True)
-            .all()
         )
     finally:
         db.close()
@@ -866,11 +925,10 @@ def _fetch_free_products() -> list:
     """Fetch all active products with price = 0 (freebies)."""
     db = SessionLocal()
     try:
-        return (
+        return _load_product_models_safely(
             db.query(Product)
             .filter(Product.is_active == True, Product.price == 0)
             .order_by(Product.id.asc())
-            .all()
         )
     finally:
         db.close()

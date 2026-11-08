@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 import uuid
 from types import SimpleNamespace
 from datetime import datetime
@@ -526,6 +527,8 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
     if message.chat.type != "private":
         return
 
+    started_at = time.perf_counter()
+    membership_ms = db_ms = username_ms = card_ms = menu_save_ms = 0.0
     from handlers.restart import stop_restart
     await stop_restart((message.from_user.id, message.chat.id))
     previous_card = await state.get_data()
@@ -553,11 +556,13 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
     # CHANNEL MEMBERSHIP CHECK (skip for admins)
     # ═══════════════════════════════════════════════════════
     if telegram_id not in ADMIN_IDS:
+        membership_started_at = time.perf_counter()
         is_member = await check_user_membership(
             message.bot,
             telegram_id,
             fast=deep_link_product_id is not None,
         )
+        membership_ms = (time.perf_counter() - membership_started_at) * 1000
         if not is_member:
             await answer_card(message,
                 "⚠️ <b>Access Restricted</b>\n\n"
@@ -574,6 +579,7 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
     is_admin = telegram_id in ADMIN_IDS
 
     try:
+        db_started_at = time.perf_counter()
         user_task = asyncio.to_thread(
             _get_or_create_user, telegram_id, username, full_name, ref_payload
         )
@@ -602,6 +608,7 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
         else:
             result = await user_task
             unread, deposit_action = 0, None
+        db_ms = (time.perf_counter() - db_started_at) * 1000
     except Exception:
         logger.exception("Failed to create/update user %s on /start", telegram_id)
         await answer_card(message,
@@ -617,7 +624,9 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
         await product_info(message, deep_link_product_id)
         return
 
+    username_started_at = time.perf_counter()
     bot_username = await _get_bot_username(message.bot)
+    username_ms = (time.perf_counter() - username_started_at) * 1000
     user.username = username
     user.full_name = full_name
     text = _build_start_welcome(user, full_name, telegram_id, username, bot_username)
@@ -630,6 +639,7 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
             label = f"💳 Resume payment · {deposit_action['code']}"
             callback_data = f"resume_deposit_{deposit_action['id']}"
         keyboard.inline_keyboard.insert(0, [InlineKeyboardButton(text=label, callback_data=callback_data, style="success")])
+    card_started_at = time.perf_counter()
     menu_card = await update_card(
         message,
         text=text,
@@ -643,10 +653,25 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
         cleanup_cards=previous_cards,
         disable_web_page_preview=True,
     )
+    card_ms = (time.perf_counter() - card_started_at) * 1000
     if menu_card:
+        menu_save_started_at = time.perf_counter()
         await asyncio.to_thread(
             _save_home_menu_location,
             telegram_id,
             int(menu_card.chat.id),
             int(menu_card.message_id),
         )
+        menu_save_ms = (time.perf_counter() - menu_save_started_at) * 1000
+    logger.info(
+        "start_timing user_id=%s membership_ms=%.1f db_ms=%.1f username_ms=%.1f "
+        "card_ms=%.1f menu_save_ms=%.1f visible_ms=%.1f total_ms=%.1f",
+        telegram_id,
+        membership_ms,
+        db_ms,
+        username_ms,
+        card_ms,
+        menu_save_ms,
+        (time.perf_counter() - started_at - menu_save_ms / 1000) * 1000,
+        (time.perf_counter() - started_at) * 1000,
+    )
