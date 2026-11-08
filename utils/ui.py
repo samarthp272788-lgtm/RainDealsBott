@@ -516,7 +516,7 @@ async def update_card(
         from services.session_resume import remember_prompt
         remember_prompt(int(owner_id or (message.from_user.id if message.from_user else 0)),
                         message.chat.id, text, reply_markup, parse_mode)
-    if delete_input:
+    if delete_input and not force_new_card:
         try:
             await message.delete()
         except Exception:
@@ -540,15 +540,35 @@ async def update_card(
         for old_chat, old_id in cleanup_cards or []:
             if old_chat and old_id:
                 old_cards.add((int(old_chat), int(old_id)))
+        delete_tasks = []
+        if delete_input:
+            delete_tasks.append((int(message.chat.id), int(message.message_id), True))
         for old_chat, old_id in old_cards:
             if old_chat != message.chat.id:
                 continue
             _cancel_scheduled_card_transition(old_chat, old_id)
             _cancel_scheduled_card_delete(old_chat, old_id)
+            delete_tasks.append((int(old_chat), int(old_id), False))
+
+        async def _delete_quietly(target_chat_id: int, target_message_id: int, is_input: bool) -> None:
             try:
-                await message.bot.delete_message(chat_id=old_chat, message_id=old_id)
+                if is_input:
+                    await message.delete()
+                else:
+                    await message.bot.delete_message(
+                        chat_id=target_chat_id,
+                        message_id=target_message_id,
+                    )
             except Exception:
-                logger.debug("Could not remove the previous menu card %s", old_id)
+                logger.debug("Could not remove previous card/message %s", target_message_id)
+
+        # Telegram deletions are independent. Run them concurrently so a
+        # /start with an invoice card plus an old menu does not wait through
+        # several network round trips in sequence.
+        await asyncio.gather(*(
+            _delete_quietly(target_chat_id, target_message_id, is_input)
+            for target_chat_id, target_message_id, is_input in delete_tasks
+        ))
         if card_owner_id:
             _forget_card(card_owner_id, message.chat.id)
         chat_id = None

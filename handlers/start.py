@@ -12,6 +12,7 @@ from aiogram import Router, F
 from aiogram.filters import CommandStart, CommandObject
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
+from sqlalchemy import or_
 
 from database import SessionLocal, transaction, retry_on_write_conflict
 from models.user import User
@@ -265,33 +266,35 @@ def _load_start_deposit_action(telegram_id: int) -> dict | None:
     """Return one resumable invoice/status shortcut for the /start card."""
     db = SessionLocal()
     try:
-        submitted = (
+        now = datetime.utcnow()
+        deposit = (
             db.query(Deposit)
             .filter(
                 Deposit.telegram_id == telegram_id,
                 Deposit.status.in_(["waiting_hash", "pending"]),
-                Deposit.tx_hash.isnot(None),
+                or_(
+                    Deposit.tx_hash.isnot(None),
+                    Deposit.invoice_expires_at > now,
+                ),
             )
-            .order_by(Deposit.id.desc())
+            # Submitted transactions take precedence; otherwise show the
+            # newest unexpired invoice. One query replaces two serial reads.
+            .order_by(Deposit.tx_hash.is_(None), Deposit.id.desc())
             .first()
         )
-        if submitted:
-            return {"kind": "status", "id": submitted.id, "code": submitted.invoice_code or submitted.order_id}
-
-        active = (
-            db.query(Deposit)
-            .filter(
-                Deposit.telegram_id == telegram_id,
-                Deposit.status.in_(["waiting_hash", "pending"]),
-                Deposit.tx_hash.is_(None),
-                Deposit.invoice_expires_at > datetime.utcnow(),
-            )
-            .order_by(Deposit.id.desc())
-            .first()
-        )
-        if active:
-            return {"kind": "resume", "id": active.id, "code": active.invoice_code or active.order_id}
-        return None
+        if not deposit:
+            return None
+        if deposit.tx_hash is not None:
+            return {
+                "kind": "status",
+                "id": deposit.id,
+                "code": deposit.invoice_code or deposit.order_id,
+            }
+        return {
+            "kind": "resume",
+            "id": deposit.id,
+            "code": deposit.invoice_code or deposit.order_id,
+        }
     finally:
         db.close()
 
@@ -485,8 +488,12 @@ def _get_or_create_user(telegram_id: int, username: str, full_name: str, ref_pay
             db.add(user)
             db.flush()
         else:
-            user.username = username
-            user.full_name = full_name
+            # Avoid issuing profile updates on every /start when Telegram
+            # profile details have not changed.
+            if user.username != username:
+                user.username = username
+            if user.full_name != full_name:
+                user.full_name = full_name
 
         return {
             "is_new": is_new,
@@ -566,12 +573,35 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
     ref_payload = "" if deep_link_product_id is not None else start_payload
     is_admin = telegram_id in ADMIN_IDS
 
-    db_task = asyncio.to_thread(
-        _get_or_create_user, telegram_id, username, full_name, ref_payload
-    )
-
     try:
-        result = await db_task
+        user_task = asyncio.to_thread(
+            _get_or_create_user, telegram_id, username, full_name, ref_payload
+        )
+        if deep_link_product_id is None:
+            # These reads do not depend on user creation. Start them together
+            # so remote TiDB latency is paid once instead of serially.
+            from services.notification_inbox import count as notification_count
+
+            results = await asyncio.gather(
+                user_task,
+                asyncio.to_thread(notification_count, telegram_id),
+                asyncio.to_thread(_load_start_deposit_action, telegram_id),
+                return_exceptions=True,
+            )
+            result = results[0]
+            if isinstance(result, BaseException):
+                raise result
+            unread = results[1]
+            if isinstance(unread, BaseException):
+                logger.warning("Could not load notification badge for /start user=%s", telegram_id)
+                unread = 0
+            deposit_action = results[2]
+            if isinstance(deposit_action, BaseException):
+                logger.warning("Could not load resumable deposit for /start user=%s", telegram_id)
+                deposit_action = None
+        else:
+            result = await user_task
+            unread, deposit_action = 0, None
     except Exception:
         logger.exception("Failed to create/update user %s on /start", telegram_id)
         await answer_card(message,
@@ -591,10 +621,6 @@ async def start_cmd(message: Message, command: CommandObject, state: FSMContext)
     user.username = username
     user.full_name = full_name
     text = _build_start_welcome(user, full_name, telegram_id, username, bot_username)
-    from services.notification_inbox import count as notification_count
-    unread,deposit_action = await asyncio.gather(
-        asyncio.to_thread(notification_count,telegram_id),
-        asyncio.to_thread(_load_start_deposit_action,telegram_id))
     keyboard = get_admin_main_menu(unread) if is_admin else get_main_menu(unread)
     if deposit_action:
         if deposit_action["kind"] == "status":
