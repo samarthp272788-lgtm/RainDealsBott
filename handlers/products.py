@@ -32,7 +32,13 @@ from models.order_requirement_submission import OrderRequirementSubmission
 from models.product_engagement import ProductEngagement
 from models.custom_rate import CustomRate
 from models.rate_control import ProductRateControl, RateControlAssignment
-from services.fulfillment_policy import order_capacity, manual_allowed, plan_delivery
+from services.fulfillment_policy import (
+    order_capacity,
+    manual_allowed,
+    manual_fallback_only,
+    effective_delivery_type,
+    plan_delivery,
+)
 from services.checkout_actions import confirmation_token, action_key, claim_checkout, finish_checkout, recover_checkout
 from services.order_workflow import record_event
 from services.warranty import start_coverage, policy_snapshot, policy_label
@@ -575,6 +581,17 @@ def _stock_indicator(stock: int) -> str:
         return f"🟢 <b>In Stock</b> ({stock} available)"
     else:
         return f"🟢 <b>Well Stocked</b> ({stock} available)"
+
+
+def _catalog_stock_badge(product, stock: int) -> str:
+    """Show fallback capacity as manual stock when no automatic units remain."""
+    if stock <= 0:
+        return "🔴 OOS"
+    if manual_fallback_only(product):
+        return "👨‍💼 Manual" if stock >= 999999 else f"👨‍💼 Manual {stock}"
+    if stock >= 999999:
+        return "🟢 In Stock"
+    return f"🟡 {stock}" if stock <= 3 else f"🟢 {stock}"
 
 
 def _provider_stock_value(stock: Any) -> int:
@@ -1304,8 +1321,7 @@ async def freebies_menu(callback: CallbackQuery):
     for p in products:
         cat_config = _get_category_config(p.category)
         stock = _real_stock(p)
-        stock_badge = "🔴 OOS" if stock <= 0 else (
-            f"🟢 In Stock" if stock >= 999999 else (f"🟡 {stock}" if stock <= 3 else f"🟢 {stock}"))
+        stock_badge = _catalog_stock_badge(p, stock)
 
         keyboard.append([
             InlineKeyboardButton(
@@ -1412,7 +1428,7 @@ async def _show_product_categories(callback: CallbackQuery, products: list):
             price = custom_prices.get(product.id)
             price = price if price is not None else _money(product.price)
             stock = _real_stock(product)
-            stock_badge = "🔴 OOS" if stock <= 0 else ("🟢 In Stock" if stock >= 999999 else f"🟢 {stock}")
+            stock_badge = _catalog_stock_badge(product, stock)
             label = f"{product.icon or '📦'} {product.name} — ${price:.2f} | {stock_badge}"
             rows.append([InlineKeyboardButton(
                 text=label[:64],
@@ -1509,8 +1525,7 @@ async def _show_products_catalog(
         stock = _real_stock(p)
         custom_price = custom_prices.get(p.id)
         price = custom_price if custom_price is not None else _money(p.price)
-        stock_badge = "🔴 OOS" if stock <= 0 else (
-            "🟢 In Stock" if stock >= 999999 else (f"🟡 {stock}" if stock <= 3 else f"🟢 {stock}"))
+        stock_badge = _catalog_stock_badge(p, stock)
         custom_badge = " 🏷" if custom_price is not None else ""
         bulk_badge = " 📦" if p.bulk_pricing and custom_price is None else ""
         keyboard.append([InlineKeyboardButton(
@@ -1606,7 +1621,7 @@ async def favorites_menu(callback: CallbackQuery):
         price_text = "🎁 FREE" if is_free else f"💰 ${custom_price if custom_price is not None else _money(p.price):.2f}"
         if custom_price is not None:
             price_text += " 🏷 Custom"
-        stock_text = "In Stock" if stock >= 999999 else str(stock)
+        stock_text = _catalog_stock_badge(p, stock).replace("🟢 ", "").replace("🟡 ", "").replace("🔴 ", "")
         text += (
             f"{p.icon or cat_config['icon']} <b>{_esc(p.name)}</b>\n"
             f"  {price_text} | {stock_icon} Stock: {stock_text}\n"
@@ -1868,7 +1883,7 @@ async def search_results(message: Message, state: FSMContext):
             price_text = "🎁 FREE" if is_free else f"💰 ${custom_price if custom_price is not None else _money(p.price):.2f}"
             if custom_price is not None:
                 price_text += " 🏷 Custom"
-            stock_text = "In Stock" if stock >= 999999 else str(stock)
+            stock_text = _catalog_stock_badge(p, stock).replace("🟢 ", "").replace("🟡 ", "").replace("🔴 ", "")
             text += (
                 f"{p.icon or cat_config['icon']} <b>{_esc(p.name)}</b>\n"
                 f"  {price_text} | {stock_icon} Stock: {stock_text}\n"
@@ -1949,11 +1964,13 @@ async def product_info(
     _fire_stock_scan(callback.bot, [product])
 
     max_qty = _get_max_qty(product)
-    real_stock_available = _real_stock(product) > 0
     stock_count = _real_stock(product)
+    real_stock_available = stock_count > 0
     cat_config = _get_category_config(product.category)
 
-    delivery_type = (product.delivery_type or "automatic").lower()
+    # If fallback is enabled and the automatic pool is empty, present the
+    # actual route buyers will receive: the manual fulfillment queue.
+    delivery_type = effective_delivery_type(product)
     delivery_config = {
         "automatic": {"icon": "🤖", "label": "Auto-Delivery", "desc": "Instant delivery after purchase"},
         "manual": {"icon": "👨‍💼", "label": "Manual Delivery", "desc": "Delivered by our team"},
@@ -1998,8 +2015,17 @@ async def product_info(
     if delivery_info['desc']:
         text += f"  └ <i>{delivery_info['desc']}</i>\n"
 
-    if (getattr(product, "source", "own") or "own") == "own" and manual_allowed(product):
+    if manual_fallback_only(product):
+        text += "  👨‍💼 <b>Manual fallback active:</b> no automatic accounts remain; orders within the listed stock capacity go to the team.\n"
+    elif (getattr(product, "source", "own") or "own") == "own" and manual_allowed(product):
         text += "  👨‍💼 Unavailable accounts are delivered by our team.\n"
+    if (
+        (getattr(product, "source", "own") or "own") == "own"
+        and bool(getattr(product, "manual_fallback", False))
+        and stock_count <= 0
+        and not product.preorder
+    ):
+        text += "  ⚠️ Manual fallback is enabled, but the configured order capacity is 0.\n"
     if product.preorder:
         text += f"  📦 <b>Preorder:</b> ✅ Available\n"
 
@@ -2018,7 +2044,7 @@ async def product_info(
 
     text += f"\n{_divider('═', 28)}\n"
 
-    if not real_stock_available and max_qty > 0 and not is_free:
+    if not real_stock_available and max_qty > 0 and product.preorder and not is_free:
         text += f"\n⚠️ <b>Out of Stock — Preorder Available</b>\n<i>Order now and receive when restocked.</i>\n"
 
     buttons = []

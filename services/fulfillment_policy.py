@@ -10,15 +10,35 @@ def manual_allowed(product):
     return (product.delivery_type or 'automatic').lower() == 'manual' or bool(getattr(product, 'manual_fallback', False))
 
 
+def automatic_inventory(product):
+    """Return the units that can actually be delivered without staff work."""
+    accounts = len(account_lines(getattr(product, 'file_content', None)))
+    reusable_content = str(getattr(product, 'reusable_delivery', '') or '').strip()
+    reusable = max(0, int(getattr(product, 'reusable_stock', 0) or 0)) if reusable_content else 0
+    return accounts + reusable
+
+
+def effective_delivery_type(product):
+    """Report manual delivery when fallback is enabled and auto inventory is empty."""
+    mode = (getattr(product, 'delivery_type', None) or 'automatic').lower()
+    source = (getattr(product, 'source', 'own') or 'own').lower()
+    if source == 'own' and mode != 'manual' and manual_allowed(product) and automatic_inventory(product) == 0:
+        return 'manual'
+    return mode
+
+
+def manual_fallback_only(product):
+    """Whether orders currently route to staff because the automatic pool is empty."""
+    mode = (getattr(product, 'delivery_type', None) or 'automatic').lower()
+    return mode != 'manual' and effective_delivery_type(product) == 'manual'
+
+
 def order_capacity(product):
     mode = (product.delivery_type or 'automatic').lower()
     stock = max(0, int(product.stock or 0))
-    accounts = len(account_lines(product.file_content))
-    reusable_content = str(getattr(product, 'reusable_delivery', '') or '').strip()
-    reusable = max(0, int(getattr(product, 'reusable_stock', 0) or 0)) if reusable_content else 0
+    inventory = automatic_inventory(product)
     if mode == 'manual':
         return stock
-    inventory = accounts + reusable
     return max(stock, inventory) if manual_allowed(product) else inventory
 
 
@@ -38,7 +58,7 @@ class DeliveryPlan:
 def plan_delivery(product, quantity):
     if quantity < 1:
         raise ValueError('Quantity must be at least 1.')
-    mode = (product.delivery_type or 'automatic').lower()
+    mode = effective_delivery_type(product)
     accounts = account_lines(product.file_content)
     reusable_content = str(getattr(product, 'reusable_delivery', '') or '').strip()
     reusable_stock = max(0, int(getattr(product, 'reusable_stock', 0) or 0)) if reusable_content else 0

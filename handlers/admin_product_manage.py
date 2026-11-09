@@ -23,7 +23,7 @@ from aiogram.exceptions import TelegramBadRequest
 from config import ADMIN_IDS
 from database import SessionLocal
 from models.product import Product
-from services.fulfillment_policy import manual_allowed
+from services.fulfillment_policy import manual_allowed, manual_fallback_only, effective_delivery_type
 from services.warranty import policy_label
 from models.admin_audit_log import AdminAuditLog
 from states.product_states import AddAccounts, EditAccounts, EditBulkPricing, EditProduct, ReusableStock
@@ -469,7 +469,8 @@ async def _refresh_manage_panel(callback: CallbackQuery, pid: int):
 
 
 def _build_product_panel(product: Product):
-    delivery_type = (product.delivery_type or "automatic").lower()
+    delivery_type = effective_delivery_type(product)
+    available_stock = _real_stock(product)
     threshold = product.low_stock_threshold if product.low_stock_threshold is not None else DEFAULT_LOW_STOCK_THRESHOLD
     api_on = getattr(product, "api_enabled", True)
     description = product.description or "No description"
@@ -478,13 +479,17 @@ def _build_product_panel(product: Product):
         f"{safe(product.icon or '📦')} <b>{safe(product.name)}</b>\n"
         f"🆔 #{product.id} · {'🟢 Enabled' if product.is_active else '🔴 Disabled'}\n"
         f"🏷 <b>Category:</b> {safe(product.category or 'General')}\n\n"
-        f"💰 <b>Price:</b> ${float(product.price or 0):.2f} · 📊 <b>Stock:</b> {product.stock}\n"
+        f"💰 <b>Price:</b> ${float(product.price or 0):.2f} · 📊 <b>Sellable stock:</b> {available_stock}\n"
         f"🚚 <b>Delivery:</b> {DELIVERY_LABELS.get(delivery_type, delivery_type)}\n"
         f"📦 <b>Preorder:</b> {'ON' if product.preorder else 'OFF'} · 🌐 <b>API:</b> {'ON' if api_on else 'OFF'}\n"
         f"⚠️ <b>Low-stock alert:</b> {threshold}\n"
         f"{safe(policy_label(product))}\n"
         f"📦 <b>Bulk pricing:</b> {'Configured' if product.bulk_pricing else 'Base price only'}\n"
     )
+    if manual_fallback_only(product):
+        text += "👨‍💼 <b>Fallback route:</b> automatic inventory is empty; orders within sellable stock go to manual fulfillment.\n"
+    elif manual_allowed(product) and available_stock <= 0 and not product.preorder:
+        text += "⚠️ <b>Manual fulfillment capacity is 0.</b> Set sellable stock above 0 to accept manual orders.\n"
     reseller_id = getattr(product, 'reseller_service_id', None) or getattr(product, 'provider_product_id', None)
     reseller_name = getattr(product, 'reseller_name', None)
     reseller_cost = getattr(product, 'reseller_cost', None)
