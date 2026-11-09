@@ -122,11 +122,11 @@ async def _warm_product_catalog(bot: Bot):
         import asyncio
         await asyncio.to_thread(ensure_order_requirements_schema)
         products = await _fetch_active_products()
-        logger.info("Product catalog cache warmed active_paid_products=%d", len(products))
+        logger.info("Product catalog cache warmed active_products=%d", len(products))
         if not products:
             logger.warning(
-                "No active paid products were loaded for the shop; "
-                "check the Render database/schema and products.is_active/price values."
+                "No active products were loaded for the shop; "
+                "check the Render database/schema and products.is_active values."
             )
     except Exception:
         logger.exception("Could not warm product catalog cache")

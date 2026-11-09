@@ -980,7 +980,8 @@ async def _refresh_active_products():
                     # product is isolated instead of crashing the catalog.
                     return _load_product_models_safely(
                         db.query(Product)
-                        .filter(Product.is_active == True, Product.price > 0)
+                        # Main Shop includes active free and paid products.
+                        .filter(Product.is_active == True)
                         .order_by(Product.id.asc())
                     )
                 finally:
@@ -1003,7 +1004,7 @@ async def _refresh_products_cache_background():
 
 
 async def _fetch_active_products():
-    """Return cached products immediately and refresh expired data in background."""
+    """Return all active paid and free products using a short-lived cache."""
     global _products_refresh_task
     now = asyncio.get_running_loop().time()
     with _products_cache_state_lock:
@@ -1366,7 +1367,7 @@ async def freebies_menu(callback: CallbackQuery):
 
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║              PRODUCTS MENU (PAID ONLY)                       ║
+# ║              ACTIVE PRODUCTS MENU                            ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 @router.callback_query(F.data == "products_menu")
@@ -1401,7 +1402,7 @@ async def _show_product_categories(callback: CallbackQuery, products: list):
     if not products:
         await show(
             callback,
-            "📦 <b>PRODUCT CATEGORIES</b>\n\n📭 <b>No paid products available right now.</b>",
+            "📦 <b>PRODUCT CATEGORIES</b>\n\n📭 <b>No active products are available right now.</b>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="⬅ Go Back", callback_data="main_menu", style="primary")
@@ -1455,7 +1456,8 @@ async def _show_product_categories(callback: CallbackQuery, products: list):
             price = price if price is not None else _money(product.price)
             stock = _real_stock(product)
             stock_badge = _catalog_stock_badge(product, stock)
-            label = f"{product.icon or '📦'} {product.name} — ${price:.2f} | {stock_badge}"
+            price_label = "FREE" if price == 0 else f"${price:.2f}"
+            label = f"{product.icon or '📦'} {product.name} — {price_label} | {stock_badge}"
             rows.append([InlineKeyboardButton(
                 text=label[:64],
                 callback_data=f"product_{product.id}",
@@ -1510,7 +1512,7 @@ async def _show_products_catalog(
     if not products:
         await show(
             callback,
-            "📦 <b>PRODUCTS</b>\n\n📭 <b>No paid products available right now.</b>",
+            "📦 <b>PRODUCTS</b>\n\n📭 <b>No active products are available right now.</b>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="⬅ Categories", callback_data="products_menu", style="primary"),
@@ -1554,8 +1556,9 @@ async def _show_products_catalog(
         stock_badge = _catalog_stock_badge(p, stock)
         custom_badge = " 🏷" if custom_price is not None else ""
         bulk_badge = " 📦" if p.bulk_pricing and custom_price is None else ""
+        price_label = "FREE" if price == 0 else f"${price:.2f}"
         keyboard.append([InlineKeyboardButton(
-            text=f"#{p.id} {p.icon or cat_config['icon']} {p.name} — ${price:.2f}{custom_badge}{bulk_badge} | {stock_badge}",
+            text=f"#{p.id} {p.icon or cat_config['icon']} {p.name} — {price_label}{custom_badge}{bulk_badge} | {stock_badge}",
             callback_data=f"product_{p.id}",
             style=cat_config["style"],
         )])

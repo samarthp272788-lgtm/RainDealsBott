@@ -39,10 +39,11 @@ async def shop_command(message: Message):
     for product in products[:20]:
         category = _get_category_config(product.category)
         price = prices.get(product.id, product.price)
+        price_label = "FREE" if float(price) == 0 else f"${price:.2f}"
         stock = _real_stock(product)
         stock_text = "OOS" if stock <= 0 else ("∞" if stock >= 999999 else str(stock))
         buttons.append([InlineKeyboardButton(
-            text=f"#{product.id} {product.icon or category['icon']} {product.name[:28]} · ${price:.2f} · {stock_text}",
+            text=f"#{product.id} {product.icon or category['icon']} {product.name[:28]} · {price_label} · {stock_text}",
             callback_data=f"product_{product.id}",
         )])
     if len(products) > 20:
