@@ -374,7 +374,7 @@ if __name__ == "__main__":
                     </div>
                     <span class="text-xs text-brand-600 dark:text-brand-400 font-mono font-medium">Bearer Auth</span>
                 </div>
-                <p class="text-sm text-gray-600 dark:text-gray-400 mb-3">Get product catalog, prices, remaining stock, and delivery type (auto / manual).</p>
+                <p class="text-sm text-gray-600 dark:text-gray-400 mb-3">Get active paid products, prices, API-fulfillable stock, and delivery type. Zero-price products are listed only in the Telegram Freebies menu. Automatic/hybrid stock counts ready account inventory; Telegram manual fallback and preorder capacity are excluded.</p>
 
                 <div class="relative group rounded-xl overflow-hidden border border-gray-200 dark:border-gray-800 bg-darkcode shadow-md">
                     <div class="flex items-center justify-between px-4 py-2 bg-gray-900 text-gray-400 text-xs font-mono border-b border-gray-800">
@@ -502,7 +502,7 @@ if __name__ == "__main__":
                 <div class="bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-900/60 rounded-xl p-4 text-xs text-rose-900 dark:text-rose-200 mb-3">
                     <strong>Warning:</strong> Executing this request creates a live, paid order and immediately deducts funds from your account balance.
                 </div>
-                <p class="text-sm text-gray-600 dark:text-gray-400 mb-3">Before ordering, read the product's <code>required_info</code> list from <code>GET /api/v1/products</code>. If it contains fields, send <code>buyer_info</code> as an object keyed by each exact field label, for example <code>{"Email":"buyer@example.com"}</code>. Email, phone, and text are supported through this API; photo/contact requirements must be submitted through Telegram. Missing or invalid fields return HTTP 422 before the order is charged.</p>
+                <p class="text-sm text-gray-600 dark:text-gray-400 mb-3">Before ordering, read the product's <code>required_info</code> list from <code>GET /api/v1/products</code>. If it contains fields, send <code>buyer_info</code> as an object keyed by each exact field label, for example <code>{"Email":"buyer@example.com"}</code>. Email, phone, and text are supported through this API; photo/contact requirements must be submitted through Telegram. Missing or invalid fields return HTTP 422 before the order is charged. API checkout requires current stock that the API can fulfill and does not accept preorders; automatic/hybrid manual-fallback capacity is not counted as API stock. Insufficient stock returns HTTP 409 with <code>out_of_stock</code>, without charging the wallet. The Telegram shop can have separate fallback and preorder behavior.</p>
 
                 <div class="relative group rounded-xl overflow-hidden border border-gray-200 dark:border-gray-800 bg-darkcode shadow-md">
                     <div class="flex items-center justify-between px-4 py-2 bg-gray-900 text-gray-400 text-xs font-mono border-b border-gray-800">
@@ -556,7 +556,7 @@ if __name__ == "__main__":
                 </div>
 
                 <p class="text-sm text-gray-600 dark:text-gray-400 mb-3">Dispatches a manual order directly to the customer's Telegram account using their numeric Telegram ID.</p>
-                <p class="text-sm text-gray-600 dark:text-gray-400 mb-3">If the product lists required buyer fields, include <code>buyer_info</code> with the exact labels returned by <code>GET /api/v1/products</code>, for example <code>{"Email":"buyer@example.com"}</code>. Missing or invalid values return HTTP 422 before charging. Photo/contact requirements must use the Telegram bot.</p>
+                <p class="text-sm text-gray-600 dark:text-gray-400 mb-3">If the product lists required buyer fields, include <code>buyer_info</code> with the exact labels returned by <code>GET /api/v1/products</code>, for example <code>{"Email":"buyer@example.com"}</code>. Missing or invalid values return HTTP 422 before charging. Photo/contact requirements must use the Telegram bot. API checkout requires current API-fulfillable stock and never accepts preorders; manual-fallback capacity for automatic/hybrid products is excluded. Insufficient stock returns HTTP 409 with <code>out_of_stock</code> and no charge.</p>
 
                 <div class="relative group rounded-xl overflow-hidden border border-gray-200 dark:border-gray-800 bg-darkcode shadow-md">
                     <div class="flex items-center justify-between px-4 py-2 bg-gray-900 text-gray-400 text-xs font-mono border-b border-gray-800">

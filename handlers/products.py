@@ -34,6 +34,7 @@ from models.custom_rate import CustomRate
 from models.rate_control import ProductRateControl, RateControlAssignment
 from services.fulfillment_policy import (
     order_capacity,
+    api_order_capacity,
     manual_allowed,
     manual_fallback_only,
     effective_delivery_type,
@@ -1061,8 +1062,8 @@ async def _refresh_active_products():
                     # product is isolated instead of crashing the catalog.
                     return _load_product_models_safely(
                         db.query(Product)
-                        # Main Shop includes active free and paid products.
-                        .filter(Product.is_active == True)
+                        # Keep zero-price items in the dedicated Freebies menu.
+                        .filter(Product.is_active == True, Product.price > 0)
                         .order_by(Product.id.asc())
                     )
                 finally:
@@ -1085,7 +1086,7 @@ async def _refresh_products_cache_background():
 
 
 async def _fetch_active_products():
-    """Return all active paid and free products using a short-lived cache."""
+    """Return active paid products using a short-lived cache."""
     global _products_refresh_task
     now = asyncio.get_running_loop().time()
     with _products_cache_state_lock:
@@ -1108,6 +1109,19 @@ def _fetch_product(product_id: int):
             db.query(Product).filter(Product.id == product_id).limit(1)
         )
         return products[0] if products else None
+    finally:
+        db.close()
+
+
+def _fetch_free_products() -> list:
+    """Load active zero-price products for the dedicated Freebies catalog."""
+    db = SessionLocal()
+    try:
+        return _load_product_models_safely(
+            db.query(Product)
+            .filter(Product.is_active == True, Product.price == 0)
+            .order_by(Product.id.asc())
+        )
     finally:
         db.close()
 
@@ -1374,70 +1388,145 @@ async def notify_new_product(bot, product):
 @router.callback_query(F.data == "freebies_menu")
 async def freebies_menu(callback: CallbackQuery):
     await callback.answer()
+    products = await asyncio.to_thread(_fetch_free_products)
+    await _show_freebies_categories(callback, products)
 
-    _schedule_reseller_stock_refresh()
-    # Use the exact same active-product snapshot as Shop. Filtering in Python
-    # keeps zero-price items visible even if the SQL numeric representation
-    # differs between MySQL/TiDB deployments.
-    products = [
-        product for product in await _fetch_active_products()
-        if _money(product.price) == Decimal("0")
-    ]
 
+async def _show_freebies_categories(callback: CallbackQuery, products: list):
     if not products:
         await show(
             callback,
-            (
-                f"🎁 <b>FREEBIES</b>\n\n"
-                f"📭 <b>No free products available right now.</b>\n\n"
-                f"{_divider('─', 28)}\n\n"
-                f"💡 Check back later — free products\n"
-                f"are added regularly!\n\n"
-                f"<i>Stay tuned for giveaways 🎉</i>"
-            ),
+            "🎁 <b>FREEBIES</b>\n\n📭 No free products are available right now. Check back later!",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="🛍 Browse All Products", callback_data="products_menu",
-                                          style="primary")],
-                    [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")]
-                ]
-            ),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🛍 Paid Products", callback_data="products_menu", style="primary")],
+                [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")],
+            ]),
         )
         return
 
     _fire_stock_scan(callback.bot, products)
+    groups: dict[str, list] = {}
+    standalone = []
+    for product in products:
+        key = _category_key(product)
+        if key is None:
+            standalone.append(product)
+        else:
+            groups.setdefault(key, []).append(product)
 
-    text = (
-        f"🎁 <b>FREEBIES</b>\n\n"
-        f"<b>🎉 Free Products Available!</b>\n\n"
-        f"{_divider('─', 28)}\n"
-        f"<b>📊 Total Free Items:</b> {len(products)}\n\n"
-        f"{_divider('─', 28)}\n\n"
-        f"<b>👇 Grab your free product below:</b>\n"
-        f"<i>Tap any item to claim it — no payment needed!</i>"
+    rows = []
+    category_row = []
+    for _, category_products in sorted(
+        groups.items(),
+        key=lambda item: _get_category_config(item[1][0].category)["label"].casefold(),
+    ):
+        first = category_products[0]
+        config = _get_category_config(first.category)
+        category_name = str(getattr(first, "category", "") or "").strip().lower()
+        icon = first.icon if category_name not in CATEGORY_CONFIG and first.icon else config["icon"]
+        label = config["label"]
+        if len(label) > 40:
+            label = label[:37].rstrip() + "…"
+        category_row.append(InlineKeyboardButton(
+            text=f"{icon} {label} ({len(category_products)})",
+            callback_data=f"freebies_cat_{first.id}",
+            style=config["style"],
+        ))
+        if len(category_row) == 3:
+            rows.append(category_row)
+            category_row = []
+    if category_row:
+        rows.append(category_row)
+
+    for product in standalone:
+        config = _get_category_config(product.category)
+        stock_badge = _catalog_stock_badge(product, _real_stock(product))
+        rows.append([InlineKeyboardButton(
+            text=f"🎁 {product.icon or config['icon']} {product.name} — FREE | {stock_badge}"[:64],
+            callback_data=f"product_{product.id}",
+            style=config["style"],
+        )])
+
+    rows.extend([
+        [InlineKeyboardButton(text=f"🎁 All Freebies ({len(products)})", callback_data="freebies_all", style="success")],
+        [InlineKeyboardButton(text="🛍 Paid Products", callback_data="products_menu", style="primary"),
+         InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")],
+    ])
+    await show(
+        callback,
+        "🎁 <b>FREEBIES</b>\n\nChoose a category, or browse every free item.\nFree products are listed here separately from the paid shop.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
 
+
+@router.callback_query(F.data == "freebies_all")
+async def freebies_all(callback: CallbackQuery):
+    await callback.answer()
+    await _show_freebies_catalog(callback, await asyncio.to_thread(_fetch_free_products), show_all=True)
+
+
+@router.callback_query(F.data.startswith("freebies_cat_"))
+async def freebies_category(callback: CallbackQuery):
+    await callback.answer()
+    products = await asyncio.to_thread(_fetch_free_products)
+    try:
+        representative_id = int(callback.data.removeprefix("freebies_cat_"))
+    except (TypeError, ValueError):
+        await _show_freebies_categories(callback, products)
+        return
+    representative = next((product for product in products if int(product.id) == representative_id), None)
+    if representative is None:
+        await _show_freebies_categories(callback, products)
+        return
+    await _show_freebies_catalog(callback, products, category=_category_key(representative))
+
+
+async def _show_freebies_catalog(
+    callback: CallbackQuery,
+    products: list,
+    category: str | None = None,
+    show_all: bool = False,
+):
+    visible = products if show_all else [product for product in products if _category_key(product) == category]
+    if visible:
+        config = _get_category_config(visible[0].category)
+        title = "All Freebies" if show_all else config["label"]
+    else:
+        title = "Freebies"
+    if not visible:
+        await show(
+            callback,
+            f"🎁 <b>{_esc(title)}</b>\n\n📭 No free products are available here right now.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅ Freebies", callback_data="freebies_menu", style="primary"),
+                 InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")],
+            ]),
+        )
+        return
+
     keyboard = []
-    for p in products:
-        cat_config = _get_category_config(p.category)
-        stock = _real_stock(p)
-        stock_badge = _catalog_stock_badge(p, stock)
-
-        keyboard.append([
-            InlineKeyboardButton(
-                text=f"{p.icon or cat_config['icon']} {p.name} — FREE! 🎁 | {stock_badge}",
-                callback_data=f"product_{p.id}",
-                style=cat_config["style"],
-            )
-        ])
-
-    keyboard.append([
-        InlineKeyboardButton(text="🛍 Browse All Products", callback_data="products_menu", style="primary"),
-        InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary"),
+    for product in visible:
+        config = _get_category_config(product.category)
+        stock_badge = _catalog_stock_badge(product, _real_stock(product))
+        keyboard.append([InlineKeyboardButton(
+            text=f"🎁 {product.icon or config['icon']} {product.name} — FREE | {stock_badge}"[:64],
+            callback_data=f"product_{product.id}",
+            style=config["style"],
+        )])
+    keyboard.extend([
+        [InlineKeyboardButton(text="⬅ Freebies", callback_data="freebies_menu", style="primary")],
+        [InlineKeyboardButton(text="🛍 Paid Products", callback_data="products_menu", style="primary"),
+         InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")],
     ])
-
-    await show(callback, text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    await show(
+        callback,
+        f"🎁 <b>{_esc(title)}</b>\n\nSelect a free product to view details and claim it.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+    )
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -2070,6 +2159,8 @@ async def product_info(
     stock_count = _real_stock(product)
     real_stock_available = stock_count > 0
     cat_config = _get_category_config(product.category)
+    catalog_home_callback = "freebies_menu" if _money(product.price) == Decimal("0") else "products_menu"
+    catalog_home_label = "🎁 Freebies" if catalog_home_callback == "freebies_menu" else "🛍 All Products"
 
     # If fallback is enabled and the automatic pool is empty, present the
     # actual route buyers will receive: the manual fulfillment queue.
@@ -2190,7 +2281,7 @@ async def product_info(
     ])
 
     buttons.append([
-        InlineKeyboardButton(text="🛍 All Products", callback_data="products_menu", style=cat_config["style"]),
+        InlineKeyboardButton(text=catalog_home_label, callback_data=catalog_home_callback, style=cat_config["style"]),
         InlineKeyboardButton(text="📜 My Orders", callback_data="orders_menu", style="primary"),
     ])
     buttons.append([
@@ -2472,6 +2563,7 @@ def _do_purchase(
     expected_total: str | None = None,
     buyer_info: dict | None = None,
     require_buyer_info: bool = False,
+    allow_preorder: bool = True,
 ) -> dict:
     with transaction() as db:
         user = db.query(User).filter(User.telegram_id == telegram_id).with_for_update().first()
@@ -2490,6 +2582,11 @@ def _do_purchase(
             return {"error": "Product not found."}
         if not product.is_active:
             return {"error": "Product unavailable."}
+        if not allow_preorder and (
+            not bool(getattr(product, "api_enabled", False))
+            or (getattr(product, "source", "own") or "own") != "own"
+        ):
+            return {"error": "product_unavailable: Product is no longer enabled for API sales."}
 
         if float(product.price) == 0:
             quantity = 1
@@ -2515,6 +2612,19 @@ def _do_purchase(
 
         if quantity < 1:
             return {"error": "Quantity must be at least 1."}
+
+        # API orders must be backed by current sellable capacity. Telegram may
+        # intentionally accept preorders for manual fulfillment, but external
+        # reseller API calls must never charge for a zero-stock preorder.
+        if not allow_preorder:
+            available = api_order_capacity(product)
+            if available < quantity:
+                return {
+                    "error": (
+                        f"out_of_stock: Only {available} unit(s) are currently "
+                        "available. No payment was taken."
+                    )
+                }
 
         if delivery_telegram_id is not None and delivery_telegram_id <= 0:
             return {"error": "delivery_telegram_id must be a positive Telegram user ID."}

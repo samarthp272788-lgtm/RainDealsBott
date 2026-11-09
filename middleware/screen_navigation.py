@@ -7,12 +7,12 @@ def is_navigation(event):
     if isinstance(event, Message):
         return True
     value = event.data or ''
-    exact = {'products_menu', 'products_all', 'main_menu', 'orders_menu', 'my_profile',
+    exact = {'products_menu', 'products_all', 'freebies_menu', 'freebies_all', 'main_menu', 'orders_menu', 'my_profile',
              'favorites_menu', 'restock_alerts_menu', 'deposit_start', 'my_deposits',
              'support_menu', 'admin_panel', 'admin_orders', 'session_home', 'session_resume',
              'deposit_bep20', 'deposit_polygon', 'deposit_binance', 'deposit_upi', 'deposit_cancel', 'deposit_promo'}
     return value in exact or value.startswith((
-        'products_cat_', 'product_', 'select_qty_', 'order_detail_', 'orders_page_',
+        'products_cat_', 'freebies_cat_', 'product_', 'select_qty_', 'order_detail_', 'orders_page_',
         'order_timeline_', 'admin_timeline_', 'work_queue_', 'work_view_', 'admin_orders_page_',
         'resume_deposit_', 'cancel_buy_', 'order_', 'admin_', 'warranty_', 'addcare_', 'ops_', 'ct_'))
 

@@ -42,6 +42,21 @@ def order_capacity(product):
     return max(stock, inventory) if manual_allowed(product) else inventory
 
 
+def api_order_capacity(product):
+    """Return stock that the reseller API can actually fulfill immediately.
+
+    Telegram's manual fallback can make an automatic/hybrid product visible
+    and queue a team-delivered order when its account pool is empty. That
+    fallback capacity is not API inventory; API clients can only buy the
+    account/reusable units currently available. Explicit manual products keep
+    their configured stock capacity.
+    """
+    mode = (getattr(product, 'delivery_type', None) or 'automatic').lower()
+    if mode in ('automatic', 'hybrid'):
+        return automatic_inventory(product)
+    return order_capacity(product)
+
+
 @dataclass(frozen=True)
 class DeliveryPlan:
     automatic: tuple[str, ...]

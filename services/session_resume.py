@@ -22,7 +22,7 @@ SAFE_STATES = {'DepositState:waiting_network', 'DepositState:waiting_amount',
                'DepositState:waiting_optional_promo', 'PurchaseStates:waiting_qty',
                'SearchStates:waiting_query', 'OrderRequirementStates:waiting_input',
                'SupportState:waiting_message', 'SupportState:tracking_ticket', 'OrderFilterStates:waiting_filter'}
-SAFE_NAV = re.compile(r'^(products_menu|products_all|products_cat_\d+|product_\d+|orders_menu|order_detail_\d+|deposit_start)$')
+SAFE_NAV = re.compile(r'^(products_menu|products_all|products_cat_\d+|freebies_menu|freebies_all|freebies_cat_\d+|product_\d+|orders_menu|order_detail_\d+|deposit_start)$')
 SAFE_KEYS = {'deposit_id', 'network', 'invoice_code', 'invoice_expires_at', 'amount_usdt',
              'pending_product_id', '_card_chat_id', '_card_message_id',
              'order_requirement_order_id', 'order_requirement_fields',

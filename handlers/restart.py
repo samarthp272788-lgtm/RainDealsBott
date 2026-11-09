@@ -170,7 +170,10 @@ async def _restore_snapshot(message, state, snapshot):
         fallback = 'Continue this step. Send '+saved_state.rsplit(':',1)[-1].replace('_',' ')+'. /start opens Home.'
         await answer_card(message, prompts.get(saved_state, fallback), state=state, reply_markup=keyboard)
     else:
-        from handlers.products import products_menu, products_all, products_category, product_info
+        from handlers.products import (
+            products_menu, products_all, products_category, product_info,
+            freebies_menu, freebies_all, freebies_category,
+        )
         from handlers.orders import my_orders, order_detail
         from handlers.deposit import deposit_menu
         nav = snapshot.get('navigation') or ''
@@ -180,6 +183,12 @@ async def _restore_snapshot(message, state, snapshot):
             await products_all(callback)
         elif nav.startswith('products_cat_'):
             await products_category(callback)
+        elif nav == 'freebies_menu':
+            await freebies_menu(callback)
+        elif nav == 'freebies_all':
+            await freebies_all(callback)
+        elif nav.startswith('freebies_cat_'):
+            await freebies_category(callback)
         elif nav.startswith('product_'):
             await product_info(callback)
         elif nav == 'orders_menu':

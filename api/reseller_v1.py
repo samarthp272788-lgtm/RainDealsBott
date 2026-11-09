@@ -63,6 +63,7 @@ from models.product import Product
 from models.user import User
 
 from services.checkout_actions import api_checkout_key, recover_checkout
+from services.fulfillment_policy import api_order_capacity
 from services.input_forms import InputError, api_requirement_values
 
 from services.api_keys import (
@@ -585,9 +586,9 @@ def _product_payload(
 
         "stock": stock,
 
-        "preorder": bool(
-            product.preorder
-        ),
+        # The reseller API only accepts orders against available stock; it
+        # never offers Telegram's manual-preorder path.
+        "preorder": False,
 
         "delivery_type": (
             product.delivery_type
@@ -611,6 +612,9 @@ def _list_products(
             .filter(
                 Product.is_active == True,
                 Product.api_enabled == True,
+                # Zero-price products belong to the Telegram Freebies catalog,
+                # not the public reseller API catalog.
+                Product.price > 0,
             )
             .order_by(
                 Product.id.asc()
@@ -638,9 +642,13 @@ def _list_products(
                     product.price
                 )
 
-            stock = _real_stock(
-                product
-            )
+            if (getattr(product, "source", "own") or "own") == "reseller":
+                # Supplier stock must come from the live provider cache.
+                stock = _real_stock(product)
+            else:
+                # Do not advertise Telegram-only manual-fallback capacity as
+                # reseller API stock for automatic/hybrid products.
+                stock = api_order_capacity(product)
 
             data.append(
                 _product_payload(
@@ -1010,6 +1018,11 @@ def _product_source(
         if not product.api_enabled:
             return None
 
+        # Freebies are claimed from the Telegram Freebies section only. Do not
+        # allow a public API client to bypass that catalog boundary.
+        if _money(product.price or Decimal("0")) <= Decimal("0"):
+            return None
+
         return (
             product.source
             or "own"
@@ -1253,6 +1266,7 @@ async def create_order(
                 api_checkout_key(principal.key_id, payload.client_order_id),
                 buyer_info=payload.buyer_info,
                 require_buyer_info=True,
+                allow_preorder=False,
             )
 
     except Exception as exc:
@@ -1326,6 +1340,20 @@ async def create_order(
                 "buyer_info_invalid",
                 message.partition(":")[2].strip(),
                 422,
+            )
+
+        if message.startswith("out_of_stock:"):
+            raise _api_error(
+                "out_of_stock",
+                message.partition(":")[2].strip(),
+                409,
+            )
+
+        if message.startswith("product_unavailable:"):
+            raise _api_error(
+                "product_unavailable",
+                message.partition(":")[2].strip(),
+                409,
             )
 
         raise _api_error(
