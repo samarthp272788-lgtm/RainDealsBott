@@ -480,6 +480,9 @@ async function route(request,env){
       const canFulfill=!Number(order.refunded)&&['manual','hybrid'].includes(deliveryType)&&(state==='preorder'||['pending_manual','processing'].includes(state));
       if(!canFulfill)error('This order is not waiting for manual fulfillment, or it has been refunded.',409);
       if(order.assigned_admin_id&&String(order.assigned_admin_id)!==String(auth.admin_id))error('This order is assigned to another admin. Reassign it in the bot fulfillment queue first.',409);
+      const pendingUnits=Math.max(0,Number(order.manual_pending_quantity)||Number(order.quantity)-Number(order.automatic_quantity)||0);
+      if(pendingUnits<1)error('This order has no remaining units to deliver.',409);
+      if(mode==='manual'&&suppliedText.split(/\r?\n/).filter(line=>line.trim()).length<pendingUnits)error(`This order still needs ${pendingUnits} unit(s). Enter at least ${pendingUnits} non-empty delivery lines, one per unit.`,409);
       const apiOrder=Boolean((await t.execute('SELECT order_id FROM api_orders WHERE order_id=? LIMIT 1',[orderId])).rows?.length);
       let recipient=String(order.delivery_telegram_id||'');
       if(apiOrder){
@@ -728,11 +731,17 @@ async function route(request,env){
     if(request.method==='GET'){const p=(await rows(env,'SELECT id,source,stock,file_content,reusable_delivery,reusable_stock FROM products WHERE id=?',[id]))[0];if(!p)error('Product not found.',404);return reply({id:p.id,source:p.source,stock:p.stock,account_count:String(p.file_content||'').split(/\r?\n/).filter(x=>x.trim()).length,reusable_stock:String(p.reusable_delivery||'').trim()?Number(p.reusable_stock||0):0});}
     if(request.method==='POST'){
       const b=await body(request);if(!['append','replace','clear'].includes(b.mode))error('Invalid accounts action.');if(b.mode!=='append'&&b.confirm!==true)error('Explicit confirmation is required for replace or clear.',403);
-      const content=String(b.content||'').split(/\r?\n/).map(x=>x.trim()).filter(Boolean).join('\n');let switchedToManual=false;
+      const content=String(b.content||'').split(/\r?\n/).map(x=>x.trim()).filter(Boolean).join('\n');let switchedToManual=false,acceptedLineCount=0;
       await tx(env,async t=>{
         const p=(await t.execute('SELECT source,file_content,stock,reusable_delivery,reusable_stock,delivery_type,manual_fallback FROM products WHERE id=? FOR UPDATE',[id])).rows?.[0];
         if(!p)error('Product not found.');if(p.source!=='own')error('Supplier inventory is managed by the provider.');
-        const value=b.mode==='clear'?'':b.mode==='replace'?content:[p.file_content,content].filter(Boolean).join('\n');
+        const existingLines=[...new Set(String(p.file_content||'').split(/\r?\n/).map(line=>line.trim()).filter(Boolean))];
+        const incomingLines=content.split(/\r?\n/).map(line=>line.trim()).filter(Boolean);
+        const baseLines=b.mode==='clear'||b.mode==='replace'?[]:existingLines;
+        const seenLines=new Set(baseLines),uniqueIncoming=[];
+        for(const line of incomingLines){if(!seenLines.has(line)){seenLines.add(line);uniqueIncoming.push(line)}}
+        acceptedLineCount=b.mode==='clear'?0:uniqueIncoming.length;
+        const value=b.mode==='clear'?'':b.mode==='replace'?uniqueIncoming.join('\n'):[...existingLines,...uniqueIncoming].join('\n');
         const sharedUnits=String(p.reusable_delivery||'').trim()?Number(p.reusable_stock||0):0,accountUnits=value?value.split(/\r?\n/).filter(x=>x.trim()).length:0,units=accountUnits+sharedUnits;
         const emptyAutomatic=units===0&&['automatic','hybrid'].includes(String(p.delivery_type||'').toLowerCase()),nextDelivery=emptyAutomatic?'manual':p.delivery_type,nextFallback=emptyAutomatic?1:Number(p.manual_fallback||0),nextPreorder=emptyAutomatic?0:null;
         const hadManualCapacity=Number(p.manual_fallback)||String(p.delivery_type||'').toLowerCase()==='manual';
@@ -740,7 +749,7 @@ async function route(request,env){
         switchedToManual=emptyAutomatic;
         await t.execute('UPDATE products SET file_content=?,stock=?,delivery_type=?,manual_fallback=?,preorder=COALESCE(?,preorder),updated_at=UTC_TIMESTAMP() WHERE id=?',[value||null,nextStock,nextDelivery,nextFallback,nextPreorder,id]);
       });
-      await audit(env,auth.admin_id,b.mode,'product_inventory',id,{mode:b.mode,line_count:b.mode==='clear'?0:content.split(/\r?\n/).filter(Boolean).length,switched_to_manual:switchedToManual});
+      await audit(env,auth.admin_id,b.mode,'product_inventory',id,{mode:b.mode,line_count:acceptedLineCount,switched_to_manual:switchedToManual});
       return reply({success:true,switched_to_manual:switchedToManual,message:switchedToManual?'Inventory saved. No automatic inventory remains, so the product was switched to manual fulfillment.':'Inventory saved.'});
     }
   }

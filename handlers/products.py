@@ -85,15 +85,56 @@ ORDER_NOTIFICATION_CHANNEL_ID = getattr(config, "ORDER_NOTIFICATION_CHANNEL_ID",
 # ║            RESELLER LIVE STOCK CACHE & HELPERS               ║
 # ╚══════════════════════════════════════════════════════════════╝
 
-_reseller_stock_cache: dict[str, int] = {}
+_reseller_stock_cache: dict[tuple[str, str], int] = {}
+_reseller_stock_cache_updated: dict[tuple[str, str], float] = {}
+_reseller_stock_unavailable: set[tuple[str, str]] = set()
 _reseller_stock_cache_time: float = 0.0
 _reseller_cache_lock = asyncio.Lock()
 _reseller_refresh_task: asyncio.Task | None = None
+_supplier_purchase_locks: dict[tuple[str, str], asyncio.Lock] = {}
 RESELLER_CACHE_TTL = 30  # Includes empty/failed refreshes, preventing retry storms.
+RESELLER_STOCK_MAX_AGE_SECONDS = 90
 RESELLER_STOCK_TIMEOUT_SECONDS = 20  # Background work does not delay browsing.
 
 # Per-user per-provider in-flight import locks
 _reseller_import_locks: set[tuple[int, str]] = set()
+
+
+def _reseller_cache_key(provider_id, service_id) -> tuple[str, str]:
+    scope = str(provider_id or "default_provider").strip().casefold()
+    return scope, str(service_id or "").strip()
+
+
+def _cached_reseller_stock(provider_id, service_id):
+    key = _reseller_cache_key(provider_id, service_id)
+    if key in _reseller_stock_unavailable:
+        return 0, False
+    if key not in _reseller_stock_cache:
+        return None, False
+    fresh = time.monotonic() - _reseller_stock_cache_updated.get(key, 0) <= RESELLER_STOCK_MAX_AGE_SECONDS
+    return (_reseller_stock_cache[key] if fresh else None), not fresh
+
+
+def _supplier_stock_value(item: dict) -> int:
+    """Parse stock conservatively; only explicit unlimited values are unbounded."""
+    if "stock" not in item or item.get("stock") is None:
+        return 0
+    value = item.get("stock")
+    if isinstance(value, str) and value.strip().casefold() in {
+        "unlimited", "infinite", "infinity", "∞"
+    }:
+        return 999999
+    try:
+        stock = int(value)
+    except (ValueError, TypeError, OverflowError):
+        return 0
+    return max(0, stock)
+
+
+def _supplier_delivery_units(delivered_items: list[str]) -> int:
+    """Count delivered units from item arrays or newline-delimited payloads."""
+    return sum(max(1, len([line for line in str(item).splitlines() if line.strip()]))
+               for item in delivered_items if str(item).strip())
 
 
 def _get_reseller_credentials(reseller_id: str | int | None = None) -> dict:
@@ -184,7 +225,14 @@ async def _call_reseller_place_order(manager, service_id: str, quantity: int, ex
 
     for _ in range(20):
         fulfillment = res.get("fulfillment")
-        if isinstance(fulfillment, dict) and (fulfillment.get("payload") or fulfillment.get("delivery_data")):
+        if isinstance(fulfillment, (str, list, int, float)) and not isinstance(fulfillment, bool) and fulfillment:
+            return res
+        if isinstance(fulfillment, dict) and any(
+            fulfillment.get(key) for key in (
+                "payload", "delivery_data", "delivery", "delivery_items",
+                "accounts", "credentials", "code", "result",
+            )
+        ):
             return res
 
         await asyncio.sleep(1)
@@ -192,10 +240,19 @@ async def _call_reseller_place_order(manager, service_id: str, quantity: int, ex
         if not isinstance(details, dict):
             continue
 
+        nested = details.get("order") or details.get("data")
+        if isinstance(nested, dict):
+            details = {**details, **nested}
         fulfillment = details.get("fulfillment")
         delivered = None
-        if isinstance(fulfillment, dict):
-            delivered = fulfillment.get("payload") or fulfillment.get("delivery_data")
+        if isinstance(fulfillment, (str, list, int, float)) and not isinstance(fulfillment, bool):
+            delivered = fulfillment
+        elif isinstance(fulfillment, dict):
+            for key in ("payload", "delivery_data", "delivery", "delivery_items",
+                        "accounts", "credentials", "code", "result"):
+                if fulfillment.get(key) is not None:
+                    delivered = fulfillment[key]
+                    break
 
         merged = dict(res)
         merged.update(details)
@@ -265,22 +322,41 @@ async def _refresh_reseller_stock_cache_if_needed():
                             _call_reseller_get_products(manager),
                             timeout=RESELLER_STOCK_TIMEOUT_SECONDS + 1,
                         )
-                        services = []
+                        services = None
                         if isinstance(reseller_data, list):
                             services = reseller_data
                         elif isinstance(reseller_data, dict):
-                            services = (reseller_data.get("services") or reseller_data.get("products")
-                                        or reseller_data.get("data") or [])
+                            for catalog_key in ("services", "products", "data"):
+                                candidate = reseller_data.get(catalog_key)
+                                if isinstance(candidate, list):
+                                    services = candidate
+                                    break
+                        if services is None:
+                            raise ValueError("Supplier catalog response did not contain a product list")
+                        scope = str(prov.get("id") or prov.get("provider_id") or "default_provider").strip().casefold()
+                        seen_service_keys = set()
                         for item in services:
                             if not isinstance(item, dict):
                                 continue
                             sid = str(item.get("service_id") or item.get("provider_product_id") or item.get("id", "")).strip()
-                            try:
-                                stock = int(item["stock"]) if item.get("stock") is not None else 999999
-                            except (ValueError, TypeError):
-                                stock = 999999
+                            stock = _supplier_stock_value(item)
+                            availability = item.get("is_available")
+                            if availability is False or str(availability or "").strip().casefold() in {
+                                "false", "no", "0", "inactive", "disabled", "unavailable"
+                            }:
+                                stock = 0
                             if sid:
-                                _reseller_stock_cache[sid] = stock
+                                key = _reseller_cache_key(scope, sid)
+                                _reseller_stock_cache[key] = stock
+                                _reseller_stock_cache_updated[key] = loop.time()
+                                _reseller_stock_unavailable.discard(key)
+                                seen_service_keys.add(key)
+                        # A successful complete catalog response is authoritative:
+                        # services absent from it are no longer sellable.
+                        for key in [key for key in _reseller_stock_cache if key[0] == scope and key not in seen_service_keys]:
+                            _reseller_stock_cache.pop(key, None)
+                            _reseller_stock_cache_updated.pop(key, None)
+                            _reseller_stock_unavailable.add(key)
                         observe_sync(prov.get("id") or prov.get("provider_id") or "default_provider")
                     except Exception as exc:
                         observe_sync(prov.get("id") or prov.get("provider_id") or "default_provider", exc)
@@ -502,7 +578,7 @@ def _stock_indicator(stock: int) -> str:
 
 def _provider_stock_value(stock: Any) -> int:
     if stock is None:
-        return 1
+        return 0
     if isinstance(stock, bool):
         return 1 if stock else 0
     try:
@@ -512,9 +588,9 @@ def _provider_stock_value(stock: Any) -> int:
         if normalized in {"out_of_stock", "oos", "unavailable", "disabled", "inactive", "false", "no"}:
             return 0
         if normalized in {"unlimited", "infinite", "infinity", "in_stock", "available", "active", "true", "yes"}:
-            return 1
-        return 1
-    return 1 if value < 0 else value
+            return 999999 if normalized in {"unlimited", "infinite", "infinity"} else 1
+        return 0
+    return max(0, value)
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -957,9 +1033,14 @@ def _real_stock(product) -> int:
         if not service_id:
             return fallback_stock
 
-        if service_id in _reseller_stock_cache:
-            live_stock = _reseller_stock_cache[service_id]
-            return min(live_stock, fallback_stock) if fallback_stock < 999999 else live_stock
+        provider_scope = getattr(product, "provider_id", None) or getattr(product, "reseller_name", None)
+        live_stock, stale = _cached_reseller_stock(provider_scope, service_id)
+        if stale:
+            return 0
+        if live_stock is not None:
+            # For supplier products the supplier's fresh count is authoritative;
+            # the local Product.stock column is only an import-time snapshot.
+            return live_stock
 
         return fallback_stock
 
@@ -2383,6 +2464,7 @@ def _do_purchase(
             reserved_delivery="\n".join(reserved_delivery) if reserved_delivery else None,
             reusable_delivery_account=plan.reusable_content,
             reusable_delivery_quantity=plan.reusable_quantity,
+            required_info_snapshot=[dict(item) for item in required_info if isinstance(item, dict)] or None,
             amount=total_amount, quantity=quantity, delivery_type=plan.order_mode,
             automatic_quantity=plan.automatic_quantity, manual_pending_quantity=plan.manual_quantity,
             stock_deducted_quantity=0 if plan.preorder else quantity,
@@ -2424,11 +2506,15 @@ def _do_purchase(
 
         referral_commission_paid = None
         if not is_preorder_order and user.referred_by:
+            order.referral_commission_amount = Decimal("0")
+            order.referral_commission_to_balance = bool(REFERRAL_CREDIT_TO_BALANCE)
             referrer = db.query(User).filter(User.telegram_id == user.referred_by).with_for_update().first()
             if referrer is not None:
                 commission = _money(total_amount * REFERRAL_COMMISSION_RATE)
                 if commission > 0:
                     referrer.referral_earnings = _money(referrer.referral_earnings) + commission
+                    order.referral_commission_amount = commission
+                    order.referral_commission_to_balance = bool(REFERRAL_CREDIT_TO_BALANCE)
                     if REFERRAL_CREDIT_TO_BALANCE:
                         referrer.balance = _money(referrer.balance) + commission
                     referral_commission_paid = {"referrer_telegram_id": referrer.telegram_id, "amount": commission}
@@ -2457,6 +2543,41 @@ def _do_purchase(
 # ╚══════════════════════════════════════════════════════════════╝
 
 async def _do_reseller_purchase(
+    telegram_id: int,
+    product_id: int,
+    quantity: int,
+    progress_callback=None,
+    checkout_key: str | None = None,
+    expected_total: str | None = None,
+) -> dict:
+    """Serialize purchases for one supplier service within this bot process."""
+    def _lock_identity():
+        db = SessionLocal()
+        try:
+            product = db.query(Product.provider_id, Product.reseller_name, Product.reseller_service_id).filter(
+                Product.id == product_id
+            ).first()
+            if not product:
+                return "missing", str(product_id)
+            provider_id, reseller_name, service_id = product
+            return str(provider_id or reseller_name or "default_provider").casefold(), str(service_id or "").strip()
+        finally:
+            db.close()
+
+    identity = await asyncio.to_thread(_lock_identity)
+    lock = _supplier_purchase_locks.setdefault(identity, asyncio.Lock())
+    async with lock:
+        return await _do_reseller_purchase_unlocked(
+            telegram_id,
+            product_id,
+            quantity,
+            progress_callback=progress_callback,
+            checkout_key=checkout_key,
+            expected_total=expected_total,
+        )
+
+
+async def _do_reseller_purchase_unlocked(
     telegram_id: int,
     product_id: int,
     quantity: int,
@@ -2494,10 +2615,16 @@ async def _do_reseller_purchase(
         await _refresh_reseller_stock_cache_if_needed()
         db_stock = getattr(product, "stock", 0)
         fallback_stk = db_stock if db_stock is not None else 999999
-        live_stock = _reseller_stock_cache.get(service_id, fallback_stk)
-        available_stock = min(live_stock, fallback_stk) if fallback_stk < 999999 else live_stock
+        provider_scope = getattr(product, "provider_id", None) or getattr(product, "reseller_name", None)
+        live_stock, stock_is_stale = _cached_reseller_stock(provider_scope, service_id)
+        if stock_is_stale:
+            return {"error": "Supplier stock could not be refreshed safely. Please try again shortly."}
+        if live_stock is None:
+            return {"error": "Supplier stock is not confirmed yet. Please try again shortly."}
+        # Do not cap fresh supplier stock with the import-time local snapshot.
+        available_stock = live_stock
 
-        if available_stock > 0 and available_stock < quantity:
+        if available_stock < quantity:
             return {"error": f"Only {available_stock} left in stock with supplier."}
 
         custom_price = _active_custom_price(db, telegram_id, product.id)
@@ -2563,6 +2690,7 @@ async def _do_reseller_purchase(
         return {"error": f"❌ Supplier service error: {str(e)}", "needs_review": True}
 
     delivered_list = []
+    delivery_items_are_atomic = False
     if isinstance(api_response, dict):
         raw_products = (
                 api_response.get("delivery_items") or
@@ -2577,12 +2705,30 @@ async def _do_reseller_purchase(
                 api_response.get("delivered_account") or
                 api_response.get("items")
         )
+        if raw_products is None and api_response.get("fulfillment") is not None:
+            fulfillment = api_response.get("fulfillment")
+            if isinstance(fulfillment, dict):
+                for key in ("payload", "delivery_data", "delivery", "delivery_items",
+                            "accounts", "credentials", "code", "result"):
+                    if fulfillment.get(key) is not None:
+                        raw_products = fulfillment[key]
+                        break
+            else:
+                raw_products = fulfillment
         if isinstance(raw_products, str):
             delivered_list = [raw_products]
         elif isinstance(raw_products, list):
             delivered_list = [str(p) for p in raw_products if p]
+            delivery_items_are_atomic = True
+        elif isinstance(raw_products, dict):
+            delivered_list = [json.dumps(raw_products, ensure_ascii=False)]
+            delivery_items_are_atomic = True
+        elif isinstance(raw_products, (int, float)) and not isinstance(raw_products, bool):
+            delivered_list = [str(raw_products)]
+            delivery_items_are_atomic = True
     elif isinstance(api_response, list):
         delivered_list = [str(p) for p in api_response if p]
+        delivery_items_are_atomic = True
     elif isinstance(api_response, str):
         delivered_list = [api_response]
 
@@ -2593,8 +2739,35 @@ async def _do_reseller_purchase(
         and not delivered_list
     )
     if not delivered_list and not is_async_provider_order:
-        logger.error("Reseller API returned success but no products/codes: %s", api_response)
+        response_fields = sorted(api_response.keys()) if isinstance(api_response, dict) else []
+        logger.error(
+            "Reseller API returned success without product content response_type=%s fields=%s",
+            type(api_response).__name__, response_fields,
+        )
         return {"error": "❌ Supplier returned no product codes. Your balance was not charged."}
+
+    delivered_units = (
+        len(delivered_list) if delivery_items_are_atomic
+        else _supplier_delivery_units(delivered_list)
+    )
+    expected_units = max(1, int(quantity or 1))
+    partial_delivery = bool(delivered_list and delivered_units < expected_units)
+    if delivered_list and delivered_units > expected_units:
+        logger.warning(
+            "Supplier returned extra delivery units; limiting user delivery order_id=%s expected=%s got=%s",
+            external_order_id, expected_units, delivered_units,
+        )
+        remaining_units = expected_units
+        limited_items = []
+        for item in delivered_list:
+            lines = [line for line in str(item).splitlines() if line.strip()]
+            take = 1 if delivery_items_are_atomic else min(len(lines), remaining_units)
+            limited_items.append(item if delivery_items_are_atomic else "\n".join(lines[:take]))
+            remaining_units -= take
+            if remaining_units <= 0:
+                break
+        delivered_list = limited_items
+        delivered_units = len(delivered_list) if delivery_items_are_atomic else _supplier_delivery_units(delivered_list)
 
     await report_progress(80, "Supplier confirmed; preparing your delivery")
     provider_order_id = None
@@ -2602,6 +2775,7 @@ async def _do_reseller_purchase(
         provider_order_id = api_response.get("order_id") or api_response.get("order_no")
     local_provider_id = int(creds["id"]) if str(creds.get("id", "")).isdigit() else None
 
+    @retry_on_write_conflict(max_attempts=3)
     def _finalize_db_transaction():
         with transaction() as db:
             u = db.query(User).filter(User.telegram_id == telegram_id).with_for_update().first()
@@ -2625,6 +2799,12 @@ async def _do_reseller_purchase(
                 purchased_product.stock = max(0, purchased_product.stock - quantity)
 
             delivered_text = "\n".join(delivered_list) if delivered_list else None
+            order_status = (
+                "processing" if is_async_provider_order else
+                "pending_manual" if partial_delivery else "completed"
+            )
+            order_delivery_type = "hybrid" if partial_delivery else "automatic"
+            manual_pending_quantity = max(0, quantity - delivered_units) if partial_delivery else 0
 
             order = Order(
                 telegram_id=u.telegram_id,
@@ -2633,13 +2813,16 @@ async def _do_reseller_purchase(
                 delivered_account=delivered_text,
                 amount=total_amount,
                 quantity=quantity,
-                delivery_type="automatic",
+                delivery_type=order_delivery_type,
+                automatic_quantity=delivered_units,
+                manual_pending_quantity=manual_pending_quantity,
                 is_preorder=False,
-                status="processing" if is_async_provider_order else "completed",
+                status=order_status,
                 refunded=False, checkout_key=checkout_key,
                 reseller_id=local_provider_id,
                 reseller_service_id=service_id,
                 reseller_order_id=external_order_id if is_async_provider_order else str(provider_order_id or external_order_id),
+                reseller_provider_order_id=str(provider_order_id) if is_async_provider_order and provider_order_id else None,
             )
             db.add(order)
             db.flush()
@@ -2648,29 +2831,39 @@ async def _do_reseller_purchase(
             if order.status == "completed":
                 start_coverage(order)
             record_event(db, order.id, 'created', 'Supplier order received.', actor_id=telegram_id)
-            record_event(db, order.id, 'supplier_pending' if is_async_provider_order else 'completed',
-                         'Supplier is processing the order.' if is_async_provider_order else 'Supplier delivery completed.')
+            event_kind = 'supplier_pending' if is_async_provider_order else 'supplier_partial' if partial_delivery else 'completed'
+            event_summary = (
+                'Supplier is processing the order.' if is_async_provider_order else
+                f'Supplier delivered {delivered_units} of {quantity} units; the team will deliver the remainder.'
+                if partial_delivery else 'Supplier delivery completed.'
+            )
+            record_event(db, order.id, event_kind, event_summary)
 
             enqueue(db, f"order-update:{order.id}:supplier", u.telegram_id,
                     "Your supplier order is being processed. Open My Orders to check its status." if is_async_provider_order
+                    else f"Your supplier delivered {delivered_units} of {quantity} units. The team will deliver the remaining {manual_pending_quantity}. Open My Orders to track it." if partial_delivery
                     else "Your order has been delivered. Open My Orders to view the delivery details.",
                     source_order_id=order.id)
 
 
             referral_commission_paid = None
             if u.referred_by:
+                order.referral_commission_amount = Decimal("0")
+                order.referral_commission_to_balance = bool(REFERRAL_CREDIT_TO_BALANCE)
                 referrer = db.query(User).filter(User.telegram_id == u.referred_by).with_for_update().first()
                 if referrer is not None:
                     commission = _money(total_amount * REFERRAL_COMMISSION_RATE)
                     if commission > 0:
                         referrer.referral_earnings = _money(referrer.referral_earnings) + commission
+                        order.referral_commission_amount = commission
+                        order.referral_commission_to_balance = bool(REFERRAL_CREDIT_TO_BALANCE)
                         if REFERRAL_CREDIT_TO_BALANCE:
                             referrer.balance = _money(referrer.balance) + commission
                         referral_commission_paid = {"referrer_telegram_id": referrer.telegram_id, "amount": commission}
 
-            stock_left = _reseller_stock_cache.get(service_id, fallback_stk)
-            if purchased_product is not None and purchased_product.stock is not None and purchased_product.stock < 999999:
-                stock_left = min(stock_left, purchased_product.stock)
+            stock_left = _cached_reseller_stock(provider_scope, service_id)[0]
+            if stock_left is None:
+                stock_left = fallback_stk
             stock_disp = "In Stock" if stock_left >= 999999 else stock_left
 
             return {
@@ -2681,9 +2874,11 @@ async def _do_reseller_purchase(
                 "delivered_accounts": delivered_list,
                 "balance": u.balance,
                 "stock": stock_disp,
-                "status": "processing" if is_async_provider_order else "completed",
+                "status": order_status,
                 "is_preorder": False,
                 "quantity": quantity,
+                "automatic_quantity": delivered_units,
+                "manual_pending_quantity": manual_pending_quantity,
                 "total_price": total_amount,
                 "price_per_unit": price,
                 "low_stock_alert": None,
@@ -2696,18 +2891,32 @@ async def _do_reseller_purchase(
         result = await asyncio.to_thread(_finalize_db_transaction)
         if result.get("duplicate_order_id"):
             return result
-        if service_id in _reseller_stock_cache and _reseller_stock_cache[service_id] < 999999:
-            _reseller_stock_cache[service_id] = max(
-                0, _reseller_stock_cache[service_id] - quantity
-            )
+        cache_key = _reseller_cache_key(provider_scope, service_id)
+        if cache_key in _reseller_stock_cache and _reseller_stock_cache[cache_key] < 999999:
+            _reseller_stock_cache[cache_key] = max(0, _reseller_stock_cache[cache_key] - quantity)
+            _reseller_stock_cache_updated[cache_key] = time.monotonic()
             result["stock"] = min(
-                _reseller_stock_cache[service_id],
-                result["stock"] if isinstance(result["stock"], int) else _reseller_stock_cache[service_id],
+                _reseller_stock_cache[cache_key],
+                result["stock"] if isinstance(result["stock"], int) else _reseller_stock_cache[cache_key],
             )
         invalidate_products_cache()
         return result
     except Exception:
         logger.exception("Error finalizing local order after successful reseller order")
+        try:
+            def _queue_reconciliation_alert():
+                from services.notification_outbox import enqueue_admin
+                with transaction() as db:
+                    enqueue_admin(
+                        db,
+                        f"supplier-finalize:{checkout_key or external_order_id}",
+                        "A supplier accepted an order, but RainDeals could not save its local order record. "
+                        f"Check supplier reference {external_order_id}, provider {prov_id}, service {service_id}, "
+                        f"buyer {telegram_id}, and checkout {checkout_key or 'unavailable'} before retrying."
+                    )
+            await asyncio.to_thread(_queue_reconciliation_alert)
+        except Exception:
+            logger.exception("Could not queue supplier finalization review alert reference=%s", external_order_id)
         return {"error": "❌ Order processing needs review. Check My Orders and contact support before retrying.", "needs_review": True}
 
 

@@ -125,7 +125,13 @@ def ensure_order_requirements_schema() -> None:
         _ensure_column(connection, "orders", "reusable_delivery_quantity", "INT NOT NULL DEFAULT 0")
         _ensure_column(connection, "orders", "automatic_quantity", "INT NOT NULL DEFAULT 0")
         _ensure_column(connection, "orders", "manual_pending_quantity", "INT NOT NULL DEFAULT 0")
+        _ensure_column(connection, "orders", "required_info_snapshot", "JSON NULL")
         _ensure_column(connection, "orders", "stock_deducted_quantity", "INT NULL")
+        _ensure_column(connection, "orders", "referral_commission_amount", "DECIMAL(20,8) NULL")
+        _ensure_column(connection, "orders", "referral_commission_to_balance", "TINYINT(1) NULL")
+        _ensure_column(connection, "orders", "reseller_provider_order_id", "VARCHAR(255) NULL")
+        _ensure_index(connection, "orders", ["status", "refunded", "reseller_id", "reseller_provider_order_id"],
+                      "ix_orders_supplier_reconcile")
         _ensure_column(connection, "orders", "checkout_key", "VARCHAR(64) NULL")
         _ensure_column(connection, "orders", "assigned_admin_id", "BIGINT NULL")
         _ensure_column(connection, "orders", "assigned_at", "DATETIME NULL")

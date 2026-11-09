@@ -656,13 +656,20 @@ def _do_refund(order_id: int, admin_id: int, cancellation_only: bool = False) ->
                 .first()
             )
             if referrer is not None:
-                commission = _money(refund_amount * REFERRAL_COMMISSION_RATE)
+                saved_commission = getattr(order, "referral_commission_amount", None)
+                commission = _money(
+                    saved_commission if saved_commission is not None
+                    else refund_amount * REFERRAL_COMMISSION_RATE
+                )
                 if commission > 0:
                     referrer.referral_earnings = max(
                         Decimal("0"),
                         _money(referrer.referral_earnings) - commission,
                     )
-                    if REFERRAL_CREDIT_TO_BALANCE:
+                    credited_to_balance = getattr(order, "referral_commission_to_balance", None)
+                    if credited_to_balance is None:
+                        credited_to_balance = REFERRAL_CREDIT_TO_BALANCE
+                    if credited_to_balance:
                         referrer.balance = _money(referrer.balance) - commission
                     commission_reversed = {
                         "referrer_telegram_id": referrer.telegram_id,
@@ -871,6 +878,21 @@ def _do_deliver(order_id: int, delivered_text: str, admin_id: int) -> dict:
             return {"error": "This order belongs to another admin. Reassign it in the team workspace first."}
         if not delivered_text or not delivered_text.strip():
             return {"error": "Delivery content cannot be empty."}
+        pending_units = max(
+            0,
+            int(order.manual_pending_quantity or 0)
+            or int(order.quantity or 0) - int(order.automatic_quantity or 0),
+        )
+        if pending_units < 1:
+            return {"error": "This order has no remaining units to deliver."}
+        delivered_units = len([line for line in delivered_text.splitlines() if line.strip()])
+        if delivered_units < pending_units:
+            return {
+                "error": (
+                    f"This order still needs {pending_units} unit(s). Send at least "
+                    f"{pending_units} non-empty delivery lines, one per unit."
+                )
+            }
         order.assigned_admin_id = admin_id
         order.assigned_at = order.assigned_at or datetime.utcnow()
         record_event(db, order.id, "completed", "Team delivery completed.", actor_id=admin_id)

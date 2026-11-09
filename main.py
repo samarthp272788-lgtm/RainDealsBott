@@ -16,6 +16,7 @@ from services.deposit_card_recovery import (
     recover_interrupted_deposit_cards,
 )
 from services.order_notifications import order_notification_loop
+from services.supplier_reconciliation import supplier_reconciliation_loop
 from services.notification_outbox import notification_loop
 from services.product_api_access import ensure_product_api_access_schema
 from services.provider_schema import ensure_provider_schema
@@ -101,6 +102,7 @@ async def main():
     deposit_card_task = None
     notification_outbox_task = None
     order_notification_task = None
+    supplier_reconciliation_task = None
 
     # --------------------------------------------------------
     # HTTP SERVER
@@ -130,6 +132,9 @@ async def main():
 
     order_notification_task = asyncio.create_task(
         order_notification_loop(bot)
+    )
+    supplier_reconciliation_task = asyncio.create_task(
+        supplier_reconciliation_loop(bot), name="supplier-order-reconciliation"
     )
 
     logger.info(
@@ -215,6 +220,13 @@ async def main():
 
             except asyncio.CancelledError:
 
+                pass
+
+        if supplier_reconciliation_task and not supplier_reconciliation_task.done():
+            supplier_reconciliation_task.cancel()
+            try:
+                await supplier_reconciliation_task
+            except asyncio.CancelledError:
                 pass
 
         if runner:

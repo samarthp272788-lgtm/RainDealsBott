@@ -597,7 +597,12 @@ def _order_requirement_context(order_id: int, telegram_id: int):
             return None, [], None
         product = db.query(Product).filter(Product.id == order.product_id).first() if order.product_id else None
         submission = db.query(OrderRequirementSubmission).filter_by(order_id=order_id).first()
-        requirements = product.required_info if product and isinstance(product.required_info, list) else []
+        saved_requirements = getattr(order, "required_info_snapshot", None)
+        requirements = (
+            saved_requirements if isinstance(saved_requirements, list)
+            else product.required_info if product and isinstance(product.required_info, list)
+            else []
+        )
         return order, requirements, submission
     finally:
         db.close()

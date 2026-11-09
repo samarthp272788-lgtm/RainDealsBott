@@ -16,6 +16,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    JSON,
     Numeric,
     String,
     Text,
@@ -110,6 +111,9 @@ class Order(Base):
     reusable_delivery_quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     automatic_quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     manual_pending_quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    # Freeze the buyer-input form at checkout so later product edits do not
+    # alter requirements for an order already waiting for information.
+    required_info_snapshot: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     stock_deducted_quantity: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     checkout_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, unique=True)
     assigned_admin_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
@@ -124,6 +128,8 @@ class Order(Base):
     term_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     coverage_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     refund_amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8), nullable=True)
+    referral_commission_amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8), nullable=True)
+    referral_commission_to_balance: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     admin_notification_queued_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     # For a manual reseller API order, this is the reseller's end customer.
@@ -176,6 +182,10 @@ class Order(Base):
         nullable=True,
         index=True,
     )
+
+    # Provider's own ID for asynchronous polling. reseller_order_id remains
+    # the RainDeals downstream reference used to authenticate callbacks.
+    reseller_provider_order_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
 
     # Relationship to Provider model
     provider: Mapped[Optional["Provider"]] = relationship(

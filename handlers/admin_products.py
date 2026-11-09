@@ -1808,7 +1808,7 @@ async def save_product(message: Message, state: FSMContext):
         accounts = []
         file_content = ""
     else:
-        accounts = [x.strip() for x in raw_text.splitlines() if x.strip()]
+        accounts = list(dict.fromkeys(x.strip() for x in raw_text.splitlines() if x.strip()))
         file_content = "\n".join(accounts)
 
     await state.update_data(draft_accounts=accounts)
