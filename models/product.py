@@ -99,6 +99,11 @@ class Product(Base):
         nullable=True,
     )
 
+    # One reusable credential can represent many sellable units. This keeps
+    # stock such as 1,000 units from requiring 1,000 copies in file_content.
+    reusable_delivery: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    reusable_stock: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+
     is_active: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,
@@ -232,6 +237,7 @@ class Product(Base):
             "subscription_days": self.subscription_days,
             "price": str(self.price) if self.price is not None else "0.00000000",
             "stock": self.stock,
+            "reusable_stock": self.reusable_stock,
             "is_active": self.is_active,
             "api_enabled": self.api_enabled,
             "delivery_type": self.delivery_type,

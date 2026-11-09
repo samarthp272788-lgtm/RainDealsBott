@@ -1821,11 +1821,15 @@ async def product_empty_inventory(message: Message, state: FSMContext):
         return
     raw = (message.text or "").strip().lower()
     if raw not in {"yes", "no"}:
-        await answer_card(message, "Switch to manual delivery? Send yes or no.")
+        await answer_card(message, "No inventory is available. Send yes to make the product manual for every order, or no to save it blocked until stock is added.")
         return
     await state.update_data(empty_inventory_decided=True)
     if raw == "yes":
         await state.update_data(delivery_type="manual", manual_fallback=True)
+    else:
+        # A rejected empty-automatic setup must stay unavailable even if
+        # manual fallback or preorder was selected in an earlier step.
+        await state.update_data(manual_fallback=False, preorder=False)
     await _finish_own_product(message, state)
 
 
@@ -1846,10 +1850,11 @@ async def _finish_own_product(message, state):
     data = await state.get_data()
     accounts = data.get("draft_accounts", [])
     file_content = "\n".join(accounts)
-    if not accounts and data.get("delivery_type") in {"automatic", "hybrid"} and not data.get("manual_fallback") and not data.get("empty_inventory_decided"):
+    if not accounts and data.get("delivery_type") in {"automatic", "hybrid"} and not data.get("empty_inventory_decided"):
         await state.set_state(AddProduct.empty_inventory)
-        await answer_card(message, "No accounts uploaded. Switch to manual delivery?\n"
-                          "Send yes, or no to keep this product blocked until accounts are added.")
+        await answer_card(message, "⚠️ No automatic inventory is configured.\n\n"
+                          "Send yes to continue with MANUAL delivery. Every order will be marked manual and sent to the fulfillment queue; it will not be auto-delivered.\n\n"
+                          "Send no to keep this product unavailable until inventory is added.")
         return
     if (data.get("manual_fallback") or data.get("delivery_type") == "manual") and "stock_capacity" not in data:
         await state.set_state(AddProduct.stock_capacity)

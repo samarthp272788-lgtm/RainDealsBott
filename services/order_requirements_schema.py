@@ -95,6 +95,8 @@ def ensure_order_requirements_schema() -> None:
         _ensure_column(connection, "users", "home_menu_chat_id", "BIGINT NULL")
         _ensure_column(connection, "users", "home_menu_message_id", "BIGINT NULL")
         _ensure_column(connection, "products", "required_info", "JSON NULL")
+        _ensure_column(connection, "products", "reusable_delivery", "TEXT NULL")
+        _ensure_column(connection, "products", "reusable_stock", "INT NOT NULL DEFAULT 0")
         _ensure_column(connection, "products", "warranty_days", "INT NOT NULL DEFAULT 0")
         _ensure_column(connection, "orders", "warranty_days", "INT NOT NULL DEFAULT 0")
         _ensure_column(connection, "orders", "warranty_expires_at", "DATETIME NULL")
@@ -107,6 +109,8 @@ def ensure_order_requirements_schema() -> None:
         if not fallback_exists:
             connection.execute(text("UPDATE products SET manual_fallback=1 WHERE delivery_type IN ('manual','hybrid')"))
         _ensure_column(connection, "orders", "reserved_delivery", "TEXT NULL")
+        _ensure_column(connection, "orders", "reusable_delivery_account", "TEXT NULL")
+        _ensure_column(connection, "orders", "reusable_delivery_quantity", "INT NOT NULL DEFAULT 0")
         _ensure_column(connection, "orders", "automatic_quantity", "INT NOT NULL DEFAULT 0")
         _ensure_column(connection, "orders", "manual_pending_quantity", "INT NOT NULL DEFAULT 0")
         _ensure_column(connection, "orders", "stock_deducted_quantity", "INT NULL")

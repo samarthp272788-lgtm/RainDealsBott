@@ -105,6 +105,7 @@ async def admin_orders(callback: CallbackQuery):
             "❌ No orders found.",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
+                    [InlineKeyboardButton(text="📦 Bulk deliver from inventory", callback_data="admin_bulk_inventory")],
                     [InlineKeyboardButton(text="📋 Fulfillment queue", callback_data="work_queue_all_0")],
                     [InlineKeyboardButton(text="⬅ Back", callback_data="admin_panel")]
                 ]
@@ -137,6 +138,7 @@ async def admin_orders(callback: CallbackQuery):
         navigation.append(InlineKeyboardButton(text="Next ➡", callback_data=f"admin_orders_page_{page + 1}"))
     if navigation:
         keyboard.append(navigation)
+    keyboard.append([InlineKeyboardButton(text="📦 Bulk deliver from inventory", callback_data="admin_bulk_inventory")])
     keyboard.append([InlineKeyboardButton(text="📋 Fulfillment queue", callback_data="work_queue_all_0")])
     keyboard.append([InlineKeyboardButton(text="⬅ Back", callback_data="admin_panel")])
 
@@ -144,6 +146,234 @@ async def admin_orders(callback: CallbackQuery):
         f"📦 Orders ({page + 1}/{total_pages}) — {total} total",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
     )
+
+
+def _bulk_inventory_options(admin_id: int) -> list[dict]:
+    with SessionLocal() as db:
+        products = db.query(Product).filter(Product.source == "own").order_by(Product.name.asc()).all()
+        options = []
+        for product in products:
+            pending = (db.query(Order).filter(
+                Order.product_id == product.id,
+                Order.refunded.is_(False),
+                Order.delivery_type.in_(("manual", "hybrid")),
+                Order.status.in_(("pending_manual", "preorder", "processing")),
+                Order.assigned_admin_id.is_(None) | (Order.assigned_admin_id == admin_id),
+            ).count())
+            accounts = [x.strip() for x in (product.file_content or "").splitlines() if x.strip()]
+            reusable_content = str(getattr(product, "reusable_delivery", "") or "").strip()
+            reusable_units = max(0, int(getattr(product, "reusable_stock", 0) or 0)) if reusable_content else 0
+            available = len(accounts) + reusable_units
+            if pending and available:
+                options.append({"id": product.id, "name": product.name, "pending": pending, "available": available})
+        return options
+
+
+@router.callback_query(F.data == "admin_bulk_inventory")
+async def admin_bulk_inventory(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    options = await asyncio.to_thread(_bulk_inventory_options, callback.from_user.id)
+    if not options:
+        await show(callback, "📦 <b>Bulk delivery</b>\n\nNo pending manual orders have enough local inventory available.",
+                   parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                       [InlineKeyboardButton(text="⬅ Orders", callback_data="admin_orders")]
+                   ]))
+        await callback.answer()
+        return
+    buttons = [[InlineKeyboardButton(
+        text=f"{item['name'][:28]} · {item['pending']} pending · {item['available']} stock",
+        callback_data=f"bulk_inventory_product_{item['id']}",
+    )] for item in options[:40]]
+    buttons.append([InlineKeyboardButton(text="⬅ Orders", callback_data="admin_orders")])
+    await show(callback,
+        "📦 <b>Bulk delivery from inventory</b>\n\n"
+        "Choose a product. Orders are processed oldest first, one by one, and each buyer receives only their own order. "
+        "An order is skipped unless its full remaining quantity is available.",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("bulk_inventory_product_"))
+async def bulk_inventory_product(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    try:
+        product_id = int(callback.data.rsplit("_", 1)[1])
+    except (TypeError, ValueError):
+        await callback.answer("Invalid product.", show_alert=True)
+        return
+    options = await asyncio.to_thread(_bulk_inventory_options, callback.from_user.id)
+    item = next((value for value in options if value["id"] == product_id), None)
+    if not item:
+        await callback.answer("No eligible orders or stock remain.", show_alert=True)
+        return
+    await show(callback,
+        f"📦 <b>Confirm bulk delivery</b>\n\nProduct: <b>{escape(item['name'])}</b>\n"
+        f"Pending orders: <b>{item['pending']}</b>\nAvailable units: <b>{item['available']}</b>\n\n"
+        "This will fulfill complete orders in oldest-first order, consume their stock, then send each delivery through the Delivery Bot.",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Start bulk delivery", callback_data=f"bulk_inventory_run_{product_id}")],
+            [InlineKeyboardButton(text="⬅ Choose product", callback_data="admin_bulk_inventory")],
+        ]))
+    await callback.answer()
+
+
+def _do_bulk_inventory_fulfill(product_id: int, admin_id: int, limit: int = 20) -> dict:
+    with transaction() as db:
+        product = db.query(Product).filter(Product.id == product_id).with_for_update().first()
+        if not product or product.source != "own":
+            return {"error": "Local product not found."}
+        orders = (db.query(Order).filter(
+            Order.product_id == product_id,
+            Order.refunded.is_(False),
+            Order.delivery_type.in_(("manual", "hybrid")),
+            Order.status.in_(("pending_manual", "preorder", "processing")),
+            Order.assigned_admin_id.is_(None) | (Order.assigned_admin_id == admin_id),
+        ).order_by(Order.id.asc()).with_for_update().limit(limit).all())
+        accounts = [x.strip() for x in (product.file_content or "").splitlines() if x.strip()]
+        reusable = max(0, int(getattr(product, "reusable_stock", 0) or 0))
+        reusable_content = str(getattr(product, "reusable_delivery", "") or "").strip()
+        if not reusable_content:
+            reusable = 0
+        switched_to_manual = False
+        results = []
+        skipped = 0
+        for order in orders:
+            if order.assigned_admin_id not in (None, admin_id):
+                skipped += 1
+                continue
+            saved_pending = int(order.manual_pending_quantity or 0)
+            calculated_pending = int(order.quantity or 0) - int(order.automatic_quantity or 0)
+            quantity = max(0, saved_pending if saved_pending > 0 else calculated_pending)
+            if quantity < 1:
+                skipped += 1
+                continue
+            if len(accounts) + reusable < quantity:
+                break
+            regular_count = min(len(accounts), quantity)
+            delivered_lines = accounts[:regular_count]
+            accounts = accounts[regular_count:]
+            reusable_used = quantity - regular_count
+            if reusable_used and order.reusable_delivery_account and order.reusable_delivery_account != reusable_content:
+                # Preserve one reusable snapshot per order so a later refund can restore the exact stock.
+                accounts = delivered_lines + accounts
+                skipped += 1
+                continue
+            if reusable_used:
+                reusable -= reusable_used
+                delivered_lines.append(reusable_content)
+                order.reusable_delivery_account = reusable_content
+                order.reusable_delivery_quantity = int(order.reusable_delivery_quantity or 0) + reusable_used
+            order.delivered_account = "\n".join(filter(None, [order.delivered_account, "\n".join(delivered_lines)]))
+            order.manual_pending_quantity = 0
+            if order.stock_deducted_quantity is None or int(order.stock_deducted_quantity or 0) == 0:
+                product.stock = max(0, int(product.stock or 0) - quantity)
+                order.stock_deducted_quantity = int(order.stock_deducted_quantity or 0) + quantity
+            order.assigned_admin_id = order.assigned_admin_id or admin_id
+            order.assigned_at = order.assigned_at or datetime.utcnow()
+            was_preorder = bool(order.is_preorder)
+            order.is_preorder = False
+            order.status = "completed"
+            start_coverage(order)
+            record_event(db, order.id, "completed", "Team delivered this order from bulk inventory.", actor_id=admin_id)
+            db.add(AdminAuditLog(
+                admin_telegram_id=int(admin_id), action="bulk_inventory_deliver", entity_type="order",
+                entity_id=str(order.id), summary=f"Bulk delivered {quantity} unit(s) from product #{product_id} inventory.",
+            ))
+            if was_preorder:
+                buyer = db.query(User).filter(User.telegram_id == order.telegram_id).with_for_update().first()
+                referrer = db.query(User).filter(User.telegram_id == buyer.referred_by).with_for_update().first() if buyer and buyer.referred_by else None
+                if referrer:
+                    commission = _money(_money(order.amount) * REFERRAL_COMMISSION_RATE)
+                    if commission > 0:
+                        referrer.referral_earnings = _money(referrer.referral_earnings) + commission
+                        if REFERRAL_CREDIT_TO_BALANCE:
+                            referrer.balance = _money(referrer.balance) + commission
+            is_api_order = bool(db.query(ApiOrder.id).filter(ApiOrder.order_id == order.id).first())
+            destination_id = order.delivery_telegram_id or (admin_id if is_api_order else order.telegram_id)
+            results.append({"order_id": order.id, "buyer_id": order.telegram_id,
+                            "destination_id": destination_id, "is_api_order": is_api_order})
+        product.file_content = "\n".join(accounts) or None
+        product.reusable_stock = reusable
+        if (
+            (product.delivery_type or "automatic").lower() in {"automatic", "hybrid"}
+            and not accounts
+            and not (reusable_content and reusable > 0)
+        ):
+            product.delivery_type = "manual"
+            product.manual_fallback = True
+            product.preorder = False
+            switched_to_manual = True
+        remaining_orders = db.query(Order.id).filter(
+            Order.product_id == product_id, Order.refunded.is_(False),
+            Order.delivery_type.in_(("manual", "hybrid")),
+            Order.status.in_(("pending_manual", "preorder", "processing")),
+            Order.assigned_admin_id.is_(None) | (Order.assigned_admin_id == admin_id),
+        ).count()
+        return {"orders": results, "skipped": skipped, "remaining_orders": remaining_orders,
+                "remaining_stock": len(accounts) + reusable, "product_name": product.name,
+                "switched_to_manual": switched_to_manual}
+
+
+@router.callback_query(F.data.startswith("bulk_inventory_run_"))
+async def bulk_inventory_run(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    if not config.DELIVERY_BRIDGE_URL or not config.DELIVERY_BRIDGE_SECRET:
+        await callback.answer("Delivery Bot bridge is not configured.", show_alert=True)
+        return
+    try:
+        product_id = int(callback.data.rsplit("_", 1)[1])
+        result = await asyncio.to_thread(_do_bulk_inventory_fulfill, product_id, callback.from_user.id)
+    except Exception:
+        logger.exception("Bulk inventory fulfillment failed")
+        await callback.answer("Bulk delivery failed. No partial transaction was saved.", show_alert=True)
+        return
+    if result.get("error"):
+        await callback.answer(result["error"], show_alert=True)
+        return
+    if not result["orders"]:
+        await show(callback,
+            f"📦 <b>Bulk delivery paused</b>\n\nNo complete order could be fulfilled.\n"
+            f"Remaining stock: {result['remaining_stock']} · Pending orders: {result['remaining_orders']}",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📦 Orders", callback_data="admin_orders")]
+            ]))
+        await callback.answer()
+        return
+    sent = waiting = failed = 0
+    failures = []
+    for item in result["orders"]:
+        try:
+            delivery_result = await send_manual_delivery(item["order_id"], item["destination_id"], callback.from_user.id)
+            if delivery_result.get("status") == "waiting_for_start":
+                waiting += 1
+            else:
+                sent += 1
+            if not item["is_api_order"]:
+                try:
+                    notice = "Your order is ready. Start the Delivery Bot to receive it." if delivery_result.get("status") == "waiting_for_start" else "Your order was delivered. Open My Orders to view it."
+                    await queue_message(callback.bot, f"bulk-order-update:{item['order_id']}", item["destination_id"], notice)
+                except Exception:
+                    logger.info("Bulk fulfillment customer notification enqueue failed for order %s", item["order_id"], exc_info=True)
+        except DeliveryBridgeError as exc:
+            failed += 1
+            failures.append((item["order_id"], str(exc)))
+    switched_notice = "\n⚠️ Inventory is empty; future orders now use manual fulfillment." if result["switched_to_manual"] else ""
+    text = (f"📦 <b>Bulk delivery finished</b>\n\nProduct: <b>{escape(result['product_name'])}</b>\n"
+            f"Orders processed: <b>{len(result['orders'])}</b>\nSent: <b>{sent}</b> · Waiting for /start: <b>{waiting}</b> · Delivery errors: <b>{failed}</b>\n"
+            f"Remaining stock: <b>{result['remaining_stock']}</b> · Pending orders: <b>{result['remaining_orders']}</b>"
+            f"{switched_notice}")
+    rows = [[InlineKeyboardButton(text=f"🔁 Retry order #{order_id}", callback_data=f"retry_api_delivery_{order_id}")] for order_id, _ in failures[:8]]
+    rows.append([InlineKeyboardButton(text="📦 Orders", callback_data="admin_orders")])
+    if result["remaining_orders"] and result["remaining_stock"]:
+        rows.insert(0, [InlineKeyboardButton(text="▶ Continue next batch", callback_data=f"bulk_inventory_run_{product_id}")])
+    await show(callback, text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer("Bulk batch complete.")
 
 
 
@@ -315,9 +545,17 @@ def _do_refund(order_id: int, admin_id: int, cancellation_only: bool = False) ->
 
         stock_restored = False
         if product is not None and order.stock_deducted_quantity is not None:
-            restored = (order.reserved_delivery or order.delivered_account or "").splitlines()[:order.automatic_quantity]
+            restored = [line.strip() for line in (order.reserved_delivery or order.delivered_account or "").splitlines() if line.strip()]
+            reusable_account = str(getattr(order, "reusable_delivery_account", "") or "").strip()
+            if reusable_account and reusable_account in restored:
+                restored.remove(reusable_account)
             existing = [line.strip() for line in (product.file_content or "").splitlines() if line.strip()]
             product.file_content = "\n".join(restored + existing) or None
+            reusable_quantity = max(0, int(getattr(order, "reusable_delivery_quantity", 0) or 0))
+            if reusable_quantity and reusable_account:
+                if str(getattr(product, "reusable_delivery", "") or "").strip() in ("", reusable_account):
+                    product.reusable_delivery = reusable_account
+                    product.reusable_stock = max(0, int(getattr(product, "reusable_stock", 0) or 0)) + reusable_quantity
             product.stock = (product.stock or 0) + order.stock_deducted_quantity
             order.reserved_delivery = None
             stock_restored = bool(order.stock_deducted_quantity)
@@ -326,11 +564,18 @@ def _do_refund(order_id: int, admin_id: int, cancellation_only: bool = False) ->
                 restored_accounts = [
                     account.strip() for account in order.reserved_delivery.splitlines() if account.strip()
                 ]
+                reusable_account = str(getattr(order, "reusable_delivery_account", "") or "").strip()
+                if reusable_account and reusable_account in restored_accounts:
+                    restored_accounts.remove(reusable_account)
                 existing = [
                     account.strip() for account in (product.file_content or "").splitlines() if account.strip()
                 ]
                 product.file_content = "\n".join(restored_accounts + existing)
                 product.stock = len(restored_accounts) + len(existing)
+                reusable_quantity = max(0, int(getattr(order, "reusable_delivery_quantity", 0) or 0))
+                if reusable_quantity and reusable_account and str(getattr(product, "reusable_delivery", "") or "").strip() in ("", reusable_account):
+                    product.reusable_delivery = reusable_account
+                    product.reusable_stock = max(0, int(getattr(product, "reusable_stock", 0) or 0)) + reusable_quantity
                 order.reserved_delivery = None
                 stock_restored = bool(restored_accounts)
             elif order.delivered_account and order.status == "completed":
@@ -340,6 +585,9 @@ def _do_refund(order_id: int, admin_id: int, cancellation_only: bool = False) ->
                 restored_accounts = [
                     a.strip() for a in order.delivered_account.splitlines() if a.strip()
                 ]
+                reusable_account = str(getattr(order, "reusable_delivery_account", "") or "").strip()
+                if reusable_account and reusable_account in restored_accounts:
+                    restored_accounts.remove(reusable_account)
                 if restored_accounts:
                     existing = (
                         [a.strip() for a in product.file_content.splitlines() if a.strip()]
@@ -347,6 +595,11 @@ def _do_refund(order_id: int, admin_id: int, cancellation_only: bool = False) ->
                     )
                     product.file_content = "\n".join(restored_accounts + existing)
                     product.stock = len(restored_accounts) + len(existing)
+                    stock_restored = True
+                reusable_quantity = max(0, int(getattr(order, "reusable_delivery_quantity", 0) or 0))
+                if reusable_quantity and reusable_account and str(getattr(product, "reusable_delivery", "") or "").strip() in ("", reusable_account):
+                    product.reusable_delivery = reusable_account
+                    product.reusable_stock = max(0, int(getattr(product, "reusable_stock", 0) or 0)) + reusable_quantity
                     stock_restored = True
             elif order.status in ("pending_info", "pending_manual", "completed"):
                 # Manual/hybrid-manual fulfillment: only the numeric

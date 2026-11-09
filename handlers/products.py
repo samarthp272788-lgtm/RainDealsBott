@@ -2006,7 +2006,7 @@ def _qty_text(product, qty: int, real_stock_available: bool, custom_price: Decim
     if (getattr(product, "source", "own") or "own") == "own":
         try:
             plan = plan_delivery(product, qty)
-            delivery_note = f"✅ Ready now: {len(plan.automatic)} · ⏳ Team delivery: {plan.manual_quantity}\n\n"
+            delivery_note = f"✅ Ready now: {plan.automatic_quantity} · ⏳ Team delivery: {plan.manual_quantity}\n\n"
         except ValueError:
             delivery_note = "Stock will be checked again before purchase.\n\n"
 
@@ -2349,7 +2349,23 @@ def _do_purchase(
         new_stock = plan.stock_after
         if not plan.preorder:
             product.file_content = "\n".join(plan.remaining) or None
+            if plan.reusable_quantity:
+                product.reusable_stock = max(0, int(product.reusable_stock or 0) - plan.reusable_quantity)
             product.stock = new_stock
+            # Once the last auto-deliverable unit is consumed, route future
+            # purchases to the manual queue instead of leaving the product
+            # labelled automatic with no deliverable inventory.
+            if (
+                delivery_type in {"automatic", "hybrid"}
+                and not any(line.strip() for line in str(product.file_content or "").splitlines())
+                and not (
+                    str(getattr(product, "reusable_delivery", "") or "").strip()
+                    and int(getattr(product, "reusable_stock", 0) or 0) > 0
+                )
+            ):
+                product.delivery_type = "manual"
+                product.manual_fallback = True
+                product.preorder = False
         if required_info:
             reserved_delivery = delivered_accounts
             delivered_accounts = []
@@ -2365,8 +2381,10 @@ def _do_purchase(
             telegram_id=user.telegram_id, product_id=product.id, product_name=product.name,
             delivered_account="\n".join(delivered_accounts) if delivered_accounts else None,
             reserved_delivery="\n".join(reserved_delivery) if reserved_delivery else None,
+            reusable_delivery_account=plan.reusable_content,
+            reusable_delivery_quantity=plan.reusable_quantity,
             amount=total_amount, quantity=quantity, delivery_type=plan.order_mode,
-            automatic_quantity=len(plan.automatic), manual_pending_quantity=plan.manual_quantity,
+            automatic_quantity=plan.automatic_quantity, manual_pending_quantity=plan.manual_quantity,
             stock_deducted_quantity=0 if plan.preorder else quantity,
             is_preorder=is_preorder_order, status=status, refunded=False,
             delivery_telegram_id=delivery_telegram_id, checkout_key=checkout_key,
@@ -2381,7 +2399,7 @@ def _do_purchase(
         if status == 'pending_info':
             record_event(db, order.id, 'awaiting_information', 'Waiting for customer information.')
         elif plan.automatic:
-            record_event(db, order.id, 'automatic_delivery', f'{len(plan.automatic)} unit(s) delivered automatically.')
+            record_event(db, order.id, 'automatic_delivery', f'{plan.automatic_quantity} unit(s) delivered automatically.')
         if status == 'completed':
             record_event(db, order.id, 'completed', 'Order completed.')
         elif status == 'pending_manual':
@@ -2428,7 +2446,7 @@ def _do_purchase(
             "low_stock_alert": low_stock_alert, "referral_commission_paid": referral_commission_paid,
             "delivery_instruction": product.delivery_instruction,
             "required_info": required_info,
-            "automatic_quantity": len(plan.automatic), "manual_pending_quantity": plan.manual_quantity,
+            "automatic_quantity": plan.automatic_quantity, "manual_pending_quantity": plan.manual_quantity,
         }
     invalidate_products_cache()
     return result

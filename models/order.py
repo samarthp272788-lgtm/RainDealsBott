@@ -104,6 +104,10 @@ class Order(Base):
 
     # Reserved stock withheld until the buyer submits required order details.
     reserved_delivery: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Snapshot of a shared credential used by this order. The payload is saved
+    # once while the quantity records how many units it covered.
+    reusable_delivery_account: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    reusable_delivery_quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     automatic_quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     manual_pending_quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     stock_deducted_quantity: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)

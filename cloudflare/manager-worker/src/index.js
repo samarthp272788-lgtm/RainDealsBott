@@ -16,12 +16,12 @@ const tables = {
   product_rate_controls:{fields:'is_active',read:true}, rate_control_assignments:{fields:'is_active',read:true}
 };
 const responseFields={
- products:'id,name,icon,description,category,price,stock,delivery_instruction,delivery_type,manual_fallback,preorder,low_stock_threshold,bulk_pricing,is_active,api_enabled,source,provider_id,reseller_service_id,reseller_cost,reseller_name,aftercare_policy,warranty_days,subscription_days,term_days,created_at,updated_at',
+ products:'id,name,icon,description,category,price,stock,reusable_stock,delivery_instruction,delivery_type,manual_fallback,preorder,low_stock_threshold,bulk_pricing,is_active,api_enabled,source,provider_id,reseller_service_id,reseller_cost,reseller_name,aftercare_policy,warranty_days,subscription_days,term_days,created_at,updated_at',
  providers:'id,name,provider_key,base_url,api_type,auth_type,configuration,is_active,created_at,updated_at',
  promocodes:'id,code,amount,max_uses,used_count,is_active,expires_at,created_at',
   custom_rates:'id,telegram_id,product_id,price,is_active,created_at,stopped_at',
  users:'id,telegram_id,username,full_name,balance,total_spent,membership,is_banned,created_at',
- orders:'id,telegram_id,user_id,product_id,product_name,service,quantity,amount,status,delivery_type,automatic_quantity,manual_pending_quantity,created_at,updated_at,delivered_at,aftercare_policy,warranty_days,subscription_days,term_days,subscription_expires_at,received_at,coverage_started_at,warranty_expires_at',
+ orders:'id,telegram_id,user_id,product_id,product_name,service,quantity,amount,status,delivery_type,automatic_quantity,manual_pending_quantity,reusable_delivery_quantity,created_at,updated_at,delivered_at,aftercare_policy,warranty_days,subscription_days,term_days,subscription_expires_at,received_at,coverage_started_at,warranty_expires_at',
  deposits:'id,telegram_id,user_id,amount,currency,network,status,txid,payment_method,created_at,updated_at,verified_at',
  tickets:'id,telegram_id,user_id,subject,status,priority,admin_response,created_at,updated_at',
  api_keys:'id,telegram_id,name,key_prefix,is_active,created_at,last_used_at',
@@ -316,7 +316,7 @@ async function route(request,env){
   if(customerResponse)return customerResponse;
   const claimResponse=await claimsRoute(request,env,url,auth,currentAdmin,{reply,tx,hasPermission,body});
   if(claimResponse)return claimResponse;
-  if(path.startsWith('/manage/products')||/^\/manage\/orders\/\d+\/fulfill$/.test(path))await requireAftercareSchema(env);
+  if(path.startsWith('/manage/products')||/^\/manage\/orders\/(?:\d+\/fulfill|bulk-fulfill)$/.test(path))await requireAftercareSchema(env);
   if(path==='/manage/admins'&&request.method==='GET'){
     if(Number(currentAdmin.is_owner)!==1)error('Only an owner can manage admin roles.',403);
     const found=await rows(env,'SELECT telegram_id,display_name,role_key,permissions_json,is_active,is_owner,created_at,updated_at FROM raindeals_web_manager_admins ORDER BY is_owner DESC,created_at ASC');
@@ -395,6 +395,69 @@ async function route(request,env){
     }
     error('Method not allowed.',405);
   }
+  if(path==='/manage/orders/bulk-fulfill'&&request.method==='GET'){
+    const found=await rows(env,`SELECT p.id,p.name,p.stock,CASE WHEN COALESCE(p.reusable_delivery,'')='' THEN 0 ELSE COALESCE(p.reusable_stock,0) END AS reusable_stock,
+      CASE WHEN COALESCE(p.file_content,'')='' THEN 0 ELSE LENGTH(p.file_content)-LENGTH(REPLACE(p.file_content,CHAR(10),''))+1 END AS account_count,
+      COUNT(o.id) AS pending_orders FROM products p JOIN orders o ON o.product_id=p.id
+      WHERE COALESCE(p.source,'own')='own' AND COALESCE(o.refunded,0)=0
+      AND LOWER(COALESCE(o.delivery_type,'')) IN ('manual','hybrid')
+      AND (LOWER(COALESCE(o.status,''))='preorder' OR LOWER(COALESCE(o.status,'')) IN ('pending_manual','processing'))
+      AND (o.assigned_admin_id IS NULL OR o.assigned_admin_id=?)
+       GROUP BY p.id,p.name,p.stock,p.reusable_stock,p.reusable_delivery,p.file_content ORDER BY p.name ASC LIMIT 100`,[auth.admin_id]);
+    return reply({rows:found.map(r=>({...r,id:Number(r.id),stock:Number(r.stock||0),reusable_stock:Number(r.reusable_stock||0),account_count:Number(r.account_count||0),pending_orders:Number(r.pending_orders||0),available:Number(r.account_count||0)+Number(r.reusable_stock||0)})).filter(r=>r.pending_orders>0&&r.available>0)});
+  }
+  if(path==='/manage/orders/bulk-fulfill'&&request.method==='POST'){
+    if(!env.DELIVERY_BRIDGE_SECRET)error('Delivery is not configured on the Manager Worker.',503);
+    const b=await body(request),productId=Number(b.product_id),requestedLimit=Number(b.limit||10),limit=Number.isInteger(requestedLimit)?Math.max(1,Math.min(10,requestedLimit)):10;
+    if(!Number.isInteger(productId)||productId<1)error('Choose a valid product.');
+    const orderColumns=await columnsFor(env,'orders'),hasTimeline=(await rows(env,"SELECT 1 FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='order_events' LIMIT 1")).length>0;
+    const batch=await tx(env,async t=>{
+      const product=(await t.execute('SELECT id,name,source,file_content,reusable_delivery,reusable_stock,stock,delivery_type,manual_fallback FROM products WHERE id=? FOR UPDATE',[productId])).rows?.[0];
+      if(!product||String(product.source||'own')!=='own')error('Local product not found.',404);
+      const candidates=(await t.execute(`SELECT id,telegram_id,delivery_telegram_id,product_id,product_name,amount,quantity,status,delivery_type,is_preorder,refunded,delivered_account,automatic_quantity,manual_pending_quantity,stock_deducted_quantity,assigned_admin_id,reusable_delivery_account,reusable_delivery_quantity FROM orders WHERE product_id=? AND COALESCE(refunded,0)=0 AND LOWER(COALESCE(delivery_type,'')) IN ('manual','hybrid') AND (LOWER(COALESCE(status,''))='preorder' OR LOWER(COALESCE(status,'')) IN ('pending_manual','processing')) AND (assigned_admin_id IS NULL OR assigned_admin_id=?) ORDER BY id ASC LIMIT ${limit} FOR UPDATE`,[productId,auth.admin_id])).rows||[];
+      let accounts=String(product.file_content||'').split(/\r?\n/).map(x=>x.trim()).filter(Boolean),shared=String(product.reusable_delivery||'').trim(),sharedStock=shared?Math.max(0,Number(product.reusable_stock||0)):0,stock=Number(product.stock||0);
+      const done=[],skipped=[];
+      for(const order of candidates){
+        const savedPending=Number(order.manual_pending_quantity||0),calculatedPending=Number(order.quantity||0)-Number(order.automatic_quantity||0),quantity=Math.max(0,savedPending>0?savedPending:calculatedPending);
+        if(quantity<1){skipped.push(Number(order.id));continue;}
+        if(accounts.length+sharedStock<quantity)break;
+        const regularUsed=Math.min(accounts.length,quantity),sharedUsed=quantity-regularUsed;
+        if(sharedUsed&&order.reusable_delivery_account&&order.reusable_delivery_account!==shared){skipped.push(Number(order.id));continue;}
+        const apiOrder=Boolean((await t.execute('SELECT order_id FROM api_orders WHERE order_id=? LIMIT 1',[order.id])).rows?.length);
+        const recipient=String(order.delivery_telegram_id||(apiOrder?auth.admin_id:order.telegram_id)||'');
+        if(!/^\d{1,20}$/.test(recipient)||BigInt(recipient)<=0n){skipped.push(Number(order.id));continue;}
+        const allocated=accounts.slice(0,regularUsed);accounts=accounts.slice(regularUsed);sharedStock-=sharedUsed;
+        const deliveryText=[allocated.join('\n'),sharedUsed?shared:''].filter(Boolean).join('\n');
+        const priorStock=Number(order.stock_deducted_quantity||0),capacityManaged=Number(product.manual_fallback)||String(product.delivery_type)==='manual';
+        const reserved=priorStock>0||(order.stock_deducted_quantity==null&&!Number(order.is_preorder)&&capacityManaged),newlyDeducted=reserved?0:quantity;
+        if(newlyDeducted)stock=Math.max(0,stock-newlyDeducted);
+        const updates=['delivered_account=?',"status='completed'","is_preorder=0",'delivery_telegram_id=?','manual_pending_quantity=0','automatic_quantity=COALESCE(automatic_quantity,0)+?','stock_deducted_quantity=COALESCE(stock_deducted_quantity,0)+?','assigned_admin_id=COALESCE(assigned_admin_id,?)','assigned_at=COALESCE(assigned_at,UTC_TIMESTAMP())'];
+        const params=[[order.delivered_account,deliveryText].filter(Boolean).join('\n'),recipient,quantity,newlyDeducted,auth.admin_id];
+        if(orderColumns.includes('reusable_delivery_quantity')){updates.push('reusable_delivery_quantity=?','reusable_delivery_account=COALESCE(?,reusable_delivery_account)');params.push(Number(order.reusable_delivery_quantity||0)+sharedUsed,sharedUsed?shared:(order.reusable_delivery_account||null));}
+        if(orderColumns.includes('coverage_started_at'))updates.push('coverage_started_at=COALESCE(coverage_started_at,UTC_TIMESTAMP())');
+        if(orderColumns.includes('subscription_expires_at'))updates.push('subscription_expires_at=CASE WHEN term_days>0 AND subscription_expires_at IS NULL THEN DATE_ADD(UTC_TIMESTAMP(),INTERVAL term_days DAY) ELSE subscription_expires_at END');
+        if(orderColumns.includes('warranty_expires_at'))updates.push('warranty_expires_at=CASE WHEN warranty_days>0 AND warranty_expires_at IS NULL THEN DATE_ADD(UTC_TIMESTAMP(),INTERVAL warranty_days DAY) ELSE warranty_expires_at END');
+        if(orderColumns.includes('updated_at'))updates.push('updated_at=UTC_TIMESTAMP()');
+        params.push(order.id);await t.execute('UPDATE orders SET '+updates.join(',')+' WHERE id=?',params);
+        if(hasTimeline)await t.execute("INSERT INTO order_events (order_id,kind,actor_id,summary,customer_visible,created_at) VALUES (?,'completed',?,'Team delivered this order from bulk inventory.',1,UTC_TIMESTAMP())",[order.id,auth.admin_id]);
+        await t.execute('INSERT INTO raindeals_web_manager_audit (admin_id,action,target_type,target_id,details,created_at) VALUES (?,\'bulk_inventory_deliver\',\'order\',?,?,UTC_TIMESTAMP(6))',[auth.admin_id,String(order.id),JSON.stringify({product_id:productId,quantity,stock_used:quantity,recipient_id:recipient})]);
+        if(Number(order.is_preorder)){
+          const buyer=(await t.execute('SELECT referred_by FROM users WHERE telegram_id=? FOR UPDATE',[order.telegram_id])).rows?.[0],referrerId=String(buyer?.referred_by||''),referrer=referrerId?(await t.execute('SELECT telegram_id FROM users WHERE telegram_id=? FOR UPDATE',[referrerId])).rows?.[0]:null,rateText=String(env.REFERRAL_COMMISSION_RATE||'0.05'),rate=Number(rateText);
+          if(referrer&&Number.isFinite(rate)&&rate>0&&rate<=1){const commission=(await t.execute('SELECT CAST(ROUND(? * ?,8) AS CHAR) AS amount',[String(order.amount||'0'),rateText])).rows?.[0]?.amount||'0',credit=!['0','false','no','off'].includes(String(env.REFERRAL_CREDIT_TO_BALANCE??'true').toLowerCase());await t.execute(credit?'UPDATE users SET referral_earnings=ROUND(COALESCE(referral_earnings,0)+?,8),balance=ROUND(COALESCE(balance,0)+?,8) WHERE telegram_id=?':'UPDATE users SET referral_earnings=ROUND(COALESCE(referral_earnings,0)+?,8) WHERE telegram_id=?',credit?[commission,commission,referrerId]:[commission,referrerId]);}
+        }
+        done.push({order_id:Number(order.id),recipient,quantity});
+      }
+      const inventoryTotal=accounts.length+sharedStock;
+      const emptyAutomatic=inventoryTotal===0&&['automatic','hybrid'].includes(String(product.delivery_type||'').toLowerCase());
+      if(emptyAutomatic){product.delivery_type='manual';product.manual_fallback=1;}
+      await t.execute('UPDATE products SET file_content=?,reusable_stock=?,stock=?,delivery_type=?,manual_fallback=?,preorder=IF(?,0,preorder),updated_at=UTC_TIMESTAMP() WHERE id=?',[accounts.join('\n')||null,sharedStock,stock,product.delivery_type,product.manual_fallback,emptyAutomatic?1:0,productId]);
+      const left=Number((await t.execute("SELECT COUNT(*) AS n FROM orders WHERE product_id=? AND COALESCE(refunded,0)=0 AND LOWER(COALESCE(delivery_type,'')) IN ('manual','hybrid') AND (LOWER(COALESCE(status,''))='preorder' OR LOWER(COALESCE(status,'')) IN ('pending_manual','processing')) AND (assigned_admin_id IS NULL OR assigned_admin_id=?)",[productId,auth.admin_id])).rows?.[0]?.n||0);
+      return{done,skipped,remaining_orders:left,remaining_stock:inventoryTotal,product_name:product.name,switched_to_manual:emptyAutomatic};
+    });
+    const notifications=[];
+    for(const item of batch.done){const n=await notifyCompletedOrder(env,item.order_id,item.recipient,auth.admin_id);notifications.push({order_id:item.order_id,status:n.status,message:n.message});}
+    return reply({success:true,completed:batch.done.length,skipped:batch.skipped,remaining_orders:batch.remaining_orders,remaining_stock:batch.remaining_stock,has_more:batch.done.length>0&&batch.remaining_orders>0&&batch.remaining_stock>0,product_name:batch.product_name,switched_to_manual:batch.switched_to_manual,notifications,message:`Processed ${batch.done.length} order(s).${batch.switched_to_manual?' Inventory is empty, so future orders now enter manual fulfillment.':''}`});
+  }
   const fulfillOrder=path.match(/^\/manage\/orders\/(\d+)\/fulfill$/);
   if(fulfillOrder&&request.method==='POST'){
     if(!env.DELIVERY_BRIDGE_SECRET)error('Delivery is not configured on the Manager Worker. Set the same DELIVERY_BRIDGE_SECRET used by the API Worker before fulfilling orders.',503);
@@ -405,7 +468,7 @@ async function route(request,env){
     const suppliedRecipient=String(b.customer_telegram_id||'').trim();
     if(suppliedRecipient&&!/^\d{1,20}$/.test(suppliedRecipient))error('Customer Telegram ID must be a positive numeric ID.');
     const orderColumns=await columnsFor(env,'orders');
-    const splitSelect=['automatic_quantity','manual_pending_quantity','stock_deducted_quantity','assigned_admin_id','aftercare_policy','warranty_days','subscription_days','term_days'].filter(c=>orderColumns.includes(c)).map(c=>','+c).join('');
+    const splitSelect=['automatic_quantity','manual_pending_quantity','stock_deducted_quantity','assigned_admin_id','aftercare_policy','warranty_days','subscription_days','term_days','reusable_delivery_account','reusable_delivery_quantity'].filter(c=>orderColumns.includes(c)).map(c=>','+c).join('');
     const timelineEnabled=(await rows(env,"SELECT 1 AS present FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='order_events' LIMIT 1")).length>0;
     const orderTimestamp=orderColumns.includes('updated_at')?',updated_at=UTC_TIMESTAMP()':'';
     const warrantyUpdate=(orderColumns.includes('subscription_expires_at')?",subscription_expires_at=CASE WHEN term_days>0 AND subscription_expires_at IS NULL THEN DATE_ADD(UTC_TIMESTAMP(),INTERVAL term_days DAY) ELSE subscription_expires_at END":'')+(orderColumns.includes('warranty_days')&&orderColumns.includes('warranty_expires_at')?",warranty_expires_at=CASE WHEN warranty_days>0 AND warranty_expires_at IS NULL THEN DATE_ADD(UTC_TIMESTAMP(),INTERVAL warranty_days DAY) ELSE warranty_expires_at END":'')+(orderColumns.includes('coverage_started_at')?',coverage_started_at=COALESCE(coverage_started_at,UTC_TIMESTAMP())':'');
@@ -428,21 +491,27 @@ async function route(request,env){
         if(suppliedRecipient&&suppliedRecipient!==recipient)error('The recipient must match the order customer.',409);
       }
       if(!/^\d{1,20}$/.test(recipient)||BigInt(recipient)<=0n)error('This order does not have a valid Telegram delivery destination.',409);
-      let deliveryText=suppliedText,stockUsed=0,newlyDeducted=0;
+      let deliveryText=suppliedText,stockUsed=0,newlyDeducted=0,switchedToManual=false;
       if(mode==='inventory'){
         if(!order.product_id)error('This order has no linked product inventory.',409);
-        const product=(await t.execute('SELECT source,file_content,stock,delivery_type,manual_fallback FROM products WHERE id=? FOR UPDATE',[order.product_id])).rows?.[0];
+        const product=(await t.execute('SELECT source,file_content,stock,delivery_type,manual_fallback,reusable_delivery,reusable_stock FROM products WHERE id=? FOR UPDATE',[order.product_id])).rows?.[0];
         if(!product)error('Linked product was not found.',404);
         if(String(product.source||'own')!=='own')error('Supplier stock is managed by its provider; use manual delivery details here.',409);
-        const available=String(product.file_content||'').split(/\r?\n/).map(x=>x.trim()).filter(Boolean),quantity=Math.max(1,Number(order.manual_pending_quantity)||Number(order.quantity)-Number(order.automatic_quantity||0)||1);
-        if(available.length<quantity)error(`Not enough uploaded accounts: ${available.length} available for quantity ${quantity}.`,409);
-        deliveryText=available.slice(0,quantity).join('\n');stockUsed=quantity;
-        const remaining=available.slice(quantity);
+        const available=String(product.file_content||'').split(/\r?\n/).map(x=>x.trim()).filter(Boolean),shared=String(product.reusable_delivery||'').trim(),sharedStock=shared?Math.max(0,Number(product.reusable_stock||0)):0,quantity=Math.max(1,Number(order.manual_pending_quantity)||Number(order.quantity)-Number(order.automatic_quantity||0)||1);
+        if(available.length+sharedStock<quantity)error(`Not enough uploaded inventory: ${available.length+sharedStock} available for quantity ${quantity}.`,409);
+        const regularUsed=Math.min(available.length,quantity),sharedUsed=quantity-regularUsed;
+        if(sharedUsed&&order.reusable_delivery_account&&order.reusable_delivery_account!==shared)error('This order already contains a different shared credential snapshot. Fulfill it manually to preserve its refund record.',409);
+        deliveryText=[available.slice(0,regularUsed).join('\n'),sharedUsed?shared:''].filter(Boolean).join('\n');stockUsed=quantity;
+        const remaining=available.slice(regularUsed);
         const capacityManaged=Number(product.manual_fallback)||product.delivery_type==='manual';
         const reserved=Number(order.stock_deducted_quantity)>0||(order.stock_deducted_quantity==null&&!Number(order.is_preorder)&&capacityManaged);
-        const stockAfter=reserved?Number(product.stock||0):capacityManaged?Math.max(Number(product.stock||0),available.length)-quantity:remaining.length;
+        const inventoryRemaining=remaining.length+Math.max(0,sharedStock-sharedUsed);
+        const stockAfter=reserved?Number(product.stock||0):capacityManaged?Math.max(Number(product.stock||0),available.length+sharedStock)-quantity:inventoryRemaining;
         if(!reserved)newlyDeducted=quantity;
-        await t.execute('UPDATE products SET file_content=?,stock=?,updated_at=UTC_TIMESTAMP() WHERE id=?',[remaining.join('\n'),stockAfter,order.product_id]);
+        const emptyAutomatic=inventoryRemaining===0&&['automatic','hybrid'].includes(String(product.delivery_type||'').toLowerCase());
+        switchedToManual=emptyAutomatic;
+        await t.execute('UPDATE products SET file_content=?,reusable_stock=?,stock=?,delivery_type=?,manual_fallback=?,preorder=IF(?,0,preorder),updated_at=UTC_TIMESTAMP() WHERE id=?',[remaining.join('\n'),sharedStock-sharedUsed,stockAfter,emptyAutomatic?'manual':product.delivery_type,emptyAutomatic?1:Number(product.manual_fallback||0),emptyAutomatic?1:0,order.product_id]);
+        if(sharedUsed){order.reusable_delivery_account=shared;order.reusable_delivery_quantity=Number(order.reusable_delivery_quantity||0)+sharedUsed;}
       }
       deliveryText=[order.delivered_account,deliveryText].filter(Boolean).join('\n');
       const splitUpdate=orderColumns.includes('manual_pending_quantity')?',manual_pending_quantity=0,automatic_quantity=COALESCE(automatic_quantity,0)+'+stockUsed+((order.stock_deducted_quantity!=null||newlyDeducted)?',stock_deducted_quantity=COALESCE(stock_deducted_quantity,0)+'+newlyDeducted:''):'';
@@ -466,21 +535,23 @@ async function route(request,env){
       }
       const assignmentUpdate=orderColumns.includes('assigned_admin_id')?',assigned_admin_id=COALESCE(assigned_admin_id,?)':'';
       const assignmentTime=orderColumns.includes('assigned_at')?',assigned_at=COALESCE(assigned_at,UTC_TIMESTAMP())':'';
+      const reusableUpdate=orderColumns.includes('reusable_delivery_quantity')?',reusable_delivery_quantity=?,reusable_delivery_account=COALESCE(?,reusable_delivery_account)':'';
       const completionParams=[deliveryText,recipient];
+      if(reusableUpdate)completionParams.push(Number(order.reusable_delivery_quantity||0),order.reusable_delivery_account||null);
       if(assignmentUpdate)completionParams.push(auth.admin_id);
       completionParams.push(orderId);
-      await t.execute("UPDATE orders SET delivered_account=?,status='completed',is_preorder=0,delivery_telegram_id=?"+splitUpdate+orderTimestamp+warrantyUpdate+assignmentUpdate+assignmentTime+' WHERE id=?',completionParams);
+      await t.execute("UPDATE orders SET delivered_account=?,status='completed',is_preorder=0,delivery_telegram_id=?"+splitUpdate+reusableUpdate+orderTimestamp+warrantyUpdate+assignmentUpdate+assignmentTime+' WHERE id=?',completionParams);
       if(timelineEnabled){
         if(!order.assigned_admin_id)await t.execute("INSERT INTO order_events (order_id,kind,summary,customer_visible,created_at) VALUES (?,'fulfillment_team','Assigned to the fulfillment team.',1,UTC_TIMESTAMP())",[orderId]);
         await t.execute("INSERT INTO order_events (order_id,kind,actor_id,summary,customer_visible,created_at) VALUES (?,'completed',?,'Team delivery completed.',1,UTC_TIMESTAMP())",[orderId,auth.admin_id]);
       }
       const sessionInfo=(await t.execute('SELECT created_at FROM raindeals_web_manager_sessions WHERE token_hash=?',[auth.token_hash])).rows?.[0];
       await t.execute('INSERT INTO raindeals_web_manager_audit (admin_id,action,target_type,target_id,details,created_at) VALUES (?,?,?,?,?,UTC_TIMESTAMP(6))',[auth.admin_id,'fulfill','order',String(orderId),JSON.stringify({mode,stock_used:stockUsed,recipient_id:recipient,preorder_commission:preorderCommission,session_started_at:sessionInfo?.created_at||null})]);
-      return{recipient,stock_used:stockUsed,product_id:order.product_id,preorder_commission:preorderCommission};
+      return{recipient,stock_used:stockUsed,product_id:order.product_id,preorder_commission:preorderCommission,switched_to_manual:switchedToManual};
     });
     const notification=await notifyCompletedOrder(env,orderId,completed.recipient,auth.admin_id);
     if(completed.stock_used)await audit(env,auth.admin_id,'consume','product_inventory',completed.product_id,{order_id:String(orderId),count:completed.stock_used});
-    return reply({success:true,order_id:String(orderId),stock_used:completed.stock_used,notification,message:notification.message});
+    return reply({success:true,order_id:String(orderId),stock_used:completed.stock_used,notification,switched_to_manual:completed.switched_to_manual,message:notification.message+(completed.switched_to_manual?' Inventory is empty, so future orders now enter manual fulfillment.':'')});
   }
   const retryOrderDelivery=path.match(/^\/manage\/orders\/(\d+)\/notify$/);
   if(retryOrderDelivery&&request.method==='POST'){
@@ -574,6 +645,45 @@ async function route(request,env){
   if(apiKeyRevoke&&request.method==='POST'){
     const id=apiKeyRevoke[1];await db(env,'UPDATE api_keys SET is_active=0,revoked_at=UTC_TIMESTAMP() WHERE id=? AND is_active=1',[id]);await audit(env,auth.admin_id,'revoke','api_key',id,{});return reply({success:true,message:'API key revoked. Existing API requests using it will be rejected.'});
   }
+  const reusableStock=path.match(/^\/manage\/products\/(\d+)\/reusable-stock$/);
+  if(reusableStock){
+    const id=reusableStock[1];
+    if(request.method==='GET'){
+      const product=(await rows(env,'SELECT id,source,reusable_delivery,reusable_stock FROM products WHERE id=? LIMIT 1',[id]))[0];
+      if(!product)error('Product not found.',404);
+      const hasContent=!!String(product.reusable_delivery||'').trim();
+      return reply({id:Number(id),source:product.source||'own',has_content:hasContent,reusable_stock:hasContent?Number(product.reusable_stock||0):0});
+    }
+    if(request.method==='POST'){
+      const b=await body(request),mode=String(b.mode||'append');let content=String(b.content||'').trim();const quantity=Number(b.quantity||0);
+      if(!['append','replace','clear'].includes(mode))error('Choose add, replace, or clear.');
+      if(mode!=='clear'&&content&&(content.length>3000||/[\r\n]/.test(content)))error('Enter one shared account, code, or link (maximum 3,000 characters).');
+      if(mode==='replace'&&!content)error('Enter the replacement credential.');
+      if(mode!=='clear'&&(!Number.isInteger(quantity)||quantity<1||quantity>1000000))error('Shared units must be a whole number from 1 to 1,000,000.');
+      if(mode!=='append'&&b.confirm!==true)error('Explicit confirmation is required to replace or clear shared stock.',403);
+      const saved=await tx(env,async t=>{
+        const p=(await t.execute('SELECT source,delivery_type,manual_fallback,stock,file_content,reusable_delivery,reusable_stock FROM products WHERE id=? FOR UPDATE',[id])).rows?.[0];
+        if(!p)error('Product not found.',404);if(String(p.source||'own')!=='own')error('Shared stock is available for own products only.');
+        const currentContent=String(p.reusable_delivery||'').trim(),currentUnits=Math.max(0,Number(p.reusable_stock||0));
+        if(mode==='append'&&!content)content=currentContent;
+        if(mode==='append'&&!content)error('Enter a shared credential before adding the first units.');
+        if(mode==='append'&&currentUnits&&currentContent!==content)error('Different shared stock is already active. Add units to the saved credential or wait until its unit count reaches zero.');
+        if(mode==='replace'&&currentUnits&&currentContent!==content)error('Wait until the current shared unit count reaches zero before replacing its credential.');
+        const nextContent=mode==='clear'?'':content;
+        const nextUnits=mode==='clear'?0:mode==='append'&&currentContent===content?currentUnits+quantity:quantity;
+        const regularCount=String(p.file_content||'').split(/\r?\n/).map(x=>x.trim()).filter(Boolean).length;
+        const inventoryTotal=regularCount+nextUnits,emptyAutomatic=inventoryTotal===0&&['automatic','hybrid'].includes(String(p.delivery_type||'').toLowerCase());
+        const nextDelivery=emptyAutomatic?'manual':p.delivery_type,nextFallback=emptyAutomatic?1:Number(p.manual_fallback||0),nextPreorder=emptyAutomatic?0:null;
+        const manual=Number(p.manual_fallback)||String(p.delivery_type||'')==='manual';
+        const nextStock=emptyAutomatic?(manual?Number(p.stock||0):0):manual?Math.max(Number(p.stock||0),inventoryTotal):inventoryTotal;
+        await t.execute('UPDATE products SET reusable_delivery=?,reusable_stock=?,stock=?,delivery_type=?,manual_fallback=?,preorder=COALESCE(?,preorder),updated_at=UTC_TIMESTAMP() WHERE id=?',[nextContent||null,nextUnits,nextStock,nextDelivery,nextFallback,nextPreorder,id]);
+        return{units:nextUnits,stock:nextStock,added:mode==='append'?quantity:mode==='clear'?0:quantity,switched_to_manual:emptyAutomatic};
+      });
+      await audit(env,auth.admin_id,mode==='clear'?'clear':'add','product_reusable_inventory',id,{added:saved.added,units:saved.units,stock:saved.stock});
+      return reply({success:true,...saved,message:saved.switched_to_manual?'Shared stock cleared. No inventory remains, so the product was switched to manual fulfillment.':mode==='clear'?'Shared stock cleared.':`Shared stock saved. ${saved.units} unit(s) remain available.`});
+    }
+    error('Method not allowed.',405);
+  }
   const match=path.match(/^\/manage\/([a-z_]+)(?:\/(\d+)(?:\/(accounts|link|disable|stock|catalog|test|import|delete|fulfill|notify))?)?$/);if(!match||!tables[match[1]])error('Endpoint not found.',404);
   const [,name,id,action]=match,meta=tables[name],dbTable=meta.table||name;
   if(name==='providers'&&id&&action==='delete'&&request.method==='POST'){
@@ -615,8 +725,24 @@ async function route(request,env){
   }
   if(action==='link'&&name==='products'&&request.method==='GET')return reply({url:env.BOT_USERNAME?`https://t.me/${env.BOT_USERNAME}?start=product_${id}`:null,message:env.BOT_USERNAME?'Product link':'Main bot username is not configured.'});
   if(action==='accounts'&&name==='products'){
-    if(request.method==='GET'){const p=(await rows(env,'SELECT id,source,stock,file_content FROM products WHERE id=?',[id]))[0];if(!p)error('Product not found.',404);return reply({id:p.id,source:p.source,stock:p.stock,account_count:String(p.file_content||'').split(/\r?\n/).filter(x=>x.trim()).length});}
-    if(request.method==='POST'){const b=await body(request);if(!['append','replace','clear'].includes(b.mode))error('Invalid accounts action.');if(b.mode!=='append'&&b.confirm!==true)error('Explicit confirmation is required for replace or clear.',403);const content=String(b.content||'').split(/\r?\n/).map(x=>x.trim()).filter(Boolean).join('\n');await tx(env,async t=>{const p=(await t.execute('SELECT source,file_content,stock,delivery_type,manual_fallback FROM products WHERE id=? FOR UPDATE',[id])).rows?.[0];if(!p)error('Product not found.',404);if(p.source!=='own')error('Supplier inventory is managed by the provider.');const value=b.mode==='clear'?'':b.mode==='replace'?content:[p.file_content,content].filter(Boolean).join('\n');await t.execute('UPDATE products SET file_content=?,stock=?,updated_at=UTC_TIMESTAMP() WHERE id=?',[value,(Number(p.manual_fallback)||p.delivery_type==='manual')?Math.max(Number(p.stock||0),value?value.split(/\r?\n/).filter(x=>x.trim()).length:0):(value?value.split(/\r?\n/).filter(x=>x.trim()).length:0),id]);});await audit(env,auth.admin_id,b.mode,'product_inventory',id,{mode:b.mode,line_count:b.mode==='clear'?0:content.split(/\r?\n/).filter(Boolean).length});return reply({success:true});}
+    if(request.method==='GET'){const p=(await rows(env,'SELECT id,source,stock,file_content,reusable_delivery,reusable_stock FROM products WHERE id=?',[id]))[0];if(!p)error('Product not found.',404);return reply({id:p.id,source:p.source,stock:p.stock,account_count:String(p.file_content||'').split(/\r?\n/).filter(x=>x.trim()).length,reusable_stock:String(p.reusable_delivery||'').trim()?Number(p.reusable_stock||0):0});}
+    if(request.method==='POST'){
+      const b=await body(request);if(!['append','replace','clear'].includes(b.mode))error('Invalid accounts action.');if(b.mode!=='append'&&b.confirm!==true)error('Explicit confirmation is required for replace or clear.',403);
+      const content=String(b.content||'').split(/\r?\n/).map(x=>x.trim()).filter(Boolean).join('\n');let switchedToManual=false;
+      await tx(env,async t=>{
+        const p=(await t.execute('SELECT source,file_content,stock,reusable_delivery,reusable_stock,delivery_type,manual_fallback FROM products WHERE id=? FOR UPDATE',[id])).rows?.[0];
+        if(!p)error('Product not found.');if(p.source!=='own')error('Supplier inventory is managed by the provider.');
+        const value=b.mode==='clear'?'':b.mode==='replace'?content:[p.file_content,content].filter(Boolean).join('\n');
+        const sharedUnits=String(p.reusable_delivery||'').trim()?Number(p.reusable_stock||0):0,accountUnits=value?value.split(/\r?\n/).filter(x=>x.trim()).length:0,units=accountUnits+sharedUnits;
+        const emptyAutomatic=units===0&&['automatic','hybrid'].includes(String(p.delivery_type||'').toLowerCase()),nextDelivery=emptyAutomatic?'manual':p.delivery_type,nextFallback=emptyAutomatic?1:Number(p.manual_fallback||0),nextPreorder=emptyAutomatic?0:null;
+        const hadManualCapacity=Number(p.manual_fallback)||String(p.delivery_type||'').toLowerCase()==='manual';
+        const nextStock=emptyAutomatic?(hadManualCapacity?Number(p.stock||0):0):hadManualCapacity?Math.max(Number(p.stock||0),units):units;
+        switchedToManual=emptyAutomatic;
+        await t.execute('UPDATE products SET file_content=?,stock=?,delivery_type=?,manual_fallback=?,preorder=COALESCE(?,preorder),updated_at=UTC_TIMESTAMP() WHERE id=?',[value||null,nextStock,nextDelivery,nextFallback,nextPreorder,id]);
+      });
+      await audit(env,auth.admin_id,b.mode,'product_inventory',id,{mode:b.mode,line_count:b.mode==='clear'?0:content.split(/\r?\n/).filter(Boolean).length,switched_to_manual:switchedToManual});
+      return reply({success:true,switched_to_manual:switchedToManual,message:switchedToManual?'Inventory saved. No automatic inventory remains, so the product was switched to manual fulfillment.':'Inventory saved.'});
+    }
   }
   if(action==='disable'&&name==='products'&&request.method==='POST'){const b=await body(request);if(b.confirm!==true)error('Explicit confirmation is required to disable this product.',403);await db(env,'UPDATE products SET is_active=0,api_enabled=0 WHERE id=?',[id]);await audit(env,auth.admin_id,'disable','product',id,{});return reply({success:true,message:'Product archived; order history is preserved.'});}
   if(request.method==='GET'){
@@ -629,6 +755,7 @@ async function route(request,env){
     const extra=name==='orders'?",IF(COALESCE(refunded,0)=0 AND LOWER(COALESCE(delivery_type,'')) IN ('manual','hybrid') AND (LOWER(COALESCE(status,''))='preorder' OR LOWER(COALESCE(status,'')) IN ('pending_manual','processing')),1,0) AS can_fulfill,IF(LOWER(COALESCE(status,''))='completed' AND COALESCE(refunded,0)=0 AND LOWER(COALESCE(delivery_type,'')) IN ('manual','hybrid') AND delivered_account IS NOT NULL AND delivered_account<>'',1,0) AS has_delivery":'';
     const pageRows=await rows(env,`SELECT ${visible.map(c=>'`'+c+'`').join(',')}${extra} FROM \`${dbTable}\`${where} ORDER BY id DESC LIMIT 31 OFFSET ${offset}`,params);
     let outputRows=pageRows.slice(0,30);
+    if(name==='products'&&outputRows.length){const ids=outputRows.map(row=>row.id),placeholders=ids.map(()=>'?').join(',');const shared=await rows(env,`SELECT id,CASE WHEN COALESCE(reusable_delivery,'')='' THEN 0 ELSE COALESCE(reusable_stock,0) END AS reusable_stock FROM products WHERE id IN (${placeholders})`,ids);const sharedMap=new Map(shared.map(row=>[String(row.id),Number(row.reusable_stock||0)]));for(const row of outputRows)row.reusable_stock=sharedMap.get(String(row.id))||0;}
     if(name==='providers'&&outputRows.length){
       const ids=outputRows.map(row=>row.id),placeholders=ids.map(()=>'?').join(',');
       const [flags,counts]=await Promise.all([
@@ -649,9 +776,26 @@ async function route(request,env){
       if(!['skip','warranty','refund'].includes(mode)||mode!=='skip'&&(!Number.isInteger(days)||days<1||days>3650))error('Choose Warranty / Refund / Skip and enter 1–3650 days for the selected policy.');
       Object.assign(values,{aftercare_policy:mode,warranty_days:mode==='warranty'?days:0,subscription_days:mode==='refund'?days:0});
     }
-    const keys=Object.keys(values);if(!keys.length)error('No editable values supplied.');
+    let keys=Object.keys(values);if(!keys.length)error('No editable values supplied.');
     if(id&&name==='products'&&'is_active'in values){const old=(await rows(env,'SELECT is_active FROM products WHERE id=?',[id]))[0];if(old&&Number(old.is_active)!==Number(values.is_active)&&b.confirm_sensitive!==true)error('Explicit confirmation is required to change product visibility.',403);}
-    if(id)await db(env,`UPDATE \`${dbTable}\` SET ${keys.map(k=>'`'+k+'`=?').join(',')} WHERE id=?`,[...Object.values(values),id]);else await db(env,`INSERT INTO \`${dbTable}\` (${keys.map(k=>'`'+k+'`').join(',')}) VALUES (${keys.map(()=>'?').join(',')})`,Object.values(values));
+    if(name==='products'){
+      await tx(env,async t=>{
+        const existing=id?(await t.execute('SELECT delivery_type,file_content,reusable_delivery,reusable_stock FROM products WHERE id=? FOR UPDATE',[id])).rows?.[0]:null;
+        if(id&&!existing)error('Product not found.',404);
+        const effectiveDelivery=String(values.delivery_type??existing?.delivery_type??'automatic').toLowerCase();
+        if(['automatic','hybrid'].includes(effectiveDelivery)){
+          const accountCount=String(existing?.file_content||'').split(/\r?\n/).filter(x=>x.trim()).length;
+          const sharedCount=String(existing?.reusable_delivery||'').trim()?Number(existing?.reusable_stock||0):0;
+          if(accountCount+sharedCount===0){
+            if(b.confirm_manual_no_inventory!==true)error('This product has no inventory. Confirm that every order should be sent to manual fulfillment.',409);
+            values.delivery_type='manual';values.manual_fallback=1;values.stock=Number(values.stock??existing?.stock??0);values.preorder=0;
+          }
+        }
+        keys=Object.keys(values);
+        if(id)await t.execute(`UPDATE \`${dbTable}\` SET ${keys.map(k=>'`'+k+'`=?').join(',')} WHERE id=?`,[...Object.values(values),id]);
+        else await t.execute(`INSERT INTO \`${dbTable}\` (${keys.map(k=>'`'+k+'`').join(',')}) VALUES (${keys.map(()=>'?').join(',')})`,Object.values(values));
+      });
+    }else if(id)await db(env,`UPDATE \`${dbTable}\` SET ${keys.map(k=>'`'+k+'`=?').join(',')} WHERE id=?`,[...Object.values(values),id]);else await db(env,`INSERT INTO \`${dbTable}\` (${keys.map(k=>'`'+k+'`').join(',')}) VALUES (${keys.map(()=>'?').join(',')})`,Object.values(values));
     await audit(env,auth.admin_id,id?'update':'create',name,id||null,{fields:keys});return reply({success:true,message:'Saved to the shared database. The main bot must read this data to apply changes.'});}
   error('Action is not configured.',405);
 }

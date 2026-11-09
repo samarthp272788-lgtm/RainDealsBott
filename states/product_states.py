@@ -56,6 +56,11 @@ class AddAccounts(StatesGroup):
     confirm = State()
 
 
+class ReusableStock(StatesGroup):
+    content = State()
+    quantity = State()
+
+
 class EditAccounts(StatesGroup):
     select_product = State()
     accounts = State()

@@ -26,7 +26,7 @@ from models.product import Product
 from services.fulfillment_policy import manual_allowed
 from services.warranty import policy_label
 from models.admin_audit_log import AdminAuditLog
-from states.product_states import AddAccounts, EditAccounts, EditBulkPricing, EditProduct
+from states.product_states import AddAccounts, EditAccounts, EditBulkPricing, EditProduct, ReusableStock
 from handlers.products import (
     _real_stock,
     _send_stock_channel_message,
@@ -45,6 +45,27 @@ DELIVERY_LABELS = {
 }
 DEFAULT_LOW_STOCK_THRESHOLD = 3
 _BULK_PAGE_SIZE = 8
+
+
+def _has_delivery_inventory(product: Product) -> bool:
+    accounts = any(line.strip() for line in str(product.file_content or "").splitlines())
+    shared = bool(str(getattr(product, "reusable_delivery", "") or "").strip())
+    shared_units = max(0, int(getattr(product, "reusable_stock", 0) or 0)) if shared else 0
+    return accounts or shared_units > 0
+
+
+async def _ask_to_switch_empty_product_to_manual(callback: CallbackQuery, product_id: int):
+    await answer_card(
+        callback,
+        "⚠️ <b>No automatic inventory is available</b>\n\n"
+        "This product cannot be saved as automatic or hybrid without separate accounts "
+        "or shared stock. Switch it to manual so new orders enter the fulfillment queue?",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Switch to Manual", callback_data=f"empty_delivery_manual_{product_id}", style="success")],
+            [InlineKeyboardButton(text="Cancel", callback_data=f"empty_delivery_cancel_{product_id}", style="primary")],
+        ]),
+    )
 
 
 def _bulk_keyboard(products, selected_ids: set[int], page: int, total_pages: int):
@@ -478,6 +499,7 @@ def _build_product_panel(product: Product):
     aftercare = (f"🛡 Warranty: {product.warranty_days}d" if mode == 'warranty' else
                  f"💸 Refund: {product.subscription_days}d" if mode == 'refund' else '🛡 Aftercare: OFF')
     has_accounts = bool(product.file_content and product.file_content.strip())
+    reusable_stock = max(0, int(getattr(product, "reusable_stock", 0) or 0))
 
     def tile(label, action, style='primary'):
         return InlineKeyboardButton(text=label, callback_data=f'{action}_{product.id}', style=style)
@@ -486,6 +508,7 @@ def _build_product_panel(product: Product):
         [tile('✏️ Name', 'edit_name'), tile('🏷 Category', 'edit_category')],
         [tile('💰 Price', 'edit_price'), tile('📦 Stock', 'edit_stock')],
         [tile('➕ Add Accounts', 'add_accounts', 'success'), tile('✏️ Edit Accounts' if has_accounts else '✏️ Accounts (empty)', 'edit_accounts')],
+        [tile(f'♻️ Shared stock: {reusable_stock}', 'reusable_stock', 'success')],
         [tile('🧾 Buyer Details', 'edit_required_info'), tile(aftercare, 'warranty_config')],
         [tile(DELIVERY_LABELS.get(delivery_type, delivery_type), 'cycle_delivery'), tile('Fallback: ON' if product.manual_fallback else 'Fallback: OFF', 'toggle_fallback')],
         [tile('🔴 Disable' if product.is_active else '🟢 Enable', 'toggle', 'danger' if product.is_active else 'success'), tile('🌐 API: ON' if api_on else '🌐 API: OFF', 'toggle_api')],
@@ -561,6 +584,112 @@ async def create_product_link(callback: CallbackQuery):
 # ==================================================
 # ADD ACCOUNTS
 # ==================================================
+
+@router.callback_query(F.data.startswith("reusable_stock_"))
+async def reusable_stock_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    try:
+        product_id = int(callback.data.rsplit("_", 1)[1])
+    except (TypeError, ValueError):
+        await callback.answer("Invalid product.", show_alert=True)
+        return
+    product = await asyncio.to_thread(_load_product, product_id)
+    if not product or getattr(product, "source", "own") != "own":
+        await callback.answer("Shared stock is available for own products only.", show_alert=True)
+        return
+    await state.update_data(reusable_product_id=product_id)
+    await state.set_state(ReusableStock.content)
+    await answer_card(callback,
+        "♻️ <b>Shared account stock</b>\n\n"
+        "Send one account, code, or link that can be reused for multiple purchases. "
+        "It is saved once; next you will enter how many units it covers.\n\n"
+        "Send /cancel to stop.", parse_mode="HTML")
+    await callback.answer()
+
+
+@router.message(ReusableStock.content)
+async def reusable_stock_content(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    content = (message.text or "").strip()
+    if not content or len(content) > 3000 or "\n" in content:
+        await answer_card(message, "Send one shared account, code, or link as a single text value (maximum 3,000 characters).")
+        return
+    await state.update_data(reusable_delivery_content=content)
+    await state.set_state(ReusableStock.quantity)
+    await answer_card(message,
+        "How many order units can use this shared account?\n\n"
+        "Enter a whole number from 1 to 1,000,000. The credential is stored once, not duplicated.")
+
+
+def _commit_reusable_stock(product_id: int, content: str, quantity: int, admin_id: int) -> dict:
+    db = SessionLocal()
+    try:
+        product = db.query(Product).filter(Product.id == product_id).with_for_update().first()
+        if not product:
+            return {"error": "Product not found."}
+        if getattr(product, "source", "own") != "own":
+            return {"error": "Shared inventory is available for own products only."}
+        existing_content = str(getattr(product, "reusable_delivery", "") or "").strip()
+        existing_units = max(0, int(getattr(product, "reusable_stock", 0) or 0))
+        if existing_units and existing_content != content:
+            return {"error": "A different shared account still has units in stock. Add the same content, or wait until its shared stock reaches zero before replacing it."}
+        next_units = existing_units + quantity if existing_content == content else quantity
+        product.reusable_delivery = content
+        product.reusable_stock = next_units
+        regular_units = len([x for x in (product.file_content or "").splitlines() if x.strip()])
+        inventory_total = regular_units + next_units
+        product.stock = max(int(product.stock or 0), inventory_total) if manual_allowed(product) else inventory_total
+        db.add(AdminAuditLog(
+            admin_telegram_id=int(admin_id), action="add_reusable_stock", entity_type="product",
+            entity_id=str(product.id), summary=f"Added {quantity} reusable unit(s); shared units now {next_units}.",
+        ))
+        db.commit()
+        return {"added": quantity, "reusable_stock": next_units, "stock": product.stock}
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+@router.message(ReusableStock.quantity)
+async def reusable_stock_quantity(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    raw = (message.text or "").strip()
+    if not raw.isdigit() or not 1 <= int(raw) <= 1_000_000:
+        await answer_card(message, "Enter a whole number from 1 to 1,000,000.")
+        return
+    data = await state.get_data()
+    product_id = int(data.get("reusable_product_id") or 0)
+    try:
+        result = await asyncio.to_thread(
+            _commit_reusable_stock, product_id,
+            str(data.get("reusable_delivery_content") or ""), int(raw), message.from_user.id,
+        )
+    except Exception:
+        logger.exception("Could not save reusable stock")
+        await answer_card(message, "Could not save shared stock. No changes were confirmed; please retry.")
+        return
+    if result.get("error"):
+        await state.clear()
+        await answer_card(message, "❌ " + html_escape(result["error"]))
+        return
+    await state.clear()
+    invalidate_products_cache()
+    try:
+        await _notify_stock_change(message.bot, product_id)
+    except Exception:
+        logger.exception("Failed to notify after reusable stock update")
+    await answer_card(message,
+        f"✅ <b>Shared stock updated</b>\n\nAdded: <b>{result['added']}</b> unit(s)\n"
+        f"Shared units available: <b>{result['reusable_stock']}</b>\nTotal product stock: <b>{result['stock']}</b>",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📦 Product Manager", callback_data=f"manage_{product_id}")]
+        ]))
 
 @router.callback_query(F.data.startswith("add_accounts_"))
 async def add_accounts(callback: CallbackQuery, state: FSMContext):
@@ -672,7 +801,8 @@ def _commit_account_import(product_id: int, lines: list[str], admin_id: int) -> 
         existing = set(existing_lines)
         fresh = [line for line in lines if line and line not in existing]
         product.file_content = "\n".join(existing_lines + fresh)
-        product.stock = max(product.stock or 0, len(existing_lines) + len(fresh)) if manual_allowed(product) else len(existing_lines) + len(fresh)
+        inventory_total = len(existing_lines) + len(fresh) + max(0, int(getattr(product, "reusable_stock", 0) or 0))
+        product.stock = max(product.stock or 0, inventory_total) if manual_allowed(product) else inventory_total
         db.add(AdminAuditLog(
             admin_telegram_id=int(admin_id),
             action="add_stock_accounts",
@@ -960,13 +1090,26 @@ async def clear_accounts(callback: CallbackQuery):
 
     db = SessionLocal()
     try:
-        product = db.query(Product).filter(Product.id == pid).first()
+        product = db.query(Product).filter(Product.id == pid).with_for_update().first()
         if not product:
             await callback.answer("❌ Product not found.")
             return
 
+        had_manual_capacity = manual_allowed(product)
         product.file_content = None
-        product.stock = product.stock if manual_allowed(product) else 0
+        has_shared_stock = (
+            bool(str(getattr(product, "reusable_delivery", "") or "").strip())
+            and max(0, int(getattr(product, "reusable_stock", 0) or 0)) > 0
+        )
+        if not has_shared_stock and (product.delivery_type or "automatic").lower() in {"automatic", "hybrid"}:
+            product.delivery_type = "manual"
+            product.manual_fallback = True
+            product.preorder = False
+            product.stock = int(product.stock or 0) if had_manual_capacity else 0
+        elif had_manual_capacity:
+            product.stock = max(int(product.stock or 0), int(getattr(product, "reusable_stock", 0) or 0))
+        else:
+            product.stock = int(getattr(product, "reusable_stock", 0) or 0) if has_shared_stock else 0
         db.commit()
         invalidate_products_cache()
         db.refresh(product)
@@ -1049,7 +1192,7 @@ async def cycle_delivery_type(callback: CallbackQuery):
 
     db = SessionLocal()
     try:
-        product = db.query(Product).filter(Product.id == pid).first()
+        product = db.query(Product).filter(Product.id == pid).with_for_update().first()
         if not product:
             await callback.answer("❌ Product not found.")
             return
@@ -1059,7 +1202,12 @@ async def cycle_delivery_type(callback: CallbackQuery):
             next_index = (DELIVERY_TYPES.index(current) + 1) % len(DELIVERY_TYPES)
         except ValueError:
             next_index = 0
-        product.delivery_type = DELIVERY_TYPES[next_index]
+        next_delivery_type = DELIVERY_TYPES[next_index]
+        if next_delivery_type in {"automatic", "hybrid"} and not _has_delivery_inventory(product):
+            await _ask_to_switch_empty_product_to_manual(callback, pid)
+            await callback.answer()
+            return
+        product.delivery_type = next_delivery_type
         db.commit()
         invalidate_products_cache()
 
@@ -1068,6 +1216,55 @@ async def cycle_delivery_type(callback: CallbackQuery):
         db.close()
 
     await callback.answer(f"🚚 Delivery set to {new_label}")
+    await _refresh_manage_panel(callback, pid)
+
+
+@router.callback_query(F.data.startswith("empty_delivery_manual_"))
+async def confirm_empty_product_manual(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    try:
+        pid = int(callback.data.rsplit("_", 1)[1])
+    except (TypeError, ValueError):
+        await callback.answer("Invalid product.", show_alert=True)
+        return
+    db = SessionLocal()
+    try:
+        product = db.query(Product).filter(Product.id == pid).with_for_update().first()
+        if not product or product.source != "own":
+            await callback.answer("Local product not found.", show_alert=True)
+            return
+        product.delivery_type = "manual"
+        product.manual_fallback = True
+        product.preorder = False
+        db.add(AdminAuditLog(
+            admin_telegram_id=int(callback.from_user.id), action="switch_empty_product_to_manual",
+            entity_type="product", entity_id=str(product.id),
+            summary="Confirmed manual fulfillment because no automatic inventory was available.",
+        ))
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Could not switch empty product to manual delivery")
+        await callback.answer("Could not update this product. Please try again.", show_alert=True)
+        return
+    finally:
+        db.close()
+    invalidate_products_cache()
+    await _refresh_manage_panel(callback, pid)
+
+
+@router.callback_query(F.data.startswith("empty_delivery_cancel_"))
+async def cancel_empty_product_manual(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    try:
+        pid = int(callback.data.rsplit("_", 1)[1])
+    except (TypeError, ValueError):
+        await callback.answer("Invalid product.", show_alert=True)
+        return
     await _refresh_manage_panel(callback, pid)
 
 
@@ -1083,12 +1280,21 @@ async def toggle_manual_fallback(callback: CallbackQuery):
             product = db.query(Product).filter(Product.id == pid).with_for_update().first()
             if not product or product.source != "own":
                 return False
+            enabling = not bool(product.manual_fallback)
+            if (enabling and (product.delivery_type or "automatic").lower() in {"automatic", "hybrid"}
+                    and not _has_delivery_inventory(product)):
+                return "confirm_manual"
             product.manual_fallback = not product.manual_fallback
             db.commit()
             return True
         finally:
             db.close()
-    if not await asyncio.to_thread(save):
+    result = await asyncio.to_thread(save)
+    if result == "confirm_manual":
+        await _ask_to_switch_empty_product_to_manual(callback, pid)
+        await callback.answer()
+        return
+    if not result:
         await callback.answer("Local product not found.", show_alert=True)
         return
     invalidate_products_cache()
