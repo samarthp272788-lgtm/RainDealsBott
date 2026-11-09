@@ -84,13 +84,16 @@ def reroute_pending_admin_alerts(bot_id):
 def enqueue(db, event, chat_id, body, bot_id=None, source_order_id=None, reply_markup=None):
     from models.bot_operations import NotificationJob
     bot_id = bot_id or main_bot_id()
-    admin_notice = str(event).lower().startswith('admin:')
+    event_text = str(event).lower()
+    admin_order_notice = event_text.startswith('admin-order:')
+    admin_notice = event_text.startswith('admin:') or admin_order_notice
     if not admin_notice and int(bot_id) == main_bot_id() and str(chat_id).isdigit():
         from config import ADMIN_IDS
         admin_notice = int(chat_id) in ADMIN_IDS
     chat_id, unroutable_admin_notice = _normalise_destination(bot_id, chat_id)
     prefix = str(event).lower().split(':', 1)[0]
-    category = ('admin' if admin_notice else
+    category = ('admin_order' if admin_order_notice else
+                'admin' if admin_notice else
                 'broadcast' if prefix == 'broadcast' else
                 'wallet_adjustment' if prefix in ('wallet-adjustment', 'balance-adjustment') else
                 'subscription' if prefix == 'subscription' else
@@ -177,7 +180,11 @@ def claim_next(bot_id):
             if not allows(db, int(row.chat_id), row.category):
                 row.status, row.error_code = 'resolved', 'preference_muted'
                 return {'skipped': True}
-        if bot_id==main_bot_id() and row.category != 'admin' and str(row.chat_id).isdigit() and int(row.chat_id)>0:
+        if row.category is None and row.source_order_id and 'ADMIN ORDER ALERT' in str(row.body):
+            # Recover category for queued rows created before admin-order
+            # events were explicitly classified.
+            row.category = 'admin_order'
+        if bot_id==main_bot_id() and row.category not in ('admin', 'admin_order') and str(row.chat_id).isdigit() and int(row.chat_id)>0:
             # The shop's private alerts live in Notifications, not extra chat cards.
             row.status, row.error_code = 'inbox', None
             return {'skipped':True,'inbox_user':int(row.chat_id)}
@@ -199,7 +206,7 @@ def finish(job_id, bot_id, status, message_id=None, error_code=None, delay=0):
         row.status, row.message_id, row.error_code = status, message_id, error_code
         row.sent_at = datetime.utcnow() if status == 'sent' else None
         row.next_attempt_at = datetime.utcnow() + timedelta(seconds=delay)
-        if status == 'sent' and row.source_order_id:
+        if status == 'sent' and row.category == 'admin_order' and row.source_order_id:
             from models.order import Order
             order = db.get(Order, row.source_order_id)
             if order:

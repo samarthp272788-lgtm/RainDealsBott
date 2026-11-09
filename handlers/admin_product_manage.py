@@ -10,7 +10,7 @@ from decimal import Decimal
 from html import escape as html_escape
 
 from aiogram import Router, F
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -27,6 +27,8 @@ from services.fulfillment_policy import manual_allowed, manual_fallback_only, ef
 from services.warranty import policy_label
 from models.admin_audit_log import AdminAuditLog
 from states.product_states import AddAccounts, EditAccounts, EditBulkPricing, EditProduct, ReusableStock
+from services.input_forms import is_cancel
+from services.session_resume import save_resume
 from handlers.products import (
     _real_stock,
     _send_stock_channel_message,
@@ -592,7 +594,7 @@ async def create_product_link(callback: CallbackQuery):
 # ADD ACCOUNTS
 # ==================================================
 
-@router.callback_query(F.data.startswith("reusable_stock_"))
+@router.callback_query(F.data.regexp(r"^reusable_stock_\d+$"))
 async def reusable_stock_start(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Access denied.", show_alert=True)
@@ -612,23 +614,87 @@ async def reusable_stock_start(callback: CallbackQuery, state: FSMContext):
         "♻️ <b>Shared account stock</b>\n\n"
         "Send one account, code, or link that can be reused for multiple purchases. "
         "It is saved once; next you will enter how many units it covers.\n\n"
-        "Send /cancel to stop.", parse_mode="HTML")
+        "Send /cancel to stop, or /start to leave this setup.", parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Cancel", callback_data="reusable_stock_cancel", style="danger")
+        ]]))
     await callback.answer()
+
+
+async def _cancel_reusable_stock_message(message: Message, state: FSMContext):
+    data = await state.get_data()
+    product_id = int(data.get("reusable_product_id") or 0)
+    await state.clear()
+    save_resume((message.from_user.id, message.chat.id), None)
+    product = await asyncio.to_thread(_load_product, product_id) if product_id else None
+    if product:
+        text, markup = _build_product_panel(product)
+        await answer_card(message, "❌ <b>Shared stock setup cancelled.</b> No inventory changes were made.\n\n" + text,
+                          parse_mode="HTML", reply_markup=markup)
+    else:
+        await answer_card(message, "❌ <b>Shared stock setup cancelled.</b> No inventory changes were made.",
+                          parse_mode="HTML")
+
+
+@router.message(ReusableStock.content, CommandStart())
+@router.message(ReusableStock.quantity, CommandStart())
+async def reusable_stock_start_command(message: Message, command, state: FSMContext):
+    # State-specific text handlers are registered before the general /start
+    # router, so explicitly hand /start back to the normal home flow.
+    from handlers.start import start_cmd
+    await start_cmd(message, command, state)
+
+
+@router.message(ReusableStock.content, Command("restart"))
+@router.message(ReusableStock.quantity, Command("restart"))
+async def reusable_stock_restart_command(message: Message, state: FSMContext):
+    from handlers.restart import restart_cmd
+    await restart_cmd(message, state)
+
+
+@router.callback_query(F.data == "reusable_stock_cancel")
+async def reusable_stock_cancel(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Access denied.", show_alert=True)
+        return
+    if await state.get_state() not in {ReusableStock.content.state, ReusableStock.quantity.state}:
+        await callback.answer("This shared-stock setup is already closed.", show_alert=True)
+        return
+    data = await state.get_data()
+    product_id = int(data.get("reusable_product_id") or 0)
+    await state.clear()
+    save_resume((callback.from_user.id, callback.message.chat.id), None)
+    if product_id:
+        await _refresh_manage_panel(callback, product_id)
+    else:
+        await answer_card(callback, "❌ <b>Shared stock setup cancelled.</b> No inventory changes were made.",
+                          parse_mode="HTML")
+        await callback.answer("Cancelled.")
 
 
 @router.message(ReusableStock.content)
 async def reusable_stock_content(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
+    if is_cancel(message.text):
+        await _cancel_reusable_stock_message(message, state)
+        return
     content = (message.text or "").strip()
     if not content or len(content) > 3000 or "\n" in content:
-        await answer_card(message, "Send one shared account, code, or link as a single text value (maximum 3,000 characters).")
+        await answer_card(message, "Send one shared account, code, or link as a single text value (maximum 3,000 characters), or /cancel.",
+                          reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                              InlineKeyboardButton(text="❌ Cancel", callback_data="reusable_stock_cancel", style="danger")
+                          ]]))
         return
     await state.update_data(reusable_delivery_content=content)
     await state.set_state(ReusableStock.quantity)
     await answer_card(message,
         "How many order units can use this shared account?\n\n"
-        "Enter a whole number from 1 to 1,000,000. The credential is stored once, not duplicated.")
+        "Enter a whole number from 1 to 1,000,000. The credential is stored once, not duplicated.\n\n"
+        "Send /cancel to stop, or /start to leave this setup.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Cancel", callback_data="reusable_stock_cancel", style="danger")
+        ]]))
 
 
 def _commit_reusable_stock(product_id: int, content: str, quantity: int, admin_id: int) -> dict:
@@ -666,9 +732,15 @@ def _commit_reusable_stock(product_id: int, content: str, quantity: int, admin_i
 async def reusable_stock_quantity(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
+    if is_cancel(message.text):
+        await _cancel_reusable_stock_message(message, state)
+        return
     raw = (message.text or "").strip()
     if not raw.isdigit() or not 1 <= int(raw) <= 1_000_000:
-        await answer_card(message, "Enter a whole number from 1 to 1,000,000.")
+        await answer_card(message, "Enter a whole number from 1 to 1,000,000, or /cancel.",
+                          reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                              InlineKeyboardButton(text="❌ Cancel", callback_data="reusable_stock_cancel", style="danger")
+                          ]]))
         return
     data = await state.get_data()
     product_id = int(data.get("reusable_product_id") or 0)

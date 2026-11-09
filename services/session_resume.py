@@ -143,10 +143,26 @@ def make_snapshot(state, data, navigation=None, *, admin=False, prompt=None, las
     return json.loads(json.dumps(value, default=_json_value))
 
 
-def _cipher(key):
-    from cryptography.fernet import Fernet
+def _resume_secrets():
     import config
-    secret = getattr(config, 'API_KEY_ENCRYPTION_KEY', None) or config.BOT_TOKEN
+    # API_KEY_ENCRYPTION_KEY was the original stable-key option for resume
+    # snapshots. Keep it as a compatibility fallback, then BOT_TOKEN for
+    # snapshots created before a dedicated key was configured.
+    values = (
+        getattr(config, 'SESSION_RESUME_ENCRYPTION_KEY', ''),
+        getattr(config, 'API_KEY_ENCRYPTION_KEY', ''),
+        getattr(config, 'BOT_TOKEN', ''),
+    )
+    return tuple(dict.fromkeys(str(value) for value in values if value))
+
+
+def _cipher(key, secret=None):
+    from cryptography.fernet import Fernet
+    if secret is None:
+        secrets = _resume_secrets()
+        if not secrets:
+            raise RuntimeError('Configure SESSION_RESUME_ENCRYPTION_KEY to encrypt saved sessions.')
+        secret = secrets[0]
     seed = f'raindeals-resume-v1:{secret}:{key[0]}:{key[1]}'.encode()
     return Fernet(base64.urlsafe_b64encode(hashlib.sha256(seed).digest()))
 
@@ -161,9 +177,15 @@ def open_snapshot(key, payload):
         return payload if not payload.get('admin') else None
     from cryptography.fernet import InvalidToken
     try:
-        return json.loads(_cipher(key).decrypt(payload['ciphertext'].encode(), ttl=MAX_AGE_SECONDS))
-    except (InvalidToken, ValueError, KeyError, TypeError):
+        ciphertext = payload['ciphertext'].encode()
+        for secret in _resume_secrets():
+            try:
+                return json.loads(_cipher(key, secret).decrypt(ciphertext, ttl=MAX_AGE_SECONDS))
+            except InvalidToken:
+                continue
+    except (ValueError, KeyError, TypeError):
         return None
+    return None
 
 
 def _persist(key, snapshot):

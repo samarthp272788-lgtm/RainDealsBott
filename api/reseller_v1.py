@@ -26,6 +26,8 @@ public API exposed directly by FastAPI.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import re
 import time
@@ -117,6 +119,8 @@ _invalid_auth_windows: dict[str, deque[float]] = defaultdict(deque)
 _in_flight_orders: dict[int, int] = defaultdict(int)
 
 _rate_lock = asyncio.Lock()
+_last_rate_cleanup = 0.0
+_RATE_CLEANUP_INTERVAL_SECONDS = 300
 
 
 # ============================================================
@@ -202,6 +206,8 @@ async def _limit_key(key_id: int) -> None:
 
     async with _rate_lock:
 
+        _cleanup_rate_windows_locked(now)
+
         window = _rate_windows[key_id]
 
         minute_window = _minute_rate_windows[key_id]
@@ -252,6 +258,8 @@ async def _limit_order(key_id: int) -> None:
     now = time.monotonic()
 
     async with _rate_lock:
+
+        _cleanup_rate_windows_locked(now)
 
         window = _order_windows[key_id]
 
@@ -311,6 +319,8 @@ async def _reject_invalid_auth_flood(client_address: str) -> None:
 
     async with _rate_lock:
 
+        _cleanup_rate_windows_locked(now)
+
         window = _invalid_auth_windows.get(client_address)
 
         if not window:
@@ -341,7 +351,48 @@ async def _record_invalid_auth(client_address: str) -> None:
     """Remember a rejected authentication attempt for one minute."""
 
     async with _rate_lock:
-        _invalid_auth_windows[client_address].append(time.monotonic())
+        now = time.monotonic()
+        _cleanup_rate_windows_locked(now)
+        _invalid_auth_windows[client_address].append(now)
+
+
+def _cleanup_rate_windows_locked(now: float) -> None:
+    """Periodically drop expired keys so long-lived workers do not grow forever.
+
+    Caller must hold ``_rate_lock``. These limits remain process-local; shared
+    enforcement across multiple Render instances requires a shared limiter.
+    """
+    global _last_rate_cleanup
+    if now - _last_rate_cleanup < _RATE_CLEANUP_INTERVAL_SECONDS:
+        return
+    _last_rate_cleanup = now
+    for mapping, lifetime in (
+        (_rate_windows, 1.0),
+        (_minute_rate_windows, 60.0),
+        (_order_windows, 60.0),
+        (_invalid_auth_windows, 60.0),
+    ):
+        for key, window in list(mapping.items()):
+            while window and now - window[0] >= lifetime:
+                window.popleft()
+            if not window:
+                mapping.pop(key, None)
+
+
+def _request_fingerprint(payload: OrderRequest) -> str:
+    """Stable digest of every client-controlled field that changes an order."""
+    canonical = json.dumps(
+        {
+            "service_id": payload.service_id,
+            "quantity": payload.quantity,
+            "delivery_telegram_id": payload.delivery_telegram_id,
+            "buyer_info": payload.buyer_info,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 # ============================================================
@@ -889,6 +940,7 @@ def _list_api_orders(
 def _reserve_order(
     api_key_id: int,
     client_order_id: str,
+    request_fingerprint: str,
 ) -> tuple[ApiOrder | None, bool]:
 
     db = SessionLocal()
@@ -912,6 +964,7 @@ def _reserve_order(
         row = ApiOrder(
             api_key_id=api_key_id,
             client_order_id=client_order_id,
+            request_fingerprint=request_fingerprint,
             status="processing",
         )
 
@@ -1127,6 +1180,8 @@ async def create_order(
             400,
         )
 
+    request_fingerprint = _request_fingerprint(payload)
+
     # Reject invalid buyer details before reserving the idempotency key. The
     # checkout transaction validates again against the locked product row.
     required_info = await asyncio.to_thread(
@@ -1147,6 +1202,7 @@ async def create_order(
         _reserve_order,
         principal.key_id,
         payload.client_order_id,
+        request_fingerprint,
     )
 
     if not request_row:
@@ -1165,6 +1221,12 @@ async def create_order(
     # --------------------------------------------------------
 
     if not is_new:
+        if request_row.request_fingerprint != request_fingerprint:
+            raise _api_error(
+                "idempotency_conflict",
+                "This client_order_id is already bound to a different purchase request. Use a new ID for a changed order.",
+                409,
+            )
         if not request_row.order_id:
             recovered = await asyncio.to_thread(recover_checkout,
                 api_checkout_key(principal.key_id, payload.client_order_id), principal.telegram_id)

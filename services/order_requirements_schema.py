@@ -92,6 +92,7 @@ def ensure_order_requirements_schema() -> None:
         _ensure_index(connection, 'bot_notification_jobs', ['bot_id','status','next_attempt_at','id'], 'ix_notification_delivery_queue')
         _ensure_unique_columns(connection, 'deposits', ['tx_hash'], 'uq_deposits_tx_hash')
         _ensure_unique_columns(connection, 'api_orders', ['api_key_id', 'client_order_id'], 'uq_api_order_client_id')
+        _ensure_column(connection, 'api_orders', 'request_fingerprint', 'VARCHAR(64) NULL')
         _ensure_column(connection, "users", "home_menu_chat_id", "BIGINT NULL")
         _ensure_column(connection, "users", "home_menu_message_id", "BIGINT NULL")
         _ensure_column(connection, "products", "required_info", "JSON NULL")

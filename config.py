@@ -101,6 +101,10 @@ API_KEY_PEPPER = os.getenv("API_KEY_PEPPER", "")
 # This must be a stable Fernet key and must never be committed or changed.
 API_KEY_ENCRYPTION_KEY = os.getenv("API_KEY_ENCRYPTION_KEY", "")
 
+# Stable key for resumable Telegram drafts/screens. Set this separately from
+# BOT_TOKEN so rotating Telegram credentials does not invalidate saved drafts.
+SESSION_RESUME_ENCRYPTION_KEY = os.getenv("SESSION_RESUME_ENCRYPTION_KEY", "")
+
 # The public Wasmer gateway shown to users in the bot. Example:
 # https://my-reseller-api.wasmer.app.  Do not put the Vercel/Render bot URL
 # here, because it is an internal bridge only.

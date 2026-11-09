@@ -278,7 +278,10 @@ def _do_bulk_inventory_fulfill(product_id: int, admin_id: int, limit: int = 20) 
                 skipped += 1
                 continue
             if len(accounts) + reusable < quantity:
-                break
+                # A large older order must not block smaller later orders
+                # that fit the remaining inventory. Leave this order pending.
+                skipped += 1
+                continue
             regular_count = min(len(accounts), quantity)
             delivered_lines = accounts[:regular_count]
             accounts = accounts[regular_count:]

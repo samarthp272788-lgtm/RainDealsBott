@@ -3,6 +3,7 @@ from utils.ui import answer_card, schedule_delete_card
 from utils.uploads import text_from_message
 import json
 import logging
+import secrets
 from decimal import Decimal
 from html import escape as _esc
 import asyncio
@@ -946,7 +947,13 @@ async def _fetch_and_show_reseller_products(callback: CallbackQuery, state: FSMC
                 if stock_val <= 0:
                     continue
 
-                products_cache[service_id] = prod
+                # Telegram limits callback_data to 1–64 UTF-8 bytes. Provider
+                # identifiers can be arbitrarily long, so keep the real ID in
+                # FSM data and send only a short opaque token in the button.
+                product_token = secrets.token_hex(6)
+                cached_product = dict(prod)
+                cached_product["_raindeals_service_id"] = service_id
+                products_cache[product_token] = cached_product
 
                 if stock_val >= 999999:
                     stock_disp = "🟢 In Stock"
@@ -959,7 +966,7 @@ async def _fetch_and_show_reseller_products(callback: CallbackQuery, state: FSMC
                 buttons.append([
                     InlineKeyboardButton(
                         text=btn_text[:64],
-                        callback_data=f"reseller_prod:{service_id}"
+                        callback_data=f"reseller_prod:{product_token}"
                     )
                 ])
             except Exception:
@@ -1019,14 +1026,26 @@ async def reseller_product_selected(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Admin only.", show_alert=True)
         return
 
-    service_id = callback.data.split(":", 1)[1]
+    product_token = callback.data.split(":", 1)[1]
     data = await state.get_data()
     products_cache = data.get("reseller_products_cache", {})
 
-    selected = products_cache.get(service_id)
+    selected = products_cache.get(product_token)
 
     if not selected:
         await callback.answer("❌ Product metadata lost. Please try again.", show_alert=True)
+        return
+
+    service_id = str(
+        selected.get("_raindeals_service_id")
+        or selected.get("service_id")
+        or selected.get("productId")
+        or selected.get("product_id")
+        or selected.get("id")
+        or ""
+    ).strip()
+    if not service_id:
+        await callback.answer("❌ Provider product ID is missing. Refresh the catalog.", show_alert=True)
         return
 
     reseller_product_name = selected.get("name") or selected.get("title") or "Reseller Product"

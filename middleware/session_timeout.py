@@ -1,6 +1,5 @@
 import logging
 import time
-from datetime import datetime, timezone
 
 from aiogram import BaseMiddleware
 from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton
@@ -11,13 +10,6 @@ GENERAL_SESSION_TIMEOUT_SECONDS = GENERAL_IDLE_SECONDS
 EXTENDED_SESSION_TIMEOUT_SECONDS = PAYMENT_IDLE_SECONDS
 MAX_TRACKED_SESSIONS = 10000
 logger = logging.getLogger(__name__)
-
-
-def _message_timestamp(message):
-    value = getattr(message, "edit_date", None) or getattr(message, "date", None)
-    if isinstance(value, datetime):
-        return value.replace(tzinfo=timezone.utc).timestamp() if value.tzinfo is None else value.timestamp()
-    return float(value) if isinstance(value, (int,float)) else time.time()
 
 
 def _timeout_for_context(callback_data="", message_text="", state=None):
@@ -58,7 +50,10 @@ class CallbackSessionTimeoutMiddleware(BaseMiddleware):
                 logger.warning('Draft lookup unavailable; no saved input was executed.')
         last = previous[0] if previous else (snapshot or {}).get('last_activity')
         if last is None and isinstance(event,CallbackQuery):
-            last = _message_timestamp(message)
+            # A button on an old Telegram message is a new interaction when
+            # this process has no session record. Using the message's creation
+            # time would reject valid navigation immediately after a restart.
+            last = now
         # The previous flow determines expiry, not the button the user is now clicking.
         timeout = _timeout_for_context(state=before_state) if before_state else (
             previous[1] if previous else _timeout_for_context(callback,state=(snapshot or {}).get('state')))

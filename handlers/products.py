@@ -880,8 +880,65 @@ def invalidate_products_cache() -> None:
         _products_cache["timestamp"] = 0
 
 
+def _purchase_configuration_errors(required_info, bulk_pricing) -> list[str]:
+    """Reject malformed purchase rules instead of silently dropping them."""
+    errors = []
+    allowed_requirement_types = {"email", "phone", "photo", "contact", "text"}
+
+    if isinstance(required_info, str):
+        try:
+            required_info = json.loads(required_info)
+            if isinstance(required_info, str):
+                required_info = json.loads(required_info)
+        except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+            errors.append("required_info")
+    if required_info is not None:
+        if not isinstance(required_info, list) or len(required_info) > 8:
+            errors.append("required_info")
+        else:
+            seen_labels = set()
+            for item in required_info:
+                if not isinstance(item, dict):
+                    errors.append("required_info")
+                    break
+                kind = str(item.get("type") or "text").strip().lower()
+                label = str(item.get("label") or kind.title()).strip()[:100]
+                if kind not in allowed_requirement_types or not label or label.casefold() in seen_labels:
+                    errors.append("required_info")
+                    break
+                seen_labels.add(label.casefold())
+
+    if isinstance(bulk_pricing, str):
+        try:
+            bulk_pricing = json.loads(bulk_pricing)
+            if isinstance(bulk_pricing, str):
+                bulk_pricing = json.loads(bulk_pricing)
+        except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+            errors.append("bulk_pricing")
+    if bulk_pricing is not None:
+        if not isinstance(bulk_pricing, dict):
+            errors.append("bulk_pricing")
+        else:
+            for tier in bulk_pricing.values():
+                if not isinstance(tier, dict) or not {"min", "price"}.issubset(tier):
+                    errors.append("bulk_pricing")
+                    break
+                try:
+                    minimum = int(tier.get("min", 1))
+                    maximum = int(tier["max"]) if tier.get("max") is not None else None
+                    price = Decimal(str(tier.get("price", 0)))
+                    if minimum < 1 or (maximum is not None and maximum < minimum) or not price.is_finite() or price < 0:
+                        errors.append("bulk_pricing")
+                        break
+                except (ValueError, TypeError, InvalidOperation, OverflowError):
+                    errors.append("bulk_pricing")
+                    break
+
+    return sorted(set(errors))
+
+
 def _load_product_models_safely(query) -> list[Product]:
-    """Materialize product rows without letting one malformed JSON value abort the query."""
+    """Materialize rows safely; never erase purchase rules during a catalog read."""
     product_columns = list(Product.__table__.columns)
     json_fields = {
         column.name
@@ -899,16 +956,14 @@ def _load_product_models_safely(query) -> list[Product]:
         "required_info": list,
         "bulk_pricing": dict,
     }
-    allowed_requirement_types = {"email", "phone", "photo", "contact", "text"}
     products = []
-    repairs: dict[int, dict[str, tuple[object, object]]] = {}
     for row in rows:
         values = {
             column.name: row[index]
             for index, column in enumerate(product_columns)
         }
         invalid_fields = []
-        disabled_optional_fields = []
+        invalid_purchase_fields = []
         for field in json_fields:
             raw_value = values[field]
             if raw_value is None:
@@ -921,11 +976,8 @@ def _load_product_models_safely(query) -> list[Product]:
                 )
             except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
                 if field in {"required_info", "bulk_pricing"}:
-                    # Both settings are optional. Repair corrupt legacy values
-                    # to JSON null so one bad setting cannot hide the product.
                     values[field] = None
-                    disabled_optional_fields.append(field)
-                    repairs.setdefault(int(values["id"]), {})[field] = (raw_value, None)
+                    invalid_purchase_fields.append(field)
                 else:
                     invalid_fields.append(field)
                 continue
@@ -935,13 +987,9 @@ def _load_product_models_safely(query) -> list[Product]:
                 try:
                     parsed = json.loads(parsed)
                 except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
-                    parsed = None
-                if parsed is None:
                     values[field] = None
-                    disabled_optional_fields.append(field)
-                    repairs.setdefault(int(values["id"]), {})[field] = (raw_value, None)
+                    invalid_purchase_fields.append(field)
                     continue
-                repairs.setdefault(int(values["id"]), {})[field] = (raw_value, parsed)
             if parsed is None and field in {"required_info", "bulk_pricing"}:
                 # JSON literal null is already the valid empty configuration.
                 values[field] = None
@@ -950,8 +998,7 @@ def _load_product_models_safely(query) -> list[Product]:
             if expected_shape and not isinstance(parsed, expected_shape):
                 if field in {"required_info", "bulk_pricing"}:
                     values[field] = None
-                    disabled_optional_fields.append(field)
-                    repairs.setdefault(int(values["id"]), {})[field] = (raw_value, None)
+                    invalid_purchase_fields.append(field)
                 else:
                     invalid_fields.append(field)
                 continue
@@ -971,17 +1018,14 @@ def _load_product_models_safely(query) -> list[Product]:
                     seen_labels.add(label.casefold())
                     normalized.append({"type": kind, "label": label})
                 if not valid:
-                    # An unusable optional form cannot be reconstructed safely.
-                    # Clear it to the same state as the admin's explicit "skip".
                     values[field] = None
-                    disabled_optional_fields.append(field)
-                    repairs.setdefault(int(values["id"]), {})[field] = (raw_value, None)
+                    invalid_purchase_fields.append(field)
                     continue
                 parsed = normalized or None
             if field == "bulk_pricing" and parsed is not None:
                 valid = True
                 for tier in parsed.values():
-                    if not isinstance(tier, dict):
+                    if not isinstance(tier, dict) or not {"min", "price"}.issubset(tier):
                         valid = False
                         break
                     try:
@@ -996,15 +1040,14 @@ def _load_product_models_safely(query) -> list[Product]:
                         break
                 if not valid:
                     values[field] = None
-                    disabled_optional_fields.append(field)
-                    repairs.setdefault(int(values["id"]), {})[field] = (raw_value, None)
+                    invalid_purchase_fields.append(field)
                     continue
             values[field] = parsed
-        if disabled_optional_fields:
+        if invalid_purchase_fields:
             logger.warning(
-                "Disabled invalid optional product configuration product_id=%s fields=%s; safe defaults applied",
+                "Product remains visible but checkout is disabled for invalid configuration product_id=%s fields=%s",
                 values.get("id"),
-                ",".join(sorted(disabled_optional_fields)),
+                ",".join(sorted(set(invalid_purchase_fields))),
             )
         if invalid_fields:
             logger.error(
@@ -1013,32 +1056,9 @@ def _load_product_models_safely(query) -> list[Product]:
                 ",".join(sorted(invalid_fields)),
             )
             continue
-        products.append(Product(**values))
-
-    # Persist repairs only if the raw value still matches what this read saw;
-    # this avoids overwriting an admin edit that happened concurrently.
-    if repairs:
-        session = query.session
-        try:
-            for product_id, fields in repairs.items():
-                conditions = [Product.id == product_id]
-                normalized_fields = {}
-                for field, (old_value, new_value) in fields.items():
-                    conditions.append(cast(getattr(Product, field), String) == old_value)
-                    normalized_fields[field] = new_value
-                session.execute(
-                    update(Product).where(*conditions).values(**normalized_fields)
-                )
-            session.commit()
-            for product_id, fields in repairs.items():
-                logger.warning(
-                    "Auto-repaired invalid optional product JSON product_id=%s fields=%s",
-                    product_id,
-                    ",".join(sorted(fields)),
-                )
-        except Exception:
-            session.rollback()
-            logger.exception("Could not persist optional product JSON repairs; sanitized catalog values are still used")
+        product = Product(**values)
+        product._invalid_purchase_configuration = tuple(sorted(set(invalid_purchase_fields)))
+        products.append(product)
     return products
 
 
@@ -2582,6 +2602,22 @@ def _do_purchase(
             return {"error": "Product not found."}
         if not product.is_active:
             return {"error": "Product unavailable."}
+        configuration_errors = _purchase_configuration_errors(
+            product.required_info,
+            product.bulk_pricing,
+        )
+        if configuration_errors:
+            logger.error(
+                "Blocked purchase for invalid product configuration product_id=%s fields=%s",
+                product.id,
+                ",".join(configuration_errors),
+            )
+            return {
+                "error": (
+                    "product_unavailable: This product has an invalid purchase configuration. "
+                    "Please contact support."
+                )
+            }
         if not allow_preorder and (
             not bool(getattr(product, "api_enabled", False))
             or (getattr(product, "source", "own") or "own") != "own"
@@ -2863,6 +2899,22 @@ async def _do_reseller_purchase_unlocked(
         product = db.query(Product).filter(Product.id == product_id).first()
         if not product or not product.is_active:
             return {"error": "Product is no longer available."}
+        configuration_errors = _purchase_configuration_errors(
+            product.required_info,
+            product.bulk_pricing,
+        )
+        if configuration_errors:
+            logger.error(
+                "Blocked reseller purchase for invalid product configuration product_id=%s fields=%s",
+                product.id,
+                ",".join(configuration_errors),
+            )
+            return {
+                "error": (
+                    "Product configuration is invalid. Please contact support. "
+                    "Customer was not charged."
+                )
+            }
 
         if float(product.price) == 0:
             quantity = 1

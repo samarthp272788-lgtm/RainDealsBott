@@ -32,12 +32,26 @@ def _prepare_schema() -> None:
         if exists:
             return
 
-        connection.execute(
-            text(
-                "ALTER TABLE orders "
-                "ADD COLUMN admin_notification_sent_at DATETIME NULL"
+        try:
+            connection.execute(
+                text(
+                    "ALTER TABLE orders "
+                    "ADD COLUMN admin_notification_sent_at DATETIME NULL"
+                )
             )
-        )
+        except Exception:
+            # Another worker may have added the column after our first schema
+            # read. Ignore only that race; propagate other DDL failures.
+            exists = connection.execute(
+                text(
+                    "SELECT 1 FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() "
+                    "AND TABLE_NAME = 'orders' "
+                    "AND COLUMN_NAME = 'admin_notification_sent_at'"
+                )
+            ).first()
+            if not exists:
+                raise
         # Do not flood the group with historical orders on its first start.
         connection.execute(
             text(
@@ -117,15 +131,13 @@ async def order_notification_loop(bot) -> None:
         logger.warning("Admin order notifications are disabled: no group ID configured")
         return
 
-    try:
-        await asyncio.to_thread(_prepare_schema)
-    except Exception:
-        logger.exception("Could not prepare admin-order notification tracking")
-        return
-
     interval = getattr(config, "ADMIN_ORDER_NOTIFICATION_POLL_SECONDS", 5)
+    schema_ready = False
     while True:
         try:
+            if not schema_ready:
+                await asyncio.to_thread(_prepare_schema)
+                schema_ready = True
             orders = await asyncio.to_thread(_pending_orders)
             for order in orders:
                 await asyncio.to_thread(_queue_order, order, channel_id, bot.id)

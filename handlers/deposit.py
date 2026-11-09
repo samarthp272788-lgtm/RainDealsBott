@@ -1041,7 +1041,7 @@ def _create_invoice(telegram_id: int, amount_usdt: Decimal, network: str) -> dic
                           Deposit.status.in_(["waiting_hash", "pending"]),
                           Deposit.tx_hash.is_(None),
                           Deposit.invoice_expires_at > datetime.utcnow())
-                  .order_by(Deposit.id.desc()).first())
+                  .order_by(Deposit.id.desc()).with_for_update().first())
         if active:
             active.network = network
             active.invoice_usdt_amount = amount_usdt
@@ -1105,6 +1105,7 @@ def _submitted_invoice_from_db(db, telegram_id: int) -> dict | None:
             Deposit.tx_hash.isnot(None),
         )
         .order_by(Deposit.id.desc())
+        .with_for_update()
         .first()
     )
     if not deposit:
@@ -1152,7 +1153,9 @@ def _verification_pending_keyboard() -> InlineKeyboardMarkup:
 def _switch_invoice_network(deposit_id: int, network: str) -> bool:
     db = SessionLocal()
     try:
-        deposit = db.query(Deposit).filter(Deposit.id == deposit_id).first()
+        if network not in NETWORK_CALLBACKS.values():
+            return False
+        deposit = db.query(Deposit).filter(Deposit.id == deposit_id).with_for_update().first()
         if not deposit or deposit.status not in {"waiting_hash", "pending"} or deposit.tx_hash:
             return False
         if deposit.invoice_expires_at and deposit.invoice_expires_at <= datetime.utcnow():
@@ -1175,6 +1178,7 @@ def _cancel_invoice(deposit_id: int, telegram_id: int) -> str:
         deposit = (
             db.query(Deposit)
             .filter(Deposit.id == deposit_id, Deposit.telegram_id == telegram_id)
+            .with_for_update()
             .first()
         )
         if not deposit:
@@ -1243,7 +1247,7 @@ async def cancel_deposit(callback: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu")],
         ])
 
-    await show(
+    result_card = await show(
         callback,
         text,
         parse_mode="HTML",

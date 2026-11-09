@@ -4,6 +4,9 @@ from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.fsm.context import FSMContext
+from decimal import Decimal, InvalidOperation
+import logging
+from sqlalchemy.exc import SQLAlchemyError
 
 from config import ADMIN_IDS
 from database import SessionLocal
@@ -11,6 +14,7 @@ from models.product import Product
 from states.product_states import AddProduct
 
 router = Router()
+logger = logging.getLogger(__name__)
 
 
 def is_admin(user_id):
@@ -42,8 +46,13 @@ async def product_name(
         state: FSMContext
 ):
 
+    value = (message.text or "").strip()
+    if not value or len(value) > 255:
+        await answer_card(message, "❌ Enter a product name between 1 and 255 characters.")
+        return
+
     await state.update_data(
-        name=message.text
+        name=value
     )
 
     await state.set_state(
@@ -72,8 +81,13 @@ async def product_icon(
         state: FSMContext
 ):
 
+    value = (message.text or "").strip()
+    if not value or len(value) > 50:
+        await answer_card(message, "❌ Enter an icon or short label up to 50 characters.")
+        return
+
     await state.update_data(
-        icon=message.text
+        icon=value
     )
 
     await state.set_state(
@@ -92,8 +106,13 @@ async def product_description(
         state: FSMContext
 ):
 
+    value = message.text or message.caption or ""
+    if len(value) > 16000:
+        await answer_card(message, "❌ Description is too long. Keep it below 16,000 characters.")
+        return
+
     await state.update_data(
-        description=message.text
+        description=value
     )
 
     await state.set_state(
@@ -113,21 +132,18 @@ async def product_price(
 ):
 
     try:
-
-        price = float(
-            message.text
-        )
-
-    except:
-
+        price = Decimal((message.text or "").strip())
+        if not price.is_finite() or price < 0 or price > Decimal("999999999999.99999999"):
+            raise InvalidOperation
+    except (InvalidOperation, ValueError, TypeError):
         await answer_card(message,
-            "❌ Invalid price."
+            "❌ Enter a finite price from 0 up to 999,999,999,999.99999999."
         )
-
         return
 
     await state.update_data(
-        price=price
+        # FSM stores are often JSON-backed; keep Decimal lossless as text.
+        price=str(price)
     )
 
     await state.set_state(
@@ -146,8 +162,13 @@ async def product_category(
         state: FSMContext
 ):
 
+    value = (message.text or "").strip()
+    if not value or len(value) > 255:
+        await answer_card(message, "❌ Enter a category between 1 and 255 characters.")
+        return
+
     await state.update_data(
-        category=message.text
+        category=value
     )
 
     await state.set_state(
@@ -174,14 +195,19 @@ async def product_accounts(
         state: FSMContext
 ):
 
+    if not message.text:
+        await answer_card(message, "❌ Send account lines as text. No product was created.")
+        return
+
     accounts = []
+    seen_accounts = set()
 
     for line in message.text.splitlines():
 
         line = line.strip()
 
-        if line:
-
+        if line and line not in seen_accounts:
+            seen_accounts.add(line)
             accounts.append(
                 line
             )
@@ -198,7 +224,7 @@ async def product_accounts(
             name=data["name"],
             icon=data["icon"],
             description=data["description"],
-            price=data["price"],
+            price=Decimal(str(data["price"])),
             category=data["category"],
             stock=stock,
             file_content="\n".join(
@@ -209,6 +235,11 @@ async def product_accounts(
         db.add(product)
 
         db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Legacy add-product save failed for admin=%s", message.from_user.id)
+        await answer_card(message, "❌ Product could not be saved. Your setup is still open; please retry or cancel.")
+        return
 
     finally:
 

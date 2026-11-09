@@ -19,8 +19,10 @@ def is_maintenance_enabled() -> bool:
         setting = db.query(MaintenanceSetting).filter(MaintenanceSetting.id == 1).first()
         return bool(setting and setting.enabled)
     except Exception:
-        logger.exception("Could not read maintenance-mode setting; allowing normal operation")
-        return False
+        # A database outage must not silently disable an explicitly enabled
+        # maintenance lock. Admins are exempt in the middleware.
+        logger.exception("Could not read maintenance-mode setting; failing closed")
+        return True
     finally:
         db.close()
 

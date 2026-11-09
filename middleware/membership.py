@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import re
 import time
 from typing import Any, Awaitable, Callable
 
@@ -136,11 +137,19 @@ async def check_user_membership(
                 if "member list is inaccessible" in str(error).lower():
                     logger.error("Bot cannot inspect membership for %s (%s); add it as an administrator", name, chat_id)
                     return False, f"{name} (bot needs admin access)"
-                logger.exception("Membership verification failed for %s (%s)", name, chat_id)
-                return False, f"{name} (verification failed)"
+                logger.warning(
+                    "Membership verification attempt %s/%s failed for %s (%s): %s",
+                    attempt + 1,
+                    attempts,
+                    name,
+                    chat_id,
+                    type(error).__name__,
+                )
 
             if attempt < attempts - 1:
                 await asyncio.sleep(MEMBERSHIP_RETRY_DELAY_SECONDS)
+            else:
+                return False, f"{name} (verification failed)"
 
         return False, name
 
@@ -198,14 +207,20 @@ def _read_banned_user_cached(telegram_id: int) -> bool:
     return banned
 
 
-# These are the ONLY callback-data prefixes a banned user can use.
-# Adjust them to match the callback_data in your customer handlers.
-BANNED_READ_ONLY_CALLBACKS = (
-    # Change these only if your customer handlers use different callback_data.
-    "orders", "my_orders", "view_order_", "order_",
-    "support", "tickets", "ticket_", "view_ticket_",
-    "my_deposits", "deposit_history", "view_deposit_",
+# These are the ONLY exact callback values and anchored read-only patterns
+# a banned user can use. Never add a broad family prefix here.
+BANNED_READ_ONLY_CALLBACKS = frozenset({
+    "orders_menu",
+    "orders_view_all",
+    "support_menu",
+    "support_ticket",
+    "support_my_tickets",
     "contact_info",
+    "my_deposits",
+})
+BANNED_READ_ONLY_CALLBACK_PATTERNS = (
+    re.compile(r"order_(?:detail|receipt|share)_\d+\Z"),
+    re.compile(r"deposits_page_\d+\Z"),
 )
 
 # Prevents repeated restricted-account messages when a banned user types.
@@ -235,7 +250,11 @@ MEMBERSHIP_REQUIRED_TEXT = (
 
 
 def _is_banned_read_only_callback(callback_data: str | None) -> bool:
-    return bool(callback_data) and callback_data.startswith(BANNED_READ_ONLY_CALLBACKS)
+    if not callback_data:
+        return False
+    return callback_data in BANNED_READ_ONLY_CALLBACKS or any(
+        pattern.fullmatch(callback_data) for pattern in BANNED_READ_ONLY_CALLBACK_PATTERNS
+    )
 
 
 class BannedUserMiddleware(BaseMiddleware):

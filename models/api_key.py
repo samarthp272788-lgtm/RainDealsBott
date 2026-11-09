@@ -38,6 +38,9 @@ class ApiOrder(Base):
         Integer, ForeignKey("api_keys.id", ondelete="CASCADE"), nullable=False, index=True
     )
     client_order_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    # Binds a retry key to the exact purchase request. A client cannot reuse
+    # one idempotency key with different product, quantity, recipient, or data.
+    request_fingerprint: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     order_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("orders.id", ondelete="SET NULL"), nullable=True, index=True
     )

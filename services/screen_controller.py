@@ -29,10 +29,16 @@ MAX_SCREENS = 10000
 def get_screen(key):
     if key not in screens:
         if len(screens) >= MAX_SCREENS:
+            removed = False
             for old_key, old in list(screens.items()):
                 if not old.active and not old.lock.locked():
                     screens.pop(old_key)
+                    removed = True
                     break
+            if not removed:
+                # All entries are busy. Evict the least-recent one anyway;
+                # its handler will fail assert_current() before repainting.
+                screens.popitem(last=False)
         screens[key] = Screen()
     screens.move_to_end(key)
     return screens[key]
