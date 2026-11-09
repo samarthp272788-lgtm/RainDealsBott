@@ -18,7 +18,7 @@ from aiogram.types import (
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-from sqlalchemy import JSON, String, cast
+from sqlalchemy import JSON, String, cast, update
 from sqlalchemy.exc import SQLAlchemyError
 
 import config
@@ -898,7 +898,9 @@ def _load_product_models_safely(query) -> list[Product]:
         "required_info": list,
         "bulk_pricing": dict,
     }
+    allowed_requirement_types = {"email", "phone", "photo", "contact", "text"}
     products = []
+    repairs: dict[int, dict[str, tuple[object, object]]] = {}
     for row in rows:
         values = {
             column.name: row[index]
@@ -917,35 +919,89 @@ def _load_product_models_safely(query) -> list[Product]:
                     else raw_value
                 )
             except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
-                if field == "bulk_pricing":
-                    # Bulk pricing is optional. If old/corrupt JSON is stored,
-                    # disable the discounts and keep the product sellable at
-                    # its base price instead of hiding the entire product.
+                if field in {"required_info", "bulk_pricing"}:
+                    # Both settings are optional. Repair corrupt legacy values
+                    # to JSON null so one bad setting cannot hide the product.
                     values[field] = None
                     disabled_optional_fields.append(field)
+                    repairs.setdefault(int(values["id"]), {})[field] = (raw_value, None)
                 else:
                     invalid_fields.append(field)
                 continue
-            # Older product-creation handlers wrote JSON text into a JSON
-            # column, producing a JSON string whose contents are themselves
-            # an object. Unwrap that legacy representation before validating.
-            if field == "bulk_pricing" and isinstance(parsed, str):
+            # Older product-creation handlers sometimes wrote JSON text inside
+            # a JSON string. Unwrap either optional configuration field.
+            if field in {"required_info", "bulk_pricing"} and isinstance(parsed, str):
                 try:
                     parsed = json.loads(parsed)
                 except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
                     parsed = None
-            expected_shape = expected_json_shapes.get(field)
-            if expected_shape and not isinstance(parsed, expected_shape):
-                if field == "bulk_pricing":
+                if parsed is None:
                     values[field] = None
                     disabled_optional_fields.append(field)
+                    repairs.setdefault(int(values["id"]), {})[field] = (raw_value, None)
+                    continue
+                repairs.setdefault(int(values["id"]), {})[field] = (raw_value, parsed)
+            if parsed is None and field in {"required_info", "bulk_pricing"}:
+                # JSON literal null is already the valid empty configuration.
+                values[field] = None
+                continue
+            expected_shape = expected_json_shapes.get(field)
+            if expected_shape and not isinstance(parsed, expected_shape):
+                if field in {"required_info", "bulk_pricing"}:
+                    values[field] = None
+                    disabled_optional_fields.append(field)
+                    repairs.setdefault(int(values["id"]), {})[field] = (raw_value, None)
                 else:
                     invalid_fields.append(field)
                 continue
+            if field == "required_info" and parsed is not None:
+                normalized = []
+                seen_labels = set()
+                valid = len(parsed) <= 8
+                for item in parsed:
+                    if not isinstance(item, dict):
+                        valid = False
+                        break
+                    kind = str(item.get("type") or "text").strip().lower()
+                    label = str(item.get("label") or kind.title()).strip()[:100]
+                    if kind not in allowed_requirement_types or not label or label.casefold() in seen_labels:
+                        valid = False
+                        break
+                    seen_labels.add(label.casefold())
+                    normalized.append({"type": kind, "label": label})
+                if not valid:
+                    # An unusable optional form cannot be reconstructed safely.
+                    # Clear it to the same state as the admin's explicit "skip".
+                    values[field] = None
+                    disabled_optional_fields.append(field)
+                    repairs.setdefault(int(values["id"]), {})[field] = (raw_value, None)
+                    continue
+                parsed = normalized or None
+            if field == "bulk_pricing" and parsed is not None:
+                valid = True
+                for tier in parsed.values():
+                    if not isinstance(tier, dict):
+                        valid = False
+                        break
+                    try:
+                        minimum = int(tier.get("min", 1))
+                        maximum = int(tier["max"]) if tier.get("max") is not None else None
+                        price = Decimal(str(tier.get("price", 0)))
+                        if minimum < 1 or (maximum is not None and maximum < minimum) or not price.is_finite() or price < 0:
+                            valid = False
+                            break
+                    except (ValueError, TypeError, InvalidOperation, OverflowError):
+                        valid = False
+                        break
+                if not valid:
+                    values[field] = None
+                    disabled_optional_fields.append(field)
+                    repairs.setdefault(int(values["id"]), {})[field] = (raw_value, None)
+                    continue
             values[field] = parsed
         if disabled_optional_fields:
             logger.warning(
-                "Disabled invalid optional product configuration product_id=%s fields=%s; using base price",
+                "Disabled invalid optional product configuration product_id=%s fields=%s; safe defaults applied",
                 values.get("id"),
                 ",".join(sorted(disabled_optional_fields)),
             )
@@ -957,6 +1013,31 @@ def _load_product_models_safely(query) -> list[Product]:
             )
             continue
         products.append(Product(**values))
+
+    # Persist repairs only if the raw value still matches what this read saw;
+    # this avoids overwriting an admin edit that happened concurrently.
+    if repairs:
+        session = query.session
+        try:
+            for product_id, fields in repairs.items():
+                conditions = [Product.id == product_id]
+                normalized_fields = {}
+                for field, (old_value, new_value) in fields.items():
+                    conditions.append(cast(getattr(Product, field), String) == old_value)
+                    normalized_fields[field] = new_value
+                session.execute(
+                    update(Product).where(*conditions).values(**normalized_fields)
+                )
+            session.commit()
+            for product_id, fields in repairs.items():
+                logger.warning(
+                    "Auto-repaired invalid optional product JSON product_id=%s fields=%s",
+                    product_id,
+                    ",".join(sorted(fields)),
+                )
+        except Exception:
+            session.rollback()
+            logger.exception("Could not persist optional product JSON repairs; sanitized catalog values are still used")
     return products
 
 
