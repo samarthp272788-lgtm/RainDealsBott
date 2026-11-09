@@ -675,7 +675,7 @@ async function route(request,env){
         const inventoryTotal=regularCount+nextUnits,emptyAutomatic=inventoryTotal===0&&['automatic','hybrid'].includes(String(p.delivery_type||'').toLowerCase());
         const nextDelivery=emptyAutomatic?'manual':p.delivery_type,nextFallback=emptyAutomatic?1:Number(p.manual_fallback||0),nextPreorder=emptyAutomatic?0:null;
         const manual=Number(p.manual_fallback)||String(p.delivery_type||'')==='manual';
-        const nextStock=emptyAutomatic?(manual?Number(p.stock||0):0):manual?Math.max(Number(p.stock||0),inventoryTotal):inventoryTotal;
+        const nextStock=emptyAutomatic?Math.max(0,Number(p.stock||0)):manual?Math.max(Number(p.stock||0),inventoryTotal):inventoryTotal;
         await t.execute('UPDATE products SET reusable_delivery=?,reusable_stock=?,stock=?,delivery_type=?,manual_fallback=?,preorder=COALESCE(?,preorder),updated_at=UTC_TIMESTAMP() WHERE id=?',[nextContent||null,nextUnits,nextStock,nextDelivery,nextFallback,nextPreorder,id]);
         return{units:nextUnits,stock:nextStock,added:mode==='append'?quantity:mode==='clear'?0:quantity,switched_to_manual:emptyAutomatic};
       });
@@ -721,7 +721,7 @@ async function route(request,env){
   }
   if(action==='stock'&&name==='products'&&request.method==='POST'){
     const b=await body(request);if(!/^\d{1,9}$/.test(String(b.stock)))error('Stock must be a nonnegative whole number.');
-    await tx(env,async t=>{const p=(await t.execute('SELECT source,delivery_type,manual_fallback FROM products WHERE id=? FOR UPDATE',[id])).rows?.[0];if(!p)error('Product not found.',404);if(p.source!=='own'||(p.delivery_type==='automatic'&&!Number(p.manual_fallback)))error('Use account upload for automatic stock; supplier stock comes from the provider.');await t.execute('UPDATE products SET stock=?,updated_at=UTC_TIMESTAMP() WHERE id=?',[Number(b.stock),id]);});await audit(env,auth.admin_id,'update','product_stock',id,{stock:Number(b.stock)});return reply({success:true,message:'Manual stock updated.'});
+    let switchedToManual=false;await tx(env,async t=>{const p=(await t.execute('SELECT source,delivery_type,manual_fallback,file_content,reusable_delivery,reusable_stock FROM products WHERE id=? FOR UPDATE',[id])).rows?.[0];if(!p)error('Product not found.',404);if(p.source!=='own')error('Supplier stock is managed by its provider.');const mode=String(p.delivery_type||'automatic').toLowerCase(),accounts=String(p.file_content||'').split(/\r?\n/).filter(x=>x.trim()).length,shared=String(p.reusable_delivery||'').trim()?Number(p.reusable_stock||0):0,hasInventory=accounts+shared>0;if(['automatic','hybrid'].includes(mode)&&!hasInventory){switchedToManual=true;await t.execute("UPDATE products SET stock=?,delivery_type='manual',manual_fallback=1,preorder=0,updated_at=UTC_TIMESTAMP() WHERE id=?",[Number(b.stock),id]);return}if(['automatic','hybrid'].includes(mode)&&!Number(p.manual_fallback))error('Automatic stock is derived from uploaded accounts.');await t.execute('UPDATE products SET stock=?,updated_at=UTC_TIMESTAMP() WHERE id=?',[Number(b.stock),id]);});await audit(env,auth.admin_id,'update','product_stock',id,{stock:Number(b.stock),switched_to_manual:switchedToManual});return reply({success:true,message:switchedToManual?'Manual stock saved. No account inventory was loaded, so delivery switched to manual.':'Manual stock updated.'});
   }
   if(action==='link'&&name==='products'&&request.method==='GET')return reply({url:env.BOT_USERNAME?`https://t.me/${env.BOT_USERNAME}?start=product_${id}`:null,message:env.BOT_USERNAME?'Product link':'Main bot username is not configured.'});
   if(action==='accounts'&&name==='products'){
@@ -736,7 +736,7 @@ async function route(request,env){
         const sharedUnits=String(p.reusable_delivery||'').trim()?Number(p.reusable_stock||0):0,accountUnits=value?value.split(/\r?\n/).filter(x=>x.trim()).length:0,units=accountUnits+sharedUnits;
         const emptyAutomatic=units===0&&['automatic','hybrid'].includes(String(p.delivery_type||'').toLowerCase()),nextDelivery=emptyAutomatic?'manual':p.delivery_type,nextFallback=emptyAutomatic?1:Number(p.manual_fallback||0),nextPreorder=emptyAutomatic?0:null;
         const hadManualCapacity=Number(p.manual_fallback)||String(p.delivery_type||'').toLowerCase()==='manual';
-        const nextStock=emptyAutomatic?(hadManualCapacity?Number(p.stock||0):0):hadManualCapacity?Math.max(Number(p.stock||0),units):units;
+        const nextStock=emptyAutomatic?Math.max(0,Number(p.stock||0)):hadManualCapacity?Math.max(Number(p.stock||0),units):units;
         switchedToManual=emptyAutomatic;
         await t.execute('UPDATE products SET file_content=?,stock=?,delivery_type=?,manual_fallback=?,preorder=COALESCE(?,preorder),updated_at=UTC_TIMESTAMP() WHERE id=?',[value||null,nextStock,nextDelivery,nextFallback,nextPreorder,id]);
       });
@@ -778,17 +778,18 @@ async function route(request,env){
     }
     let keys=Object.keys(values);if(!keys.length)error('No editable values supplied.');
     if(id&&name==='products'&&'is_active'in values){const old=(await rows(env,'SELECT is_active FROM products WHERE id=?',[id]))[0];if(old&&Number(old.is_active)!==Number(values.is_active)&&b.confirm_sensitive!==true)error('Explicit confirmation is required to change product visibility.',403);}
+    let switchedToManual=false;
     if(name==='products'){
       await tx(env,async t=>{
-        const existing=id?(await t.execute('SELECT delivery_type,file_content,reusable_delivery,reusable_stock FROM products WHERE id=? FOR UPDATE',[id])).rows?.[0]:null;
+        const existing=id?(await t.execute('SELECT source,stock,delivery_type,file_content,reusable_delivery,reusable_stock FROM products WHERE id=? FOR UPDATE',[id])).rows?.[0]:null;
         if(id&&!existing)error('Product not found.',404);
         const effectiveDelivery=String(values.delivery_type??existing?.delivery_type??'automatic').toLowerCase();
-        if(['automatic','hybrid'].includes(effectiveDelivery)){
+        const effectiveSource=String(values.source??existing?.source??'own').toLowerCase();
+        if(effectiveSource==='own'&&['automatic','hybrid'].includes(effectiveDelivery)){
           const accountCount=String(existing?.file_content||'').split(/\r?\n/).filter(x=>x.trim()).length;
           const sharedCount=String(existing?.reusable_delivery||'').trim()?Number(existing?.reusable_stock||0):0;
           if(accountCount+sharedCount===0){
-            if(b.confirm_manual_no_inventory!==true)error('This product has no inventory. Confirm that every order should be sent to manual fulfillment.',409);
-            values.delivery_type='manual';values.manual_fallback=1;values.stock=Number(values.stock??existing?.stock??0);values.preorder=0;
+            switchedToManual=true;values.delivery_type='manual';values.manual_fallback=1;values.stock=Number(values.stock??existing?.stock??0);values.preorder=0;
           }
         }
         keys=Object.keys(values);
@@ -796,7 +797,7 @@ async function route(request,env){
         else await t.execute(`INSERT INTO \`${dbTable}\` (${keys.map(k=>'`'+k+'`').join(',')}) VALUES (${keys.map(()=>'?').join(',')})`,Object.values(values));
       });
     }else if(id)await db(env,`UPDATE \`${dbTable}\` SET ${keys.map(k=>'`'+k+'`=?').join(',')} WHERE id=?`,[...Object.values(values),id]);else await db(env,`INSERT INTO \`${dbTable}\` (${keys.map(k=>'`'+k+'`').join(',')}) VALUES (${keys.map(()=>'?').join(',')})`,Object.values(values));
-    await audit(env,auth.admin_id,id?'update':'create',name,id||null,{fields:keys});return reply({success:true,message:'Saved to the shared database. The main bot must read this data to apply changes.'});}
+    await audit(env,auth.admin_id,id?'update':'create',name,id||null,{fields:keys,switched_to_manual:switchedToManual});return reply({success:true,message:switchedToManual?'Saved. No account inventory is loaded, so delivery was switched to manual.':'Saved to the shared database. The main bot must read this data to apply changes.'});}
   error('Action is not configured.',405);
 }
 export default {async fetch(request,env){try{const response=await route(request,env);const headers=new Headers(response.headers);headers.set('cache-control','no-store');headers.set('x-content-type-options','nosniff');headers.set('x-frame-options','DENY');headers.set('referrer-policy','no-referrer');headers.set('content-security-policy',"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");return new Response(response.body,{status:response.status,headers});}catch(e){if(!e.status)console.error('manager_request_failed',String(e.message).replace(/(password|token|secret)[^ ]*/gi,'[redacted]').slice(0,120));return reply({error:e.status?e.message:'Database operation failed. Check the schema and Worker service bindings.'},e.status||503);}},async scheduled(_event,env){try{await cleanExpiredManagerLinkCards(env)}catch(e){console.error('manager_link_expiry_cleanup_failed',String(e?.message||'unknown').slice(0,120))}}};

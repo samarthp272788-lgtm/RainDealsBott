@@ -22,6 +22,7 @@ Important:
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import time
 from contextlib import contextmanager
@@ -45,6 +46,30 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+
+_invalid_json_warning_logged = False
+
+
+def _safe_json_deserializer(value):
+    """Read legacy JSON columns without letting one bad value crash the bot.
+
+    TiDB can contain older empty/non-JSON strings in columns that the ORM now
+    maps as JSON. Treat only those malformed values as NULL at read time and
+    never include their contents in logs. New writes still use SQLAlchemy's
+    normal JSON serializer.
+    """
+    global _invalid_json_warning_logged
+    if value is None:
+        return None
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError, UnicodeDecodeError):
+        if not _invalid_json_warning_logged:
+            logger.warning(
+                "Invalid JSON returned by the database; treating malformed JSON values as NULL during reads."
+            )
+            _invalid_json_warning_logged = True
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +108,7 @@ logger.info(
 
 engine = create_engine(
     DATABASE_URL,
+    json_deserializer=_safe_json_deserializer,
 
     # Verify pooled connections before using them.
     pool_pre_ping=True,

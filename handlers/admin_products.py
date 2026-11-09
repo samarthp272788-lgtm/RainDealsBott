@@ -1819,17 +1819,14 @@ async def save_product(message: Message, state: FSMContext):
 async def product_empty_inventory(message: Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         return
-    raw = (message.text or "").strip().lower()
-    if raw not in {"yes", "no"}:
-        await answer_card(message, "No inventory is available. Send yes to make the product manual for every order, or no to save it blocked until stock is added.")
-        return
-    await state.update_data(empty_inventory_decided=True)
-    if raw == "yes":
-        await state.update_data(delivery_type="manual", manual_fallback=True)
-    else:
-        # A rejected empty-automatic setup must stay unavailable even if
-        # manual fallback or preorder was selected in an earlier step.
-        await state.update_data(manual_fallback=False, preorder=False)
+    # Compatibility for admins who were already in this older FSM state
+    # during deployment: empty automatic products now switch automatically.
+    await state.update_data(
+        empty_inventory_decided=True,
+        delivery_type="manual",
+        manual_fallback=True,
+        preorder=False,
+    )
     await _finish_own_product(message, state)
 
 
@@ -1850,16 +1847,22 @@ async def _finish_own_product(message, state):
     data = await state.get_data()
     accounts = data.get("draft_accounts", [])
     file_content = "\n".join(accounts)
-    if not accounts and data.get("delivery_type") in {"automatic", "hybrid"} and not data.get("empty_inventory_decided"):
-        await state.set_state(AddProduct.empty_inventory)
-        await answer_card(message, "⚠️ No automatic inventory is configured.\n\n"
-                          "Send yes to continue with MANUAL delivery. Every order will be marked manual and sent to the fulfillment queue; it will not be auto-delivered.\n\n"
-                          "Send no to keep this product unavailable until inventory is added.")
-        return
+    if not accounts and data.get("delivery_type") in {"automatic", "hybrid"}:
+        await state.update_data(
+            delivery_type="manual",
+            manual_fallback=True,
+            preorder=False,
+            empty_inventory_decided=True,
+        )
+        data = await state.get_data()
     if (data.get("manual_fallback") or data.get("delivery_type") == "manual") and "stock_capacity" not in data:
         await state.set_state(AddProduct.stock_capacity)
-        await answer_card(message, f"Uploaded accounts: {len(accounts)}\nEnter order capacity, e.g. 1000.\n"
-                          "Accounts deliver first; the team completes the rest.")
+        mode_notice = (
+            "No account inventory was added, so this product was switched to MANUAL automatically.\n\n"
+            if not accounts and data.get("empty_inventory_decided") else ""
+        )
+        await answer_card(message, mode_notice + f"Uploaded accounts: {len(accounts)}\nEnter order capacity, e.g. 1000.\n"
+                          "Orders will enter the manual fulfillment queue.")
         return
     # Save to database
     db = SessionLocal()

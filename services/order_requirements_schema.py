@@ -108,6 +108,18 @@ def ensure_order_requirements_schema() -> None:
         _ensure_column(connection, "products", "manual_fallback", "TINYINT(1) NOT NULL DEFAULT 0")
         if not fallback_exists:
             connection.execute(text("UPDATE products SET manual_fallback=1 WHERE delivery_type IN ('manual','hybrid')"))
+        # Normalize legacy own products that advertise automatic/hybrid
+        # delivery without separate or reusable account inventory. Keep the
+        # configured stock as manual sellable capacity and avoid prompting an
+        # admin during startup. This runs after manual_fallback is guaranteed
+        # to exist on older databases.
+        connection.execute(text(
+            "UPDATE products SET delivery_type='manual', manual_fallback=1, preorder=0 "
+            "WHERE COALESCE(source,'own')='own' "
+            "AND LOWER(COALESCE(delivery_type,'automatic')) IN ('automatic','hybrid') "
+            "AND TRIM(COALESCE(file_content,''))='' "
+            "AND (TRIM(COALESCE(reusable_delivery,''))='' OR COALESCE(reusable_stock,0)<=0)"
+        ))
         _ensure_column(connection, "orders", "reserved_delivery", "TEXT NULL")
         _ensure_column(connection, "orders", "reusable_delivery_account", "TEXT NULL")
         _ensure_column(connection, "orders", "reusable_delivery_quantity", "INT NOT NULL DEFAULT 0")

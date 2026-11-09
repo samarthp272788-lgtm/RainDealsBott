@@ -1049,7 +1049,23 @@ def _commit_account_replacement(product_id: int, lines: list[str], admin_id: int
             return {"error": "Product not found."}
         previous_count = len([line for line in (product.file_content or "").splitlines() if line.strip()])
         product.file_content = "\n".join(lines)
-        product.stock = max(product.stock or 0, len(lines)) if manual_allowed(product) else len(lines)
+        reusable_content = str(getattr(product, "reusable_delivery", "") or "").strip()
+        reusable_units = max(0, int(getattr(product, "reusable_stock", 0) or 0)) if reusable_content else 0
+        inventory_total = len(lines) + reusable_units
+        if (
+            product.source == "own"
+            and (product.delivery_type or "automatic").lower() in {"automatic", "hybrid"}
+            and inventory_total == 0
+        ):
+            product.delivery_type = "manual"
+            product.manual_fallback = True
+            product.preorder = False
+            # The stock field is the manual order capacity once delivery is
+            # switched, so preserve its configured value even if it was
+            # previously treated as automatic stock.
+            product.stock = max(0, int(product.stock or 0))
+        else:
+            product.stock = max(product.stock or 0, inventory_total) if manual_allowed(product) else inventory_total
         db.add(AdminAuditLog(
             admin_telegram_id=int(admin_id), action="replace_stock_accounts",
             entity_type="product", entity_id=str(product.id),
@@ -1105,7 +1121,7 @@ async def clear_accounts(callback: CallbackQuery):
             product.delivery_type = "manual"
             product.manual_fallback = True
             product.preorder = False
-            product.stock = int(product.stock or 0) if had_manual_capacity else 0
+            product.stock = max(0, int(product.stock or 0))
         elif had_manual_capacity:
             product.stock = max(int(product.stock or 0), int(getattr(product, "reusable_stock", 0) or 0))
         else:
@@ -1203,11 +1219,17 @@ async def cycle_delivery_type(callback: CallbackQuery):
         except ValueError:
             next_index = 0
         next_delivery_type = DELIVERY_TYPES[next_index]
-        if next_delivery_type in {"automatic", "hybrid"} and not _has_delivery_inventory(product):
-            await _ask_to_switch_empty_product_to_manual(callback, pid)
-            await callback.answer()
-            return
-        product.delivery_type = next_delivery_type
+        switched_to_manual = (
+            product.source == "own"
+            and next_delivery_type in {"automatic", "hybrid"}
+            and not _has_delivery_inventory(product)
+        )
+        if switched_to_manual:
+            product.delivery_type = "manual"
+            product.manual_fallback = True
+            product.preorder = False
+        else:
+            product.delivery_type = next_delivery_type
         db.commit()
         invalidate_products_cache()
 
@@ -1215,7 +1237,10 @@ async def cycle_delivery_type(callback: CallbackQuery):
     finally:
         db.close()
 
-    await callback.answer(f"🚚 Delivery set to {new_label}")
+    await callback.answer(
+        "No account inventory; switched to manual delivery."
+        if switched_to_manual else f"🚚 Delivery set to {new_label}"
+    )
     await _refresh_manage_panel(callback, pid)
 
 
@@ -1280,25 +1305,29 @@ async def toggle_manual_fallback(callback: CallbackQuery):
             product = db.query(Product).filter(Product.id == pid).with_for_update().first()
             if not product or product.source != "own":
                 return False
-            enabling = not bool(product.manual_fallback)
-            if (enabling and (product.delivery_type or "automatic").lower() in {"automatic", "hybrid"}
-                    and not _has_delivery_inventory(product)):
-                return "confirm_manual"
-            product.manual_fallback = not product.manual_fallback
+            switched_to_manual = (
+                (product.delivery_type or "automatic").lower() in {"automatic", "hybrid"}
+                and not _has_delivery_inventory(product)
+            )
+            if switched_to_manual:
+                product.delivery_type = "manual"
+                product.manual_fallback = True
+                product.preorder = False
+            else:
+                product.manual_fallback = not product.manual_fallback
             db.commit()
-            return True
+            return "switched_to_manual" if switched_to_manual else True
         finally:
             db.close()
     result = await asyncio.to_thread(save)
-    if result == "confirm_manual":
-        await _ask_to_switch_empty_product_to_manual(callback, pid)
-        await callback.answer()
-        return
     if not result:
         await callback.answer("Local product not found.", show_alert=True)
         return
     invalidate_products_cache()
-    await callback.answer("Manual fallback updated.")
+    await callback.answer(
+        "No account inventory; product switched to manual."
+        if result == "switched_to_manual" else "Manual fallback updated."
+    )
     await _refresh_manage_panel(callback, pid)
 
 
@@ -1838,11 +1867,21 @@ async def set_stock(message: Message):
             await answer_card(message, "❌ Product not found.")
             return
         delivery_type = (product.delivery_type or "automatic").lower()
-        if not manual_allowed(product) and not getattr(product, "reseller_service_id", None):
+        switched_to_manual = False
+        if (
+            product.source == "own"
+            and delivery_type in {"automatic", "hybrid"}
+            and not _has_delivery_inventory(product)
+        ):
+            product.delivery_type = "manual"
+            product.manual_fallback = True
+            product.preorder = False
+            switched_to_manual = True
+        elif not manual_allowed(product) and not getattr(product, "reseller_service_id", None):
             await answer_card(message,
                 "ℹ️ This product delivers automatically from loaded accounts, "
-                "so stock is derived from the account list. Setting manual stock "
-                "requires enabling Manual fallback in the product first."
+                "so stock is derived from the account list. Manual stock is "
+                "used only after the product is set to manual delivery."
             )
             return
         previous_stock = int(product.stock or 0)
@@ -1863,7 +1902,12 @@ async def set_stock(message: Message):
     except Exception:
         logger.exception("Failed to send stock notification after /setstock")
 
-    await answer_card(message, f"✅ Stock updated to <b>{stock}</b>.", parse_mode="HTML")
+    await answer_card(
+        message,
+        f"✅ Stock updated to <b>{stock}</b>."
+        + (" Delivery switched to MANUAL because no account inventory is loaded." if switched_to_manual else ""),
+        parse_mode="HTML",
+    )
 
 
 @router.message(Command("setthreshold"))
