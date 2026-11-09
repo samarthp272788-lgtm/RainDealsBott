@@ -28,6 +28,7 @@ from database import SessionLocal, transaction, retry_on_write_conflict
 from models.product import Product
 from models.user import User
 from models.order import Order
+from models.order_requirement_submission import OrderRequirementSubmission
 from models.product_engagement import ProductEngagement
 from models.custom_rate import CustomRate
 from models.rate_control import ProductRateControl, RateControlAssignment
@@ -35,7 +36,7 @@ from services.fulfillment_policy import order_capacity, manual_allowed, plan_del
 from services.checkout_actions import confirmation_token, action_key, claim_checkout, finish_checkout, recover_checkout
 from services.order_workflow import record_event
 from services.warranty import start_coverage, policy_snapshot, policy_label
-from services.input_forms import quantity as parse_quantity, is_cancel, InputError
+from services.input_forms import quantity as parse_quantity, is_cancel, InputError, api_requirement_values
 from services.notification_outbox import enqueue, enqueue_once
 
 # Reseller Manager & Reseller Config imports
@@ -2340,6 +2341,8 @@ def _do_purchase(
     delivery_telegram_id: int | None = None,
     checkout_key: str | None = None,
     expected_total: str | None = None,
+    buyer_info: dict | None = None,
+    require_buyer_info: bool = False,
 ) -> dict:
     with transaction() as db:
         user = db.query(User).filter(User.telegram_id == telegram_id).with_for_update().first()
@@ -2426,6 +2429,12 @@ def _do_purchase(
         delivered_accounts = list(plan.automatic)
         reserved_delivery = []
         required_info = product.required_info if isinstance(product.required_info, list) else []
+        requirement_submission = None
+        if require_buyer_info:
+            try:
+                requirement_submission = api_requirement_values(required_info, buyer_info)
+            except InputError as exc:
+                return {"error": f"buyer_info_invalid: {exc}"}
         is_preorder_order = plan.preorder
         new_stock = plan.stock_after
         if not plan.preorder:
@@ -2447,10 +2456,10 @@ def _do_purchase(
                 product.delivery_type = "manual"
                 product.manual_fallback = True
                 product.preorder = False
-        if required_info:
+        if required_info and not require_buyer_info:
             reserved_delivery = delivered_accounts
             delivered_accounts = []
-        status = "pending_info" if required_info else (
+        status = "pending_info" if required_info and not require_buyer_info else (
             "preorder" if plan.preorder else "pending_manual" if plan.manual_quantity else "completed"
         )
 
@@ -2477,7 +2486,15 @@ def _do_purchase(
             start_coverage(order)
         db.add(order)
         db.flush()
+        if requirement_submission is not None:
+            db.add(OrderRequirementSubmission(
+                order_id=order.id,
+                telegram_id=telegram_id,
+                values=requirement_submission,
+            ))
         record_event(db, order.id, 'created', 'Order received.', actor_id=telegram_id)
+        if requirement_submission is not None:
+            record_event(db, order.id, 'information', 'Buyer information received through reseller API.', actor_id=telegram_id)
         if status == 'pending_info':
             record_event(db, order.id, 'awaiting_information', 'Waiting for customer information.')
         elif plan.automatic:
@@ -2549,6 +2566,8 @@ async def _do_reseller_purchase(
     progress_callback=None,
     checkout_key: str | None = None,
     expected_total: str | None = None,
+    buyer_info: dict | None = None,
+    require_buyer_info: bool = False,
 ) -> dict:
     """Serialize purchases for one supplier service within this bot process."""
     def _lock_identity():
@@ -2574,6 +2593,8 @@ async def _do_reseller_purchase(
             progress_callback=progress_callback,
             checkout_key=checkout_key,
             expected_total=expected_total,
+            buyer_info=buyer_info,
+            require_buyer_info=require_buyer_info,
         )
 
 
@@ -2584,6 +2605,8 @@ async def _do_reseller_purchase_unlocked(
     progress_callback=None,
     checkout_key: str | None = None,
     expected_total: str | None = None,
+    buyer_info: dict | None = None,
+    require_buyer_info: bool = False,
 ) -> dict:
     async def report_progress(percent: int, stage: str) -> None:
         if progress_callback is None:
@@ -2607,6 +2630,14 @@ async def _do_reseller_purchase_unlocked(
 
         if getattr(product, "source", "own") != "reseller":
             return {"error": "Invalid product source."}
+
+        required_info = product.required_info if isinstance(product.required_info, list) else []
+        requirement_submission = None
+        if require_buyer_info:
+            try:
+                requirement_submission = api_requirement_values(required_info, buyer_info)
+            except InputError as exc:
+                return {"error": f"buyer_info_invalid: {exc}"}
 
         service_id = str(getattr(product, "reseller_service_id", "") or "").strip()
         if not service_id:
@@ -2814,6 +2845,7 @@ async def _do_reseller_purchase_unlocked(
                 amount=total_amount,
                 quantity=quantity,
                 delivery_type=order_delivery_type,
+                required_info_snapshot=[dict(item) for item in required_info if isinstance(item, dict)] or None,
                 automatic_quantity=delivered_units,
                 manual_pending_quantity=manual_pending_quantity,
                 is_preorder=False,
@@ -2826,11 +2858,19 @@ async def _do_reseller_purchase_unlocked(
             )
             db.add(order)
             db.flush()
+            if requirement_submission is not None:
+                db.add(OrderRequirementSubmission(
+                    order_id=order.id,
+                    telegram_id=telegram_id,
+                    values=requirement_submission,
+                ))
             for field, value in saved_aftercare.items():
                 setattr(order, field, value)
             if order.status == "completed":
                 start_coverage(order)
             record_event(db, order.id, 'created', 'Supplier order received.', actor_id=telegram_id)
+            if requirement_submission is not None:
+                record_event(db, order.id, 'information', 'Buyer information received through reseller API.', actor_id=telegram_id)
             event_kind = 'supplier_pending' if is_async_provider_order else 'supplier_partial' if partial_delivery else 'completed'
             event_summary = (
                 'Supplier is processing the order.' if is_async_provider_order else

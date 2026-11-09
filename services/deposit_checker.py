@@ -53,6 +53,7 @@ from email.header import decode_header
 from typing import Optional, Union
 
 import requests
+from sqlalchemy import func
 
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
@@ -308,11 +309,9 @@ PAY_TRANSACTION_MATCH_FIELDS = (
     "merchantTradeNo",
 )
 
-BINANCE_PAY_ACCEPTED_CURRENCIES = getattr(
-    config,
-    "BINANCE_PAY_ACCEPTED_CURRENCIES",
-    ["USDT", "BUSD", "USDC"],
-)
+# Wallet accounting is denominated in USDT. Do not credit other assets at
+# face value unless an explicit, verified conversion is implemented.
+BINANCE_PAY_ACCEPTED_CURRENCIES = {"USDT"}
 
 try:
     BINANCE_PAY_LOOKBACK_DAYS = int(
@@ -415,8 +414,7 @@ AMOUNT_RE = re.compile(
 )
 
 RECEIVED_AMOUNT_RE = re.compile(
-    r"(?:Received|Credited|Payment\s+of|"
-    r"Amount\s+Received|Paid)"
+    r"(?:Received|Credited|Amount\s+Received)"
     r"[:\s]*"
     r"(?:₹|Rs\.?|INR)?\s*"
     r"([\d,]+(?:\.\d{1,2})?)",
@@ -444,6 +442,12 @@ TRANSFER_TOPIC = Web3.keccak(
 # ================================================================
 
 _check_attempts: dict[int, int] = {}
+
+# Pending deposits are scanned in bounded, rotating batches so the checker
+# does not load the entire table or starve newer rows behind old pending ones.
+_pending_deposit_cursor = 0
+_pending_deposit_scan_ceiling: int | None = None
+PENDING_DEPOSIT_BATCH_SIZE = 25
 
 _binance_client: Optional[Client] = None
 
@@ -1119,7 +1123,7 @@ def _match_binance_row(
         requested_amount: Optional[Decimal],
         claim_started_at: Optional[datetime] = None,
 ):
-    row = next((item for item in rows if str(
+    row = next((item for item in rows if isinstance(item, dict) and str(
         item.get("txId") or item.get("txid") or ""
     ).lower() == tx_hash.lower()), None)
 
@@ -1131,10 +1135,14 @@ def _match_binance_row(
     # ------------------------------------------------------------
 
     try:
-        status = int(
-            row.get("status", -1)
-        )
-    except Exception:
+        raw_status = row.get("status", -1)
+        if isinstance(raw_status, bool):
+            raise ValueError("boolean is not a Binance status code")
+        status_number = Decimal(str(raw_status))
+        if not status_number.is_finite() or status_number != status_number.to_integral_value():
+            raise ValueError("non-integral Binance status code")
+        status = int(status_number)
+    except (InvalidOperation, TypeError, ValueError, OverflowError):
         status = -1
 
     if status in {0, 6, 8}:
@@ -1146,9 +1154,13 @@ def _match_binance_row(
         )
         return None
 
-    if status != 1:
-        logger.warning("[%s] Binance rejected deposit tx=%s status=%s", chain.name, tx_hash[:18], status)
-        return False
+    if status == 1:
+        pass
+    else:
+        # Do not terminally fail a deposit for an unknown status code; Binance
+        # may add or change status values. Only an explicit success can credit.
+        logger.warning("[%s] Binance deposit status is not a verified success tx=%s status=%s", chain.name, tx_hash[:18], status)
+        return None
 
     # A recent deposit may be claimed for up to 72 hours after it was made,
     # measured against the time this user submitted its TXID.
@@ -1158,13 +1170,20 @@ def _match_binance_row(
             chain.name,
             tx_hash[:18],
         )
-        return False
+        return None
     try:
         insert_time_ms = int(row.get("insertTime"))
         record_time = datetime.fromtimestamp(insert_time_ms / 1000, tz=timezone.utc).replace(tzinfo=None)
         claim_time = claim_started_at
         if claim_time.tzinfo is not None:
             claim_time = claim_time.astimezone(timezone.utc).replace(tzinfo=None)
+        if record_time > datetime.utcnow() + timedelta(minutes=5):
+            logger.warning(
+                "[%s] Binance deposit timestamp is unexpectedly in the future; leaving pending | tx=%s",
+                chain.name,
+                tx_hash[:18],
+            )
+            return None
         if record_time < claim_time - BINANCE_CLAIM_WINDOW:
             logger.warning(
                 "[%s] Binance deposit is older than the claim window | tx=%s",
@@ -1178,7 +1197,7 @@ def _match_binance_row(
             chain.name,
             tx_hash[:18],
         )
-        return False
+        return None
 
     # ------------------------------------------------------------
     # Coin
@@ -1190,7 +1209,10 @@ def _match_binance_row(
         or ""
     ).upper()
     allowed_coins = {str(coin).upper() for coin in DEPOSIT_COINS}
-    if not binance_coin or binance_coin not in allowed_coins:
+    if not binance_coin:
+        logger.warning("[%s] Binance deposit record has no asset; leaving pending | tx=%s", chain.name, tx_hash[:18])
+        return None
+    if binance_coin not in allowed_coins:
         logger.warning(
             "[%s] Binance deposit asset is not allowed | tx=%s coin=%s",
             chain.name,
@@ -1213,7 +1235,10 @@ def _match_binance_row(
         or ""
     ).upper()
 
-    if not expected_network or row_network != expected_network:
+    if not expected_network or not row_network:
+        logger.warning("[%s] Binance deposit record/config has no network; leaving pending | tx=%s", chain.name, tx_hash[:18])
+        return None
+    if row_network != expected_network:
         logger.warning(
             "[%s] NETWORK MISMATCH | Binance=%s expected=%s",
             chain.name,
@@ -1236,7 +1261,10 @@ def _match_binance_row(
             chain.address or ""
     ).lower()
 
-    if not expected_address or not binance_address or binance_address != expected_address:
+    if not expected_address or not binance_address:
+        logger.warning("[%s] Binance deposit record/config has no address; leaving pending | tx=%s", chain.name, tx_hash[:18])
+        return None
+    if binance_address != expected_address:
         logger.warning(
             "[%s] ADDRESS MISMATCH",
             chain.name,
@@ -1261,11 +1289,12 @@ def _match_binance_row(
 
     except Exception:
 
-        return False
+        logger.warning("[%s] Binance deposit record has an invalid amount; leaving pending | tx=%s", chain.name, tx_hash[:18])
+        return None
 
-    if binance_amount <= 0:
-        logger.warning("[%s] Binance reported non-positive deposit amount | tx=%s", chain.name, tx_hash[:18])
-        return False
+    if not binance_amount.is_finite() or binance_amount <= 0:
+        logger.warning("[%s] Binance reported an invalid deposit amount; leaving pending | tx=%s", chain.name, tx_hash[:18])
+        return None
 
     if requested_amount is not None and requested_amount > 0 and binance_amount < requested_amount - AMOUNT_TOLERANCE:
         logger.warning(
@@ -1275,7 +1304,17 @@ def _match_binance_row(
             binance_amount,
             requested_amount,
         )
-        return False
+        # This is a genuine, successful transfer, but it does not meet the
+        # invoice amount. Preserve it for staff review rather than closing the
+        # invoice and making the received funds disappear from the workflow.
+        return {
+            "underpaid": True,
+            "binance_status": status,
+            "binance_amount": binance_amount,
+            "binance_coin": binance_coin,
+            "binance_network": row_network,
+            "binance_address": binance_address,
+        }
 
     # ------------------------------------------------------------
     # Everything matches
@@ -1357,6 +1396,15 @@ async def verify_transaction(
 
     if binance_result is False:
         return False
+
+    if isinstance(binance_result, dict) and binance_result.get("underpaid"):
+        return {
+            "underpaid": True,
+            "amount": binance_result["binance_amount"],
+            "coin": binance_result["binance_coin"],
+            "network": binance_result["binance_network"],
+            "binance_status": binance_result["binance_status"],
+        }
 
     # ------------------------------------------------------------
     # FINAL RESULT
@@ -1467,58 +1515,17 @@ def _extract_amount(
         RECEIVED_AMOUNT_RE.finditer(text)
     )
 
-    if matches:
-
-        if near_pos is not None:
-
-            best = min(
-                matches,
-                key=lambda m: abs(
-                    m.start(1)
-                    - near_pos
-                ),
-            )
-
-            value = to_decimal(
-                best.group(1)
-            )
-
-            if value is not None:
-                return value
-
-        value = to_decimal(
-            matches[0].group(1)
-        )
-
-        if value is not None:
-            return value
+    # Do not guess when the receipt has multiple received/credited amounts.
+    # Ambiguous bank messages remain pending for manual review.
+    if len(matches) == 1:
+        return to_decimal(matches[0].group(1))
 
     matches = list(
         AMOUNT_RE.finditer(text)
     )
 
-    if matches:
-
-        if near_pos is not None:
-
-            best = min(
-                matches,
-                key=lambda m: abs(
-                    m.start()
-                    - near_pos
-                ),
-            )
-
-            value = to_decimal(
-                best.group(1)
-            )
-
-            if value is not None:
-                return value
-
-        return to_decimal(
-            matches[0].group(1)
-        )
+    if len(matches) == 1:
+        return to_decimal(matches[0].group(1))
 
     return None
 
@@ -1671,11 +1678,28 @@ def _fetch_famapp_matches() -> dict:
                 f"{_get_body(msg)}"
             )
 
+            normalized_text = full.casefold()
+            # The configured sender alone is not enough: receipt emails can
+            # include outgoing or failed transfers as well. Credit only clear
+            # incoming receipt language and refuse failure/reversal messages.
+            incoming_markers = (
+                "received", "credited", "amount received", "money received",
+                "added to your account", "deposited to your account",
+            )
+            negative_markers = (
+                "failed", "failure", "declined", "pending", "reversed",
+                "refunded", "refund", "debited", "sent to", "paid to",
+            )
+            if not any(marker in normalized_text for marker in incoming_markers):
+                continue
+            if any(marker in normalized_text for marker in negative_markers):
+                continue
+
             data = _extract_upi_identifiers(
                 full
             )
 
-            if data["amount"] is None:
+            if data["amount"] is None or not data["amount"].is_finite() or data["amount"] <= 0:
                 continue
 
             utr = data["utr"]
@@ -1690,15 +1714,20 @@ def _fetch_famapp_matches() -> dict:
                 "txn_id": txn_id,
             }
 
-            if utr:
-                matches[
-                    utr.upper()
-                ] = payment
+            def add_match(key):
+                if not key:
+                    return
+                normalized_key = key.upper()
+                previous = matches.get(normalized_key)
+                if previous is not None and previous != payment:
+                    # Conflicting provider emails for one reference are not
+                    # safe to resolve by whichever message happened last.
+                    matches[normalized_key] = None
+                elif normalized_key not in matches:
+                    matches[normalized_key] = payment
 
-            if txn_id:
-                matches[
-                    txn_id.upper()
-                ] = payment
+            add_match(utr)
+            add_match(txn_id)
 
         return matches
 
@@ -1904,13 +1933,18 @@ def _match_pay_transaction(
         order_id: str,
         rows: list[dict],
 ):
+    success_statuses = {"success", "successful", "completed", "complete", "paid", "confirmed", "1"}
+    status_fields = ("status", "transactionStatus", "transaction_status", "payStatus", "pay_status")
+    amount_fields = ("amount", "totalFee", "total_fee")
+
     for row in rows:
 
+        if not isinstance(row, dict):
+            continue
+
         matched = any(
-            str(
-                row.get(field)
-            )
-            == str(order_id)
+            str(row.get(field)).strip().casefold()
+            == str(order_id).strip().casefold()
             for field in PAY_TRANSACTION_MATCH_FIELDS
             if row.get(field)
             is not None
@@ -1919,18 +1953,21 @@ def _match_pay_transaction(
         if not matched:
             continue
 
+        # The invoice's unique merchant/order reference identifies the payment.
+        # Require an explicit successful payment status; do not rely on a
+        # direction field that Binance Pay's documented order response omits.
+        status_value = next((row.get(field) for field in status_fields if row.get(field) is not None), None)
+        if status_value is None:
+            logger.warning("Binance Pay match lacks payment status; leaving deposit pending")
+            continue
+        if str(status_value).strip().casefold() not in success_statuses:
+            continue
+
         try:
+            amount_value = next((row.get(field) for field in amount_fields if row.get(field) is not None), None)
+            amount = Decimal(str(amount_value))
 
-            amount = Decimal(
-                str(
-                    row.get(
-                        "amount",
-                        "0",
-                    )
-                )
-            )
-
-            if amount > 0:
+            if amount.is_finite() and amount > 0:
                 return row
 
         except Exception:
@@ -1968,19 +2005,24 @@ async def verify_binance_pay_order(
     }
 
     if currency not in accepted:
-        return False
+        # A completed payment in another asset is not a bot-wallet credit, but
+        # it must remain visible for manual reconciliation.
+        logger.warning("Binance Pay invoice matched a completed payment in unsupported currency=%s", currency or "missing")
+        return None
+
+    amount_value = next((match.get(field) for field in ("amount", "totalFee", "total_fee")
+                         if match.get(field) is not None), None)
+    try:
+        amount = Decimal(str(amount_value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not amount.is_finite() or amount <= 0:
+        return None
 
     return {
         "sender": "BINANCE_PAY",
         "receiver": "",
-        "amount": Decimal(
-            str(
-                match.get(
-                    "amount",
-                    "0",
-                )
-            )
-        ).copy_abs(),
+        "amount": amount.copy_abs(),
         "currency": currency,
         "order_id": order_id,
     }
@@ -2149,7 +2191,7 @@ def convert_inr_to_usdt(
 ) -> Decimal:
     """Convert INR using one verified rate snapshot and retain accounting precision."""
     rate = rate if rate is not None else _get_usdt_inr_rate()
-    if rate <= 0:
+    if not rate.is_finite() or rate <= 0 or not inr_amount.is_finite() or inr_amount <= 0:
         return Decimal("0")
 
     return (inr_amount / rate).quantize(
@@ -2210,36 +2252,15 @@ def _keep_pending_or_cancel(
         deposit: Deposit,
         result_info: dict | None = None,
 ) -> bool:
-    """Count a pending verification and cancel it at the configured limit."""
-    attempts = _record_pending_attempt(deposit.id)
-
-    if attempts < MAX_CHECK_ATTEMPTS:
-        logger.info(
-            "[%s] Deposit %s still pending (attempt %s/%s)",
-            deposit.network,
-            deposit.id,
-            attempts,
-            MAX_CHECK_ATTEMPTS,
-        )
-        return True
-
-    _finalize_failed(
-        db,
-        deposit,
-        f"verification attempt limit reached ({attempts}/{MAX_CHECK_ATTEMPTS})",
-    )
-    logger.warning("Deposit %s cancelled after %s verification attempts", deposit.id, attempts)
-
+    """Keep an unconfirmed payment pending regardless of retry count."""
+    # A provider outage or delayed indexing does not prove that a payment
+    # failed. Avoid an unbounded process-local counter and preserve the invoice
+    # for later verification/manual review.
+    _clear_pending_attempts(deposit.id)
     if result_info is not None:
-        result_info.update({
-            "reason": "attempt_limit",
-            "deposit_id": deposit.id,
-            "attempts": attempts,
-            "telegram_id": deposit.telegram_id,
-            "network": str(deposit.network or ""),
-        })
-
-    return False
+        result_info.update({"reason": "pending", "deposit_id": deposit.id})
+    logger.debug("[%s] Deposit %s remains pending verification", deposit.network, deposit.id)
+    return True
 
 
 async def _notify_attempt_limit(bot, result_info: dict) -> None:
@@ -2284,13 +2305,6 @@ async def _notify_attempt_limit(bot, result_info: dict) -> None:
 # FAILED DEPOSIT
 # ================================================================
 
-DELETE_FAILED_DEPOSITS = getattr(
-    config,
-    "DEPOSIT_DELETE_FAILED",
-    False,
-)
-
-
 def _finalize_failed(
         db,
         deposit: Deposit,
@@ -2300,10 +2314,9 @@ def _finalize_failed(
     if not deposit or deposit.status in ('completed', 'failed'):
         db.rollback()
         return
-    if DELETE_FAILED_DEPOSITS:
-        db.delete(deposit)
-    else:
-        deposit.status = "failed"
+    # Preserve the payment record for support/audit and duplicate protection.
+    # Never hard-delete a failed payment attempt.
+    deposit.status = "failed"
 
     db.commit()
 
@@ -2355,9 +2368,65 @@ def _fail_deposit(
         )
 
 
+def _hold_underpaid_for_review(
+        db,
+        deposit: Deposit,
+        received_amount: Decimal,
+        requested_amount: Decimal,
+        result_info: dict | None = None,
+        inr_amount: Decimal | None = None,
+        conversion_rate: Decimal | None = None,
+):
+    """Preserve a verified short payment and enqueue one durable admin alert."""
+    deposit.received_amount = received_amount
+    if inr_amount is not None:
+        deposit.inr_amount = inr_amount
+    if conversion_rate is not None:
+        deposit.conversion_rate = conversion_rate
+
+    shortfall = max(Decimal("0"), requested_amount - received_amount)
+    if result_info is not None:
+        result_info.update({
+            "reason": "underpaid",
+            "deposit_id": deposit.id,
+            "requested": str(requested_amount),
+            "received": str(received_amount),
+            "shortfall": str(shortfall),
+        })
+
+    from services.notification_outbox import enqueue_admin
+    enqueue_admin(
+        db,
+        f"deposit-underpaid:{deposit.id}",
+        "⚠️ <b>Deposit amount mismatch · review needed</b>\n"
+        f"Deposit: <code>#{deposit.id}</code>\n"
+        f"Network: <code>{deposit.network}</code>\n"
+        f"Received: <code>{received_amount:.8f} USDT</code>\n"
+        f"Invoice: <code>{requested_amount:.8f} USDT</code>\n"
+        f"Shortfall: <code>{shortfall:.8f} USDT</code>\n"
+        "No wallet credit was made. Review the saved payment before deciding how to resolve it.",
+    )
+    db.commit()
+    logger.warning(
+        "Verified deposit is underpaid and held for review deposit_id=%s received=%s requested=%s",
+        deposit.id,
+        received_amount,
+        requested_amount,
+    )
+
+
 # ================================================================
 # VERIFY ONE DEPOSIT
 # ================================================================
+
+def _locked_deposit(db, deposit_id: int):
+    return (
+        db.query(Deposit)
+        .filter(Deposit.id == deposit_id)
+        .populate_existing()
+        .with_for_update()
+        .first()
+    )
 
 async def verify_deposit(
         deposit_or_id,
@@ -2377,10 +2446,7 @@ async def verify_deposit(
             else deposit_or_id.id
         )
 
-        deposit = db.get(
-            Deposit,
-            deposit_id,
-        )
+        deposit = db.get(Deposit, deposit_id)
 
         if deposit is None:
             _clear_pending_attempts(
@@ -2479,6 +2545,13 @@ async def verify_deposit(
                 return None if _keep_pending_or_cancel(db, deposit, result_info) else False
 
             if verification is False:
+                deposit = _locked_deposit(db, deposit_id)
+                if deposit is None:
+                    _clear_pending_attempts(deposit_id)
+                    return False
+                if deposit.status in ("completed", "failed"):
+                    _clear_pending_attempts(deposit.id)
+                    return deposit.status == "completed"
                 _fail_deposit(
                     db,
                     deposit.id,
@@ -2493,7 +2566,27 @@ async def verify_deposit(
                 ]
             )
 
-            rate = _get_usdt_inr_rate()
+            db.close()
+            db = None
+            rate = await asyncio.to_thread(_get_usdt_inr_rate)
+            try:
+                rate = Decimal(str(rate))
+            except (InvalidOperation, TypeError, ValueError):
+                rate = Decimal("0")
+            if not rate.is_finite() or rate <= 0:
+                logger.error("UPI verification is pending because no valid USDT/INR rate is available")
+                if result_info is not None:
+                    result_info.update({"reason": "rate_unavailable", "deposit_id": deposit.id})
+                return None
+
+            db = SessionLocal()
+            deposit = _locked_deposit(db, deposit_id)
+            if deposit is None:
+                _clear_pending_attempts(deposit_id)
+                return False
+            if deposit.status in ("completed", "failed"):
+                _clear_pending_attempts(deposit.id)
+                return deposit.status == "completed"
 
             received_amount = (
                 convert_inr_to_usdt(
@@ -2516,13 +2609,11 @@ async def verify_deposit(
                         < requested_usdt
                         - AMOUNT_TOLERANCE
                 ):
-                    _fail_deposit(
-                        db,
-                        deposit.id,
-                        "UPI underpaid",
+                    _hold_underpaid_for_review(
+                        db, deposit, received_amount, requested_usdt, result_info,
+                        inr_amount=inr_amount, conversion_rate=rate,
                     )
-
-                    return False
+                    return None
 
             _clear_pending_attempts(
                 deposit.id
@@ -2564,7 +2655,7 @@ async def verify_deposit(
             )
 
             db = SessionLocal()
-            deposit = db.get(Deposit, deposit_id)
+            deposit = _locked_deposit(db, deposit_id)
             if deposit is None:
                 _clear_pending_attempts(deposit_id)
                 return False
@@ -2595,13 +2686,10 @@ async def verify_deposit(
                         < requested_amount
                         - AMOUNT_TOLERANCE
                 ):
-                    _fail_deposit(
-                        db,
-                        deposit.id,
-                        "Binance Pay underpaid",
+                    _hold_underpaid_for_review(
+                        db, deposit, received_amount, requested_amount, result_info,
                     )
-
-                    return False
+                    return None
 
             _clear_pending_attempts(
                 deposit.id
@@ -2665,7 +2753,7 @@ async def verify_deposit(
         )
 
         db = SessionLocal()
-        deposit = db.get(Deposit, deposit_id)
+        deposit = _locked_deposit(db, deposit_id)
         if deposit is None:
             _clear_pending_attempts(deposit_id)
             return False
@@ -2676,6 +2764,12 @@ async def verify_deposit(
         # --------------------------------------------------------
         # Still pending
         # --------------------------------------------------------
+
+        if isinstance(verification, dict) and verification.get("underpaid"):
+            _hold_underpaid_for_review(
+                db, deposit, Decimal(str(verification["amount"])), requested_amount, result_info,
+            )
+            return None
 
         if verification is None:
             # Binance may index a deposit late, or its API may be temporarily
@@ -2709,13 +2803,14 @@ async def verify_deposit(
         # Final amount verification
         # --------------------------------------------------------
 
-        received_amount = Decimal(
-            str(
-                verification[
-                    "amount"
-                ]
-            )
-        )
+        try:
+            received_amount = Decimal(str(verification["amount"]))
+        except (InvalidOperation, KeyError, TypeError, ValueError):
+            logger.error("Verified Binance response had no usable amount; deposit remains pending id=%s", deposit.id)
+            return None
+        if not received_amount.is_finite() or received_amount <= 0:
+            logger.error("Verified Binance response had an invalid amount; deposit remains pending id=%s", deposit.id)
+            return None
 
         if requested_amount is not None and requested_amount > Decimal("0"):
 
@@ -2724,13 +2819,10 @@ async def verify_deposit(
                     < requested_amount
                     - AMOUNT_TOLERANCE
             ):
-                _finalize_failed(
-                    db,
-                    deposit,
-                    "underpaid",
+                _hold_underpaid_for_review(
+                    db, deposit, received_amount, requested_amount, result_info,
                 )
-
-                return False
+                return None
 
         # --------------------------------------------------------
         # Final duplicate protection
@@ -2796,7 +2888,12 @@ async def verify_deposit(
             "Error verifying deposit"
         )
 
-        return False
+        # An exception is not evidence that payment failed. Keep the row
+        # pending so a temporary database/provider error cannot discard a
+        # valid payment or trigger a false failure notification.
+        if result_info is not None:
+            result_info["reason"] = "verification_error"
+        return None
 
     finally:
 
@@ -2809,23 +2906,51 @@ async def verify_deposit(
 # ================================================================
 
 async def check_pending_deposits(bot=None):
-    global _binance_pending_skip_logged
+    global _binance_pending_skip_logged, _pending_deposit_cursor, _pending_deposit_scan_ceiling
 
     db = SessionLocal()
 
     try:
 
-        rows = (
-            db.query(
-                Deposit.id,
-                Deposit.network,
+        query = db.query(Deposit.id, Deposit.network).filter(Deposit.status == "pending")
+        if _pending_deposit_scan_ceiling is None:
+            _pending_deposit_scan_ceiling = int(
+                query.with_entities(func.max(Deposit.id)).scalar() or 0
             )
-            .filter(
-                Deposit.status
-                == "pending"
+
+        rows = []
+        if _pending_deposit_scan_ceiling:
+            rows = (
+                query.filter(
+                    Deposit.id > _pending_deposit_cursor,
+                    Deposit.id <= _pending_deposit_scan_ceiling,
+                )
+                .order_by(Deposit.id.asc())
+                .limit(PENDING_DEPOSIT_BATCH_SIZE)
+                .all()
             )
-            .all()
-        )
+
+        if not rows:
+            # Start a fresh bounded scan. Capturing a ceiling means incoming
+            # deposits cannot keep moving the finish line and starve older
+            # pending rows.
+            _pending_deposit_cursor = 0
+            _pending_deposit_scan_ceiling = int(
+                query.with_entities(func.max(Deposit.id)).scalar() or 0
+            )
+            if _pending_deposit_scan_ceiling:
+                rows = (
+                    query.filter(Deposit.id <= _pending_deposit_scan_ceiling)
+                    .order_by(Deposit.id.asc())
+                    .limit(PENDING_DEPOSIT_BATCH_SIZE)
+                    .all()
+                )
+
+        if rows:
+            _pending_deposit_cursor = int(rows[-1][0])
+        else:
+            _pending_deposit_cursor = 0
+            _pending_deposit_scan_ceiling = None
 
     finally:
 

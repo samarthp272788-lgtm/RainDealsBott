@@ -11,6 +11,10 @@ def bind_reference(deposit_id, reference, user_id, network):
     reference = reference.strip()
     if network in ('BEP20', 'POLYGON'):
         reference = reference.lower()
+    elif network == 'BINANCE':
+        # Binance Pay references are matched case-insensitively. Store one
+        # canonical form so casing cannot create a second invoice claim.
+        reference = reference.upper()
     try:
         with transaction() as db:
             deposit = db.query(Deposit).filter(Deposit.id == deposit_id).with_for_update().first()

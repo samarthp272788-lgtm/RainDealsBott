@@ -62,3 +62,48 @@ def field_value(message, kind):
     if kind not in validators:
         raise InputError('This field type is not supported. Contact support.')
     return {'kind': 'text', 'value': validators[kind](message.text)}
+
+
+def api_requirement_values(requirements, values):
+    """Validate reseller API buyer fields and return the bot's stored shape.
+
+    API forms are text-only. Photo/contact forms must be completed through the
+    Telegram flow so Telegram file/contact ownership can be checked correctly.
+    Keys use the exact label returned by the product catalog.
+    """
+    if not requirements:
+        if values not in (None, {}):
+            raise InputError('This product does not request buyer information.')
+        return None
+    if not isinstance(values, dict):
+        raise InputError('buyer_info must be an object keyed by the required field labels.')
+
+    fields = {}
+    seen_labels = set()
+    for item in requirements:
+        if not isinstance(item, dict):
+            raise InputError('Product buyer-information settings are invalid.')
+        kind = str(item.get('type', 'text')).strip().lower()
+        label = str(item.get('label') or kind.title()).strip()
+        folded_label = label.casefold()
+        if not label or folded_label in seen_labels:
+            raise InputError('Product buyer-information labels must be unique and non-empty.')
+        seen_labels.add(folded_label)
+        if kind in {'photo', 'contact'}:
+            raise InputError(f'The {kind} field must be submitted through the Telegram bot.')
+        if kind not in {'email', 'phone', 'text'}:
+            raise InputError('Product has an unsupported buyer-information field.')
+        fields[label] = kind
+
+    missing = [label for label in fields if label not in values]
+    extra = [label for label in values if label not in fields]
+    if missing:
+        raise InputError('Missing buyer_info field(s): ' + ', '.join(missing))
+    if extra:
+        raise InputError('Unknown buyer_info field(s): ' + ', '.join(str(x) for x in extra))
+
+    validators = {'email': email, 'phone': phone, 'text': text_value}
+    normalized = {}
+    for label, kind in fields.items():
+        normalized[label] = {'kind': 'text', 'value': validators[kind](values[label])}
+    return normalized

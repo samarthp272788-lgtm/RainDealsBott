@@ -27,6 +27,49 @@ from services.performance import supplier_observed
 logger = logging.getLogger(__name__)
 
 
+def _normalize_provider_stock(raw_stock, availability=None) -> tuple[int, bool]:
+    """Return bounded stock; unknown quantities never become unlimited."""
+    unavailable = {"0", "false", "no", "out_of_stock", "oos", "inactive", "disabled", "unavailable"}
+    availability_flag = availability.get("available") if isinstance(availability, dict) else availability
+    if (availability_flag is False
+            or (isinstance(availability_flag, (int, float)) and not isinstance(availability_flag, bool) and availability_flag == 0)
+            or (isinstance(availability_flag, str) and availability_flag.strip().casefold() in unavailable)):
+        return 0, False
+    value = raw_stock if raw_stock is not None else availability
+    if isinstance(value, dict):
+        for key in ("available", "quantity", "stock", "count", "units", "in_stock"):
+            if key in value and value[key] is not None:
+                return _normalize_provider_stock(value[key])
+        return 0, False
+    if isinstance(value, bool):
+        return (1, True) if value else (0, False)
+    if isinstance(value, (int, float, Decimal)):
+        try:
+            number = Decimal(str(value))
+            if number.is_finite() and number >= 0 and number == number.to_integral_value():
+                stock = min(int(number), 999998)
+                return stock, stock > 0
+        except Exception:
+            pass
+        return 0, False
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"unlimited", "infinite", "infinity", "∞"}:
+            return 999999, True
+        if normalized in {"1", "true", "yes", "available", "in_stock", "active", "enabled"}:
+            return 1, True
+        if normalized in {"false", "no", "out_of_stock", "oos", "inactive", "disabled", "none", "null"}:
+            return 0, False
+        try:
+            number = Decimal(normalized)
+            if number.is_finite() and number >= 0 and number == number.to_integral_value():
+                stock = min(int(number), 999998)
+                return stock, stock > 0
+        except Exception:
+            pass
+    return 0, False
+
+
 class ResellerAPIError(Exception):
     """Raised when reseller API returns an error."""
 
@@ -669,8 +712,8 @@ class ResellerManager:
             used_stock_key = stock_key
             if raw_stock is None:
                 for k in (
-                        "availability.available", "quantity", "stock", "qty", "available", "available_stock",
-                        "stock_count", "inventory", "count", "units", "in_stock", "balance", "amount"
+                        "quantity", "stock", "qty", "available_stock", "stock_count", "inventory",
+                        "count", "units", "availability.available", "available", "in_stock"
                 ):
                     raw_stock = self._extract_value(item, k)
                     if raw_stock is not None and k != used_price_key:
@@ -698,47 +741,18 @@ class ResellerManager:
             except (InvalidOperation, TypeError, ValueError):
                 price = Decimal("0.00")
 
-            stock: int = 999999
-            is_available: bool = True
+            if not price.is_finite() or price <= 0 or price > Decimal("999999999999.99999999"):
+                logger.warning("Skipping provider item with invalid/non-positive price service_id=%s", final_service_id)
+                continue
 
-            if raw_stock is not None:
-                if isinstance(raw_stock, bool):
-                    stock = 999999 if raw_stock else 0
-                    is_available = raw_stock
-                elif isinstance(raw_stock, (int, float)):
-                    val = int(raw_stock)
-                    if val < 0:
-                        stock = 999999
-                        is_available = True
-                    else:
-                        stock = val
-                        is_available = stock > 0
-                else:
-                    s_val = str(raw_stock).strip().lower()
-                    if s_val in (
-                    "unlimited", "infinite", "infinity", "in_stock", "available", "active", "true", "yes", "enabled"):
-                        stock = 999999
-                        is_available = True
-                    elif s_val in ("out_of_stock", "disabled", "inactive", "false", "no", "none", "null", "oos"):
-                        stock = 0
-                        is_available = False
-                    else:
-                        digits = re.findall(r"\d+", s_val)
-                        if digits:
-                            stock = max(1, int(digits[0])) if s_val == "low_stock" else int(digits[0])
-                            is_available = stock > 0
-                        else:
-                            stock = 999999
-                            is_available = True
-            else:
-                status_val = str(
-                    item.get("status") or item.get("available") or item.get("is_available") or "").strip().lower()
-                if status_val in ("false", "0", "disabled", "inactive", "out_of_stock", "oos"):
-                    stock = 0
-                    is_available = False
-                else:
-                    stock = 999999
-                    is_available = True
+            # Keep explicit False/0 values; using `or` here used to discard
+            # an out-of-stock flag and could publish a sold-out service.
+            availability = next(
+                (item.get(key) for key in ("available", "is_available", "status")
+                 if item.get(key) is not None),
+                None,
+            )
+            stock, is_available = _normalize_provider_stock(raw_stock, availability)
 
             final_desc = str(raw_desc).strip() if raw_desc else f"Imported from reseller: {clean_name}"
 

@@ -61,6 +61,71 @@ _provider_fetch_locks: dict[tuple[int, str], asyncio.Lock] = {}
 _ADD_CATEGORY_PAGE_SIZE = 18
 
 
+def _provider_import_stock(product: dict) -> int | None:
+    """Parse provider stock without treating missing or malformed data as unlimited."""
+    if not isinstance(product, dict):
+        return None
+
+    unavailable_values = {"0", "false", "no", "out_of_stock", "oos", "inactive", "disabled", "unavailable"}
+    for flag in (product.get("is_available"), product.get("available"), product.get("status")):
+        if (flag is False or (isinstance(flag, (int, float)) and not isinstance(flag, bool) and flag == 0)
+                or (isinstance(flag, str) and flag.strip().casefold() in unavailable_values)):
+            return 0
+
+    raw = product.get("stock")
+    if isinstance(raw, dict):
+        raw = next((raw[key] for key in ("available", "quantity", "stock", "count", "units", "in_stock")
+                    if raw.get(key) is not None), None)
+    if raw is None:
+        availability = product.get("availability")
+        if isinstance(availability, dict) and availability.get("available") is not None:
+            raw = availability.get("available")
+        else:
+            raw = product.get("is_available", product.get("available"))
+
+    if isinstance(raw, bool):
+        return 1 if raw else 0
+    if isinstance(raw, (int, float, Decimal)):
+        try:
+            value = Decimal(str(raw))
+            if value.is_finite() and value >= 0 and value == value.to_integral_value():
+                return min(int(value), 999998)
+        except Exception:
+            return None
+        return None
+
+    if isinstance(raw, str):
+        value = raw.strip().casefold()
+        if value in {"unlimited", "infinite", "infinity", "∞"}:
+            return 999999
+        if value in {"1", "true", "yes", "available", "in_stock", "active", "enabled"}:
+            return 1
+        if value in {"false", "no", "out_of_stock", "oos", "inactive", "disabled", "none", "null"}:
+            return 0
+        try:
+            parsed = Decimal(value)
+            if parsed.is_finite() and parsed >= 0 and parsed == parsed.to_integral_value():
+                return min(int(parsed), 999998)
+        except Exception:
+            return None
+    return None
+
+
+def _provider_import_price(product: dict) -> Decimal | None:
+    raw = product.get("price")
+    if isinstance(raw, dict):
+        raw = raw.get("amount")
+    if isinstance(raw, bool):
+        return None
+    try:
+        value = Decimal(str(raw))
+        if value.is_finite() and Decimal("0") < value <= Decimal("999999999999.99999999"):
+            return value
+        return None
+    except Exception:
+        return None
+
+
 def _load_product_category_options() -> list[dict[str, str | int]]:
     """Return unique stored categories and their product counts for admin pickers."""
     db = SessionLocal()
@@ -866,32 +931,17 @@ async def _fetch_and_show_reseller_products(callback: CallbackQuery, state: FSMC
 
                 name = str(prod.get("name") or prod.get("title") or "Unknown Product")
 
-                raw_price = prod.get("price")
-                if isinstance(raw_price, dict):
-                    price = float(raw_price.get("amount", 0.0))
-                else:
-                    try:
-                        price = float(raw_price or 0.0)
-                    except (ValueError, TypeError):
-                        price = 0.0
+                parsed_price = _provider_import_price(prod)
+                stock_val = _provider_import_stock(prod)
+                if parsed_price is None or stock_val is None:
+                    logger.warning(
+                        "Skipping provider catalog item with invalid price/unknown stock service_id=%s",
+                        service_id,
+                    )
+                    continue
+                price = parsed_price
 
-                raw_stock = prod.get("stock")
-                if raw_stock is not None:
-                    try:
-                        stock_val = int(raw_stock)
-                    except (ValueError, TypeError):
-                        stock_val = 999999
-                else:
-                    raw_av = prod.get("availability")
-                    if isinstance(raw_av, dict) and "available" in raw_av:
-                        try:
-                            stock_val = int(raw_av["available"])
-                        except (ValueError, TypeError):
-                            stock_val = 999999
-                    else:
-                        stock_val = 999999
-
-                if stock_val <= 0 or prod.get("is_available") is False:
+                if stock_val <= 0:
                     continue
 
                 products_cache[service_id] = prod
@@ -978,30 +1028,11 @@ async def reseller_product_selected(callback: CallbackQuery, state: FSMContext):
         return
 
     reseller_product_name = selected.get("name") or selected.get("title") or "Reseller Product"
-    raw_price = selected.get("price")
-    if isinstance(raw_price, dict):
-        reseller_cost = Decimal(str(raw_price.get("amount", "0.00")))
-    else:
-        try:
-            reseller_cost = Decimal(str(raw_price or "0.00"))
-        except Exception:
-            reseller_cost = Decimal("0.00")
-
-    raw_stock = selected.get("stock")
-    if raw_stock is not None:
-        try:
-            reseller_stock = int(raw_stock)
-        except (ValueError, TypeError):
-            reseller_stock = 999999
-    else:
-        raw_av = selected.get("availability")
-        if isinstance(raw_av, dict) and "available" in raw_av:
-            try:
-                reseller_stock = int(raw_av["available"])
-            except (ValueError, TypeError):
-                reseller_stock = 999999
-        else:
-            reseller_stock = 999999
+    reseller_cost = _provider_import_price(selected)
+    reseller_stock = _provider_import_stock(selected)
+    if reseller_cost is None or reseller_stock is None or reseller_stock <= 0:
+        await callback.answer("Provider price or stock is missing/invalid. Refresh the catalog before importing.", show_alert=True)
+        return
 
     reseller_name = data.get("reseller_name", "Reseller")
 
@@ -1319,11 +1350,6 @@ async def _save_reseller_product(message, state, data, price):
                 Product.reseller_service_id == str(reseller_service_id)
             ).first()
 
-        if not existing_product and reseller_service_id:
-            existing_product = db.query(Product).filter(
-                Product.reseller_service_id == str(reseller_service_id)
-            ).first()
-
         if existing_product:
             existing_product.name = data["name"]
             existing_product.price = price
@@ -1633,7 +1659,11 @@ async def product_required_info(message: Message, state: FSMContext):
                     "<code>contact</code>, or <code>text</code>. Example: "
                     "<code>email:Customer email</code>", parse_mode="HTML")
                 return
-            requirements.append({"type": kind, "label": (label.strip() if sep and label.strip() else kind.title())[:100]})
+            field_label = (label.strip() if sep and label.strip() else kind.title())[:100]
+            if any(str(existing.get("label", "")).casefold() == field_label.casefold() for existing in requirements):
+                await answer_card(message, f"❌ Buyer-information labels must be unique. <code>{_esc(field_label)}</code> is repeated.", parse_mode="HTML")
+                return
+            requirements.append({"type": kind, "label": field_label})
         if len(requirements) > 8:
             await answer_card(message, "❌ You can add up to 8 required fields.")
             return

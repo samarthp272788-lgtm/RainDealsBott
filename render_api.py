@@ -106,7 +106,8 @@ async def lifespan(app: FastAPI):
         # ----------------------------------------------------
 
         if TELEGRAM_TRANSPORT != "cloudflare":
-            await bot.delete_webhook(drop_pending_updates=True)
+            # Keep queued updates during Render restarts/deploys.
+            await bot.delete_webhook()
 
         me = await bot.get_me()
 

@@ -159,9 +159,9 @@ async def main():
         me.username,
     )
 
-    await bot.delete_webhook(
-        drop_pending_updates=True
-    )
+    # Preserve Telegram's queued updates on restart; dropping them here can
+    # silently lose checkout, deposit-reference, and admin messages.
+    await bot.delete_webhook()
 
     # --------------------------------------------------------
     # POLLING

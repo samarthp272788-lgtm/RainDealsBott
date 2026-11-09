@@ -1747,7 +1747,17 @@ async def process_txid(message: Message, state: FSMContext):
     # ═══════════════════════════════════════════════════════════════
     await asyncio.to_thread(_set_pending_if_waiting, deposit_id)
 
-    if network == "UPI":
+    if result_info.get("reason") == "underpaid":
+        pending_msg = (
+            "⚠️ <b>PAYMENT RECEIVED · REVIEW NEEDED</b>\n\n"
+            "We found your transfer, but its amount is below the invoice.\n\n"
+            f"📥 <b>Received:</b> {result_info.get('received')} USDT\n"
+            f"📋 <b>Invoice:</b> {result_info.get('requested')} USDT\n"
+            f"➖ <b>Difference:</b> {result_info.get('shortfall')} USDT\n\n"
+            "No balance was credited. This payment is held for review; contact support with this deposit ID.\n"
+            f"🆔 <code>#{deposit_id}</code>"
+        )
+    elif network == "UPI":
         pending_msg = (
             f"⏳ <b>VERIFICATION PENDING</b>\n\n"
             f"<b>Your payment is being verified.</b>\n\n"

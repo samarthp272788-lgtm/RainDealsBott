@@ -63,6 +63,7 @@ from models.product import Product
 from models.user import User
 
 from services.checkout_actions import api_checkout_key, recover_checkout
+from services.input_forms import InputError, api_requirement_values
 
 from services.api_keys import (
     ApiKeyConfigurationError,
@@ -155,6 +156,15 @@ class OrderRequest(BaseModel):
         description=(
             "Telegram user ID for manual/customer delivery "
             "when applicable."
+        ),
+    )
+
+    buyer_info: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "Required product fields, keyed by the exact labels returned in "
+            "the product's required_info list. Email, phone, and text fields "
+            "are supported; Telegram photo/contact fields must use the bot."
         ),
     )
 
@@ -536,6 +546,18 @@ def _decimal_text(
 # PRODUCT RESPONSE
 # ============================================================
 
+def _required_info_payload(product: Product) -> list[dict[str, str]]:
+    raw = product.required_info if isinstance(product.required_info, list) else []
+    output = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("type") or "text").strip().lower()
+        label = str(item.get("label") or kind.title()).strip()
+        if label:
+            output.append({"type": kind, "label": label})
+    return output
+
 def _product_payload(
     product: Product,
     price: Decimal,
@@ -571,6 +593,8 @@ def _product_payload(
             product.delivery_type
             or "automatic"
         ),
+
+        "required_info": _required_info_payload(product),
     }
 
 
@@ -996,6 +1020,18 @@ def _product_source(
         db.close()
 
 
+def _product_required_info(product_id: int) -> list | None:
+    """Return buyer requirements for an active API-enabled product."""
+    db = SessionLocal()
+    try:
+        product = db.get(Product, product_id)
+        if not product or not product.is_active or not product.api_enabled:
+            return None
+        return product.required_info if isinstance(product.required_info, list) else []
+    finally:
+        db.close()
+
+
 # ============================================================
 # GET ACCOUNT
 # ============================================================
@@ -1077,6 +1113,18 @@ async def create_order(
             ),
             400,
         )
+
+    # Reject invalid buyer details before reserving the idempotency key. The
+    # checkout transaction validates again against the locked product row.
+    required_info = await asyncio.to_thread(
+        _product_required_info,
+        payload.service_id,
+    )
+    if required_info is not None:
+        try:
+            api_requirement_values(required_info, payload.buyer_info)
+        except InputError as exc:
+            raise _api_error("buyer_info_invalid", str(exc), 422)
 
     # --------------------------------------------------------
     # Reserve idempotency key
@@ -1190,6 +1238,8 @@ async def create_order(
                 payload.service_id,
                 payload.quantity,
                 checkout_key=api_checkout_key(principal.key_id, payload.client_order_id),
+                buyer_info=payload.buyer_info,
+                require_buyer_info=True,
             )
 
         else:
@@ -1201,6 +1251,8 @@ async def create_order(
                 payload.quantity,
                 payload.delivery_telegram_id,
                 api_checkout_key(principal.key_id, payload.client_order_id),
+                buyer_info=payload.buyer_info,
+                require_buyer_info=True,
             )
 
     except Exception as exc:
@@ -1267,6 +1319,13 @@ async def create_order(
                 "insufficient_balance",
                 "Insufficient wallet balance.",
                 400,
+            )
+
+        if message.startswith("buyer_info_invalid:"):
+            raise _api_error(
+                "buyer_info_invalid",
+                message.partition(":")[2].strip(),
+                422,
             )
 
         raise _api_error(

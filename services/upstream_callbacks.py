@@ -159,6 +159,32 @@ async def process_upstream_callback(raw_body: bytes, headers, bot) -> dict:
             if delivery:
                 delivered_units = _delivery_unit_count(fulfillment, delivery)
                 expected_units = max(1, int(order.quantity or 1))
+                if delivered_units > expected_units:
+                    logger.warning(
+                        "Supplier callback over-delivery held for review order_id=%s expected=%s got=%s",
+                        order.id, expected_units, delivered_units,
+                    )
+                    order.delivery_type = "manual"
+                    order.automatic_quantity = 0
+                    order.manual_pending_quantity = expected_units
+                    order.status = "pending_manual"
+                    record_event(
+                        session, order.id, "supplier_review",
+                        f"Supplier reported {delivered_units} units for a {expected_units}-unit order; delivery withheld for review.",
+                        customer_visible=False,
+                    )
+                    from services.notification_outbox import enqueue_admin
+                    enqueue_admin(
+                        session, f"supplier-overdelivery:{order.id}",
+                        f"Supplier callback for order #{order.id} reported {delivered_units} units for {expected_units} purchased. Delivery was withheld; review the provider response before completing the order.",
+                    )
+                    enqueue(
+                        session, f"upstream:{order.id}:delivery-review", order.telegram_id,
+                        f"📦 <b>Order under review</b>\n\nProduct: {escape(order.product_name)}\nOrder: <code>#{order.id}</code>\n\nThe supplier response needs a quick review. Your order remains protected; open My Orders for updates.",
+                        source_order_id=order.id,
+                    )
+                    session.commit()
+                    return {"ok": True, "message": "overdelivery_withheld_for_review"}
                 if expected_units > 1 and delivered_units < expected_units:
                     logger.warning(
                         "Supplier callback has incomplete delivery order_id=%s expected=%s got=%s",
@@ -200,18 +226,53 @@ async def process_upstream_callback(raw_body: bytes, headers, bot) -> dict:
                 notification = (order.telegram_id, order.product_name, str(delivery), "delivered")
             else:
                 logger.warning("Supplier reported delivery without content order_id=%s", order.id)
-                order.delivery_type = "hybrid"
+                expected_units = max(1, int(order.quantity or 1))
+                automatic_units = min(expected_units, max(0, int(order.automatic_quantity or 0)))
+                order.delivery_type = "hybrid" if automatic_units else "manual"
+                order.automatic_quantity = automatic_units
                 order.manual_pending_quantity = max(
-                    0, int(order.quantity or 1) - int(order.automatic_quantity or 0)
+                    0, expected_units - automatic_units
+                )
+                order.status = "pending_manual"
+                record_event(
+                    session, order.id, "supplier_review",
+                    "Supplier marked the order delivered without delivery content; awaiting team review.",
+                    customer_visible=False,
                 )
                 from services.notification_outbox import enqueue_admin
                 enqueue_admin(
                     session, f"supplier-missing-delivery:{order.id}",
                     f"Supplier order #{order.id} was marked delivered without delivery content. Review it with the provider.",
                 )
+                enqueue(
+                    session, f"upstream:{order.id}:missing-delivery", order.telegram_id,
+                    f"📦 <b>Order under review</b>\n\nProduct: {escape(order.product_name)}\nOrder: <code>#{order.id}</code>\n\nThe supplier did not return delivery details. Our team is reviewing it; open My Orders for updates.",
+                    source_order_id=order.id,
+                )
                 session.commit()
                 return {"ok": True, "message": "delivery_content_missing"}
         elif status in {"canceled", "cancelled", "failed", "error", "rejected"}:
+            if order.status == "pending_manual":
+                # Once a provider response has put an order into manual review,
+                # a later failure callback is not enough to safely refund it.
+                # The provider may be reporting an older state, and an earlier
+                # callback may already contain partial/ambiguous fulfillment.
+                logger.warning(
+                    "Supplier failure callback held for review order_id=%s",
+                    order.id,
+                )
+                from services.notification_outbox import enqueue_admin
+                enqueue_admin(
+                    session, f"supplier-failure-during-review:{order.id}",
+                    f"Supplier reported {status} for order #{order.id}, which is already under manual review. No automatic refund was issued; reconcile delivery and payment first.",
+                )
+                record_event(
+                    session, order.id, "supplier_review",
+                    "Supplier failure callback arrived while order was under manual review; refund withheld pending reconciliation.",
+                    customer_visible=False,
+                )
+                session.commit()
+                return {"ok": True, "message": "failure_held_for_review"}
             if order.delivered_account or int(order.automatic_quantity or 0) > 0:
                 logger.warning(
                     "Supplier failed after partial delivery; withholding automatic refund order_id=%s",
@@ -238,10 +299,14 @@ async def process_upstream_callback(raw_body: bytes, headers, bot) -> dict:
             record_event(session, order.id, "refunded", "Supplier cancellation refunded to wallet.")
             notification = (order.telegram_id, order.product_name, "", "canceled")
         elif status in {"", "pending", "processing", "created", "queued", "in_progress", "accepted"}:
-            order.status = "processing"
+            # Delayed/out-of-order provider callbacks must not undo an
+            # established manual-review state.
+            if order.status != "pending_manual":
+                order.status = "processing"
         else:
             logger.warning("Unsupported supplier callback status=%s order_id=%s; leaving order processing", status, order.id)
-            order.status = "processing"
+            if order.status != "pending_manual":
+                order.status = "processing"
 
         if notification:
             telegram_id, product_name, delivery, outcome = notification
