@@ -905,6 +905,7 @@ def _load_product_models_safely(query) -> list[Product]:
             for index, column in enumerate(product_columns)
         }
         invalid_fields = []
+        disabled_optional_fields = []
         for field in json_fields:
             raw_value = values[field]
             if raw_value is None:
@@ -916,13 +917,38 @@ def _load_product_models_safely(query) -> list[Product]:
                     else raw_value
                 )
             except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
-                invalid_fields.append(field)
+                if field == "bulk_pricing":
+                    # Bulk pricing is optional. If old/corrupt JSON is stored,
+                    # disable the discounts and keep the product sellable at
+                    # its base price instead of hiding the entire product.
+                    values[field] = None
+                    disabled_optional_fields.append(field)
+                else:
+                    invalid_fields.append(field)
                 continue
+            # Older product-creation handlers wrote JSON text into a JSON
+            # column, producing a JSON string whose contents are themselves
+            # an object. Unwrap that legacy representation before validating.
+            if field == "bulk_pricing" and isinstance(parsed, str):
+                try:
+                    parsed = json.loads(parsed)
+                except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+                    parsed = None
             expected_shape = expected_json_shapes.get(field)
             if expected_shape and not isinstance(parsed, expected_shape):
-                invalid_fields.append(field)
+                if field == "bulk_pricing":
+                    values[field] = None
+                    disabled_optional_fields.append(field)
+                else:
+                    invalid_fields.append(field)
                 continue
             values[field] = parsed
+        if disabled_optional_fields:
+            logger.warning(
+                "Disabled invalid optional product configuration product_id=%s fields=%s; using base price",
+                values.get("id"),
+                ",".join(sorted(disabled_optional_fields)),
+            )
         if invalid_fields:
             logger.error(
                 "Skipping product with invalid JSON configuration product_id=%s fields=%s",

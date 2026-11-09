@@ -400,15 +400,22 @@ def _parse_bulk_pricing(raw_text: str) -> dict | None:
     return tiers if tiers else None
 
 
-def _format_bulk_pricing_display(bulk_pricing: str | None) -> str:
-    if not bulk_pricing:
-        return ""
-
+def _bulk_pricing_dict(bulk_pricing) -> dict | None:
+    if isinstance(bulk_pricing, dict):
+        return bulk_pricing
+    if not isinstance(bulk_pricing, str) or not bulk_pricing.strip():
+        return None
     try:
         tiers = json.loads(bulk_pricing)
-    except (json.JSONDecodeError, TypeError):
-        return ""
+        if isinstance(tiers, str):
+            tiers = json.loads(tiers)
+        return tiers if isinstance(tiers, dict) else None
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
 
+
+def _format_bulk_pricing_display(bulk_pricing) -> str:
+    tiers = _bulk_pricing_dict(bulk_pricing)
     if not tiers:
         return ""
 
@@ -427,15 +434,10 @@ def _format_bulk_pricing_display(bulk_pricing: str | None) -> str:
     return "\n".join(lines)
 
 
-def _format_bulk_pricing_plain(bulk_pricing: str | None) -> str:
-    if not bulk_pricing:
+def _format_bulk_pricing_plain(bulk_pricing) -> str:
+    tiers = _bulk_pricing_dict(bulk_pricing)
+    if not tiers:
         return "(not set)"
-
-    try:
-        tiers = json.loads(bulk_pricing)
-    except (json.JSONDecodeError, TypeError):
-        return "(invalid data)"
-
     lines = []
     sorted_tiers = sorted(tiers.values(), key=lambda x: x.get("min", 0))
 
@@ -1433,7 +1435,7 @@ async def save_bulk_pricing(message: Message, state: FSMContext):
     raw = message.text.strip()
 
     if raw.lower() in ("skip", "none", "remove", "no", "n"):
-        bulk_json = None
+        bulk_data = None
         confirm = (
             "✅ <b>Bulk Pricing Removed!</b>\n\n"
             "📦 Now using flat pricing.\n"
@@ -1463,8 +1465,7 @@ async def save_bulk_pricing(message: Message, state: FSMContext):
             )
             return
 
-        bulk_json = json.dumps(bulk_data)
-        display = _format_bulk_pricing_display(bulk_json)
+        display = _format_bulk_pricing_display(bulk_data)
 
         await state.clear()
 
@@ -1489,7 +1490,9 @@ async def save_bulk_pricing(message: Message, state: FSMContext):
     try:
         product = db.query(Product).filter(Product.id == pid).first()
         if product:
-            product.bulk_pricing = bulk_json
+            # Product.bulk_pricing is a JSON object column; store the parsed
+            # mapping directly instead of a JSON-encoded string.
+            product.bulk_pricing = bulk_data
             db.commit()
             invalidate_products_cache()
     finally:

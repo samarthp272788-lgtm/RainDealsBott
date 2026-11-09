@@ -316,16 +316,23 @@ def _parse_bulk_pricing(raw_text: str) -> dict | None:
     return tiers if tiers else None
 
 
-def _format_bulk_pricing_display(bulk_pricing: str | None) -> str:
-    """Format bulk pricing for display in product panel."""
-    if not bulk_pricing:
-        return ""
-
+def _bulk_pricing_dict(bulk_pricing) -> dict | None:
+    if isinstance(bulk_pricing, dict):
+        return bulk_pricing
+    if not isinstance(bulk_pricing, str) or not bulk_pricing.strip():
+        return None
     try:
         tiers = json.loads(bulk_pricing)
-    except (json.JSONDecodeError, TypeError):
-        return ""
+        if isinstance(tiers, str):
+            tiers = json.loads(tiers)
+        return tiers if isinstance(tiers, dict) else None
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
 
+
+def _format_bulk_pricing_display(bulk_pricing) -> str:
+    """Format bulk pricing for display in product panel."""
+    tiers = _bulk_pricing_dict(bulk_pricing)
     if not tiers:
         return ""
 
@@ -346,17 +353,12 @@ def _format_bulk_pricing_display(bulk_pricing: str | None) -> str:
     return "\n".join(lines)
 
 
-def _format_bulk_pricing_plain(bulk_pricing: str | None) -> str:
+def _format_bulk_pricing_plain(bulk_pricing) -> str:
     """Format bulk pricing as plain text lines for editing."""
-    if not bulk_pricing:
-        return ""
-
-    try:
-        tiers = json.loads(bulk_pricing)
-    except (json.JSONDecodeError, TypeError):
-        return ""
-
+    tiers = _bulk_pricing_dict(bulk_pricing)
     lines = []
+    if not tiers:
+        return ""
     sorted_tiers = sorted(tiers.values(), key=lambda x: x.get("min", 0))
 
     for tier in sorted_tiers:
@@ -1800,8 +1802,8 @@ async def product_bulk_pricing(message: Message, state: FSMContext):
         else:
             confirm_lines.append(f"  🏷 {min_q}+ units → <b>${price:.2f}</b>/each")
 
-    bulk_json = json.dumps(bulk_data)
-    await state.update_data(bulk_pricing=bulk_json)
+    # Store a dict because Product.bulk_pricing is a JSON object column.
+    await state.update_data(bulk_pricing=bulk_data)
     await state.set_state(AddProduct.accounts)
 
     confirm_lines.append(f"\n{_divider('═')}")
