@@ -1042,19 +1042,6 @@ def _fetch_products_by_ids(product_ids: list[int]) -> list:
         db.close()
 
 
-def _fetch_free_products() -> list:
-    """Fetch all active products with price = 0 (freebies)."""
-    db = SessionLocal()
-    try:
-        return _load_product_models_safely(
-            db.query(Product)
-            .filter(Product.is_active == True, Product.price == 0)
-            .order_by(Product.id.asc())
-        )
-    finally:
-        db.close()
-
-
 def _accounts(product) -> list[str]:
     if not product.file_content:
         return []
@@ -1308,7 +1295,13 @@ async def freebies_menu(callback: CallbackQuery):
     await callback.answer()
 
     _schedule_reseller_stock_refresh()
-    products = await asyncio.to_thread(_fetch_free_products)
+    # Use the exact same active-product snapshot as Shop. Filtering in Python
+    # keeps zero-price items visible even if the SQL numeric representation
+    # differs between MySQL/TiDB deployments.
+    products = [
+        product for product in await _fetch_active_products()
+        if _money(product.price) == Decimal("0")
+    ]
 
     if not products:
         await show(
@@ -1324,7 +1317,7 @@ async def freebies_menu(callback: CallbackQuery):
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [InlineKeyboardButton(text="🛍 Browse Paid Products", callback_data="products_menu",
+                    [InlineKeyboardButton(text="🛍 Browse All Products", callback_data="products_menu",
                                           style="primary")],
                     [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")]
                 ]
@@ -1359,7 +1352,7 @@ async def freebies_menu(callback: CallbackQuery):
         ])
 
     keyboard.append([
-        InlineKeyboardButton(text="🛍 Browse Paid Products", callback_data="products_menu", style="primary"),
+        InlineKeyboardButton(text="🛍 Browse All Products", callback_data="products_menu", style="primary"),
         InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary"),
     ])
 
