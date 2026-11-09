@@ -1149,13 +1149,18 @@ async def clear_accounts(callback: CallbackQuery):
     F.data.startswith("toggle_")
     & ~F.data.startswith("toggle_preorder_")
     & ~F.data.startswith("toggle_api_")
+    & ~F.data.startswith("toggle_fallback_")
 )
 async def toggle_product(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("Access denied.", show_alert=True)
         return
 
-    pid = int(callback.data.split("_")[1])
+    try:
+        pid = int(callback.data.rsplit("_", 1)[1])
+    except (TypeError, ValueError):
+        await callback.answer("Invalid product.", show_alert=True)
+        return
 
     db = SessionLocal()
     try:
