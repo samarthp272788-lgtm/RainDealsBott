@@ -150,7 +150,16 @@ async def admin_orders(callback: CallbackQuery):
 
 def _bulk_inventory_options(admin_id: int) -> list[dict]:
     with SessionLocal() as db:
-        products = db.query(Product).filter(Product.source == "own").order_by(Product.name.asc()).all()
+        # Select only the fields this screen needs. Loading Product entities
+        # also deserializes JSON columns, and one legacy row with invalid JSON
+        # should not make the whole bulk-fulfillment screen unavailable.
+        products = db.query(
+            Product.id.label("id"),
+            Product.name.label("name"),
+            Product.file_content.label("file_content"),
+            Product.reusable_delivery.label("reusable_delivery"),
+            Product.reusable_stock.label("reusable_stock"),
+        ).filter(Product.source == "own").order_by(Product.name.asc()).all()
         options = []
         for product in products:
             pending = (db.query(Order).filter(
@@ -223,7 +232,20 @@ async def bulk_inventory_product(callback: CallbackQuery):
 
 def _do_bulk_inventory_fulfill(product_id: int, admin_id: int, limit: int = 20) -> dict:
     with transaction() as db:
-        product = db.query(Product).filter(Product.id == product_id).with_for_update().first()
+        # Avoid hydrating Product JSON columns here too; legacy malformed JSON
+        # is unrelated to inventory and must not abort fulfillment.
+        product = db.query(
+            Product.id.label("id"),
+            Product.name.label("name"),
+            Product.source.label("source"),
+            Product.file_content.label("file_content"),
+            Product.reusable_stock.label("reusable_stock"),
+            Product.reusable_delivery.label("reusable_delivery"),
+            Product.stock.label("stock"),
+            Product.delivery_type.label("delivery_type"),
+            Product.manual_fallback.label("manual_fallback"),
+            Product.preorder.label("preorder"),
+        ).filter(Product.id == product_id).with_for_update().first()
         if not product or product.source != "own":
             return {"error": "Local product not found."}
         orders = (db.query(Order).filter(
@@ -234,6 +256,10 @@ def _do_bulk_inventory_fulfill(product_id: int, admin_id: int, limit: int = 20) 
             Order.assigned_admin_id.is_(None) | (Order.assigned_admin_id == admin_id),
         ).order_by(Order.id.asc()).with_for_update().limit(limit).all())
         accounts = [x.strip() for x in (product.file_content or "").splitlines() if x.strip()]
+        product_stock = max(0, int(product.stock or 0))
+        product_delivery_type = (product.delivery_type or "automatic").lower()
+        product_manual_fallback = bool(product.manual_fallback)
+        product_preorder = bool(product.preorder)
         reusable = max(0, int(getattr(product, "reusable_stock", 0) or 0))
         reusable_content = str(getattr(product, "reusable_delivery", "") or "").strip()
         if not reusable_content:
@@ -270,7 +296,7 @@ def _do_bulk_inventory_fulfill(product_id: int, admin_id: int, limit: int = 20) 
             order.delivered_account = "\n".join(filter(None, [order.delivered_account, "\n".join(delivered_lines)]))
             order.manual_pending_quantity = 0
             if order.stock_deducted_quantity is None or int(order.stock_deducted_quantity or 0) == 0:
-                product.stock = max(0, int(product.stock or 0) - quantity)
+                product_stock = max(0, product_stock - quantity)
                 order.stock_deducted_quantity = int(order.stock_deducted_quantity or 0) + quantity
             order.assigned_admin_id = order.assigned_admin_id or admin_id
             order.assigned_at = order.assigned_at or datetime.utcnow()
@@ -296,17 +322,23 @@ def _do_bulk_inventory_fulfill(product_id: int, admin_id: int, limit: int = 20) 
             destination_id = order.delivery_telegram_id or (admin_id if is_api_order else order.telegram_id)
             results.append({"order_id": order.id, "buyer_id": order.telegram_id,
                             "destination_id": destination_id, "is_api_order": is_api_order})
-        product.file_content = "\n".join(accounts) or None
-        product.reusable_stock = reusable
         if (
-            (product.delivery_type or "automatic").lower() in {"automatic", "hybrid"}
+            product_delivery_type in {"automatic", "hybrid"}
             and not accounts
             and not (reusable_content and reusable > 0)
         ):
-            product.delivery_type = "manual"
-            product.manual_fallback = True
-            product.preorder = False
+            product_delivery_type = "manual"
+            product_manual_fallback = True
+            product_preorder = False
             switched_to_manual = True
+        db.query(Product).filter(Product.id == product_id).update({
+            Product.file_content: "\n".join(accounts) or None,
+            Product.reusable_stock: reusable,
+            Product.stock: product_stock,
+            Product.delivery_type: product_delivery_type,
+            Product.manual_fallback: product_manual_fallback,
+            Product.preorder: product_preorder,
+        }, synchronize_session=False)
         remaining_orders = db.query(Order.id).filter(
             Order.product_id == product_id, Order.refunded.is_(False),
             Order.delivery_type.in_(("manual", "hybrid")),
