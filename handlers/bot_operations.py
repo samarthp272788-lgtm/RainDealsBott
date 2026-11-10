@@ -34,7 +34,12 @@ def back(order_id, admin=False):
     return keyboard([[Button(text='⬅ Back', callback_data=f'warranty_admin_{order_id}' if admin else f'warranty_order_{order_id}')]])
 
 
-@router.callback_query(F.data.startswith('warranty_config_'))
+def _claim_is_open(ctx):
+    request = ctx.get('request') if ctx else None
+    return bool(request and request.get('status') not in ('rejected', 'declined'))
+
+
+@router.callback_query(F.data.regexp(r'^warranty_config_\d+$'))
 async def configure_warranty(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer('Access denied.', show_alert=True)
@@ -51,7 +56,7 @@ async def configure_warranty(callback: CallbackQuery, state: FSMContext):
                    [Button(text='Cancel', callback_data=f'warranty_cancelconfig_{product_id}')]]))
 
 
-@router.callback_query(F.data.startswith('warranty_policy_'))
+@router.callback_query(F.data.regexp(r'^warranty_policy_\d+_(warranty|refund|skip)$'))
 async def choose_warranty_policy(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer('Access denied.', show_alert=True)
@@ -78,7 +83,7 @@ async def choose_warranty_policy(callback: CallbackQuery, state: FSMContext):
                reply_markup=keyboard([[Button(text='Cancel', callback_data=f'warranty_cancelconfig_{product_id}')]]))
 
 
-@router.callback_query(F.data.startswith('warranty_cancelconfig_'))
+@router.callback_query(F.data.regexp(r'^warranty_cancelconfig_\d+$'))
 async def cancel_warranty_policy(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer('Access denied.', show_alert=True)
@@ -125,6 +130,7 @@ async def render_warranty(target, order_id, admin=False):
     buttons.append([Button(text='🧾 Order / product invoice',callback_data=f'warranty_invoice_{order_id}'),
                     Button(text='📦 Delivered information',callback_data=f'warranty_delivery_{order_id}')])
     buttons.append([Button(text='📋 Full order & submitted details',callback_data=f'order_{order_id}' if admin else f'order_detail_{order_id}')])
+    closed_claim = bool(request and request['status'] in ('rejected', 'declined'))
     if request:
         buttons.append([Button(text='💬 Conversation / more proof', callback_data=f'ct_thread_{order_id}')])
         evidence = request['evidence']
@@ -138,6 +144,9 @@ async def render_warranty(target, order_id, admin=False):
             buttons.append([Button(text='Decline', callback_data=f'warranty_reject_{order_id}', style='danger')])
         elif admin and ctx['reviewable'] and request['status'] == 'approved':
             buttons.append([Button(text='Deliver replacement', callback_data=f'warranty_complete_{order_id}', style='success')])
+        elif closed_claim and not admin and ctx.get('can_submit'):
+            buttons.append([Button(text='Submit a new claim',
+                                   callback_data=f'warranty_request_{order_id}', style='primary')])
     elif ctx.get('can_submit',not ctx['error']):
         buttons.append([Button(text='💸 Ask for refund' if refund else '🛡 Claim warranty', callback_data=f'warranty_request_{order_id}', style='primary')])
     if admin and ctx.get('reviewable'):
@@ -147,7 +156,7 @@ async def render_warranty(target, order_id, admin=False):
     await answer_card(target, text, parse_mode='HTML', reply_markup=keyboard(buttons), replace_media=True)
 
 
-@router.callback_query(F.data.startswith('warranty_details_'))
+@router.callback_query(F.data.regexp(r'^warranty_details_\d+$'))
 async def warranty_details(callback: CallbackQuery, state: FSMContext):
     order_id = int(callback.data.rsplit('_', 1)[1])
     admin = callback.from_user.id in ADMIN_IDS
@@ -160,8 +169,8 @@ async def warranty_details(callback: CallbackQuery, state: FSMContext):
     await show(callback, warranty.request_text(ctx), parse_mode='HTML', reply_markup=back(order_id, admin), replace_media=True)
 
 
-@router.callback_query(F.data.startswith('warranty_order_'))
-@router.callback_query(F.data.startswith('warranty_admin_'))
+@router.callback_query(F.data.regexp(r'^warranty_order_\d+$'))
+@router.callback_query(F.data.regexp(r'^warranty_admin_\d+$'))
 async def warranty_status(callback: CallbackQuery, state: FSMContext):
     admin = callback.data.startswith('warranty_admin_')
     if admin and callback.from_user.id not in ADMIN_IDS:
@@ -172,11 +181,13 @@ async def warranty_status(callback: CallbackQuery, state: FSMContext):
     await render_warranty(callback, int(callback.data.rsplit('_', 1)[1]), admin)
 
 
-@router.callback_query(F.data.startswith('warranty_request_'))
+@router.callback_query(F.data.regexp(r'^warranty_request_\d+$'))
 async def request_warranty(callback: CallbackQuery, state: FSMContext):
     order_id = int(callback.data.rsplit('_', 1)[1])
     ctx = await asyncio.to_thread(warranty.context, order_id, callback.from_user.id)
-    if not ctx or not ctx.get('can_submit',not ctx['error']) or ctx['request']:
+    existing = ctx.get('request') if ctx else None
+    open_claim = bool(existing and existing['status'] not in ('rejected', 'declined'))
+    if not ctx or not ctx.get('can_submit',not ctx['error']) or open_claim:
         await callback.answer('Request unavailable. Refresh this order.', show_alert=True)
         return
     await callback.answer()
@@ -189,7 +200,7 @@ async def request_warranty(callback: CallbackQuery, state: FSMContext):
                                       [Button(text='Back',callback_data=f'warranty_order_{order_id}')]]))
 
 
-@router.callback_query(F.data.startswith('warranty_confirm_'))
+@router.callback_query(F.data.regexp(r'^warranty_confirm_\d+$'))
 async def confirm_claim_product(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     order_id = int(callback.data.rsplit('_',1)[1])
@@ -204,7 +215,7 @@ async def confirm_claim_product(callback: CallbackQuery, state: FSMContext):
         [Button(text=label,callback_data=f'warranty_issue_{order_id}_{code}')] for code,label in ISSUES.items()]))
 
 
-@router.callback_query(F.data.startswith('warranty_issue_'))
+@router.callback_query(F.data.regexp(r'^warranty_issue_\d+_[a-z_]+$'))
 async def choose_claim_issue(callback: CallbackQuery, state: FSMContext):
     from services.claim_details import ISSUES
     _,_,raw_order,issue = callback.data.split('_',3)
@@ -214,7 +225,7 @@ async def choose_claim_issue(callback: CallbackQuery, state: FSMContext):
         await callback.answer('Confirm the product first.',show_alert=True)
         return
     ctx = await asyncio.to_thread(warranty.context,order_id,callback.from_user.id)
-    if not ctx or not ctx.get('can_submit',not ctx['error']) or ctx['request']:
+    if not ctx or not ctx.get('can_submit', not ctx['error']) or _claim_is_open(ctx):
         await callback.answer('This claim is no longer available.',show_alert=True)
         return
     await callback.answer()
@@ -286,7 +297,7 @@ async def claim_confirmation(target, state, notice=''):
     data = await state.get_data()
     order_id = data['warranty_order']
     ctx = await asyncio.to_thread(warranty.context, order_id, target.from_user.id)
-    if not ctx or not ctx.get('can_submit',not ctx['error']) or ctx['request']:
+    if not ctx or not ctx.get('can_submit', not ctx['error']) or _claim_is_open(ctx):
         await state.clear()
         await render_warranty(target, order_id)
         return
@@ -303,7 +314,7 @@ async def claim_confirmation(target, state, notice=''):
         [Button(text='Cancel', callback_data=f'warranty_order_{order_id}')]]), replace_media=True)
 
 
-@router.callback_query(F.data.startswith('warranty_submit_'))
+@router.callback_query(F.data.regexp(r'^warranty_submit_\d+$'))
 async def submit_claim(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     order_id = int(callback.data.rsplit('_', 1)[1])
@@ -317,8 +328,12 @@ async def submit_claim(callback: CallbackQuery, state: FSMContext):
     proof = None
     if data['warranty_evidence']['kind'] == 'photo':
         from io import BytesIO
-        from services.claim_details import proof_mime
+        from services.claim_details import proof_mime, MAX_PROOF_BYTES
         try:
+            file_meta = await callback.bot.get_file(data['warranty_evidence']['file_id'])
+            if file_meta.file_size is None or file_meta.file_size > MAX_PROOF_BYTES:
+                await answer_card(callback, 'Upload a screenshot smaller than 2 MB.', reply_markup=back(order_id))
+                return
             buffer = BytesIO()
             async with asyncio.timeout(20):
                 await callback.bot.download(data['warranty_evidence']['file_id'],destination=buffer)
@@ -348,7 +363,7 @@ async def claim_confirmation_input(message: Message, state: FSMContext):
     await claim_confirmation(message, state, 'Use Submit claim, or /cancel.')
 
 
-@router.callback_query(F.data.startswith('warranty_queue_'))
+@router.callback_query(F.data.regexp(r'^warranty_queue_\d+$'))
 async def warranty_queue(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer('Access denied.', show_alert=True)
@@ -397,7 +412,7 @@ async def warranty_action(callback: CallbackQuery, state: FSMContext):
     await show(callback, prompt+'\n/cancel to stop.', reply_markup=back(order_id, True))
 
 
-@router.callback_query(F.data.startswith('warranty_refundapprove_'))
+@router.callback_query(F.data.regexp(r'^warranty_refundapprove_\d+$'))
 async def approve_refund(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer('Access denied.', show_alert=True)
@@ -431,7 +446,7 @@ async def warranty_resolution(message: Message, state: FSMContext):
     await render_warranty(message, data['warranty_order'], True)
 
 
-@router.callback_query(F.data.startswith('warranty_photo_'))
+@router.callback_query(F.data.regexp(r'^warranty_photo_\d+$'))
 async def warranty_photo(callback: CallbackQuery):
     order_id = int(callback.data.rsplit('_', 1)[1])
     admin = callback.from_user.id in ADMIN_IDS
@@ -444,6 +459,11 @@ async def warranty_photo(callback: CallbackQuery):
     if not request.get('proof_available'):
         try:
             from io import BytesIO
+            from services.claim_details import MAX_PROOF_BYTES
+            file_meta = await callback.bot.get_file(request['evidence']['file_id'])
+            if file_meta.file_size is None or file_meta.file_size > MAX_PROOF_BYTES:
+                await callback.answer('Evidence exceeds the 2 MB review limit.', show_alert=True)
+                return
             image = BytesIO()
             async with asyncio.timeout(15):
                 await callback.bot.download(request['evidence']['file_id'],destination=image)
@@ -453,7 +473,7 @@ async def warranty_photo(callback: CallbackQuery):
     await show_warranty_photo(callback, request['evidence']['file_id'], order_id, admin)
 
 
-@router.callback_query(F.data.startswith('warranty_invoice_'))
+@router.callback_query(F.data.regexp(r'^warranty_invoice_\d+$'))
 async def claim_invoice(callback: CallbackQuery):
     admin = callback.from_user.id in ADMIN_IDS
     order_id = int(callback.data.rsplit('_',1)[1])
@@ -466,7 +486,7 @@ async def claim_invoice(callback: CallbackQuery):
     await show(callback,invoice_text(ctx['invoice']),parse_mode='HTML',reply_markup=back(order_id,admin),replace_media=True)
 
 
-@router.callback_query(F.data.startswith('warranty_delivery_'))
+@router.callback_query(F.data.regexp(r'^warranty_delivery_\d+$'))
 async def claim_delivery(callback: CallbackQuery):
     admin = callback.from_user.id in ADMIN_IDS
     order_id = int(callback.data.rsplit('_',1)[1])
@@ -479,7 +499,7 @@ async def claim_delivery(callback: CallbackQuery):
                parse_mode='HTML',reply_markup=back(order_id,admin),replace_media=True)
 
 
-@router.callback_query(F.data.startswith('warranty_metadata_'))
+@router.callback_query(F.data.regexp(r'^warranty_metadata_\d+$'))
 async def claim_metadata(callback: CallbackQuery,state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer('Access denied.',show_alert=True)
@@ -536,23 +556,62 @@ async def operations(callback: CallbackQuery, state: FSMContext):
     if callback.data == 'ops_performance' or callback.data.startswith('ops_providers_'):
         text = 'This tool is not available in the bot.'
     elif callback.data.startswith('ops_resolveconfirm_'):
-        job_id = int(callback.data.rsplit('_', 1)[1])
+        try:
+            job_id = int(callback.data.rsplit('_', 1)[1])
+        except (TypeError, ValueError):
+            await callback.answer('Invalid notification.', show_alert=True)
+            return
         text = 'Check the recipient’s chat first. This closes the uncertain send without resending it or claiming confirmed Telegram delivery.'
         buttons.append([Button(text='Resolve without resending', callback_data=f'ops_resolve_{job_id}')])
         buttons.append([Button(text='Cancel', callback_data='ops_notifications_0')])
+    elif callback.data.startswith('ops_retry_uncertain_confirm_'):
+        try:
+            job_id = int(callback.data.rsplit('_', 1)[1])
+        except (TypeError, ValueError):
+            await callback.answer('Invalid notification.', show_alert=True)
+            return
+        text = ('⚠️ <b>Retry an uncertain notification?</b>\n\n'
+                'Telegram may have accepted the first send. Retrying can deliver a duplicate. '
+                'Check the recipient chat before continuing.')
+        buttons.append([Button(text='Retry anyway · may duplicate', callback_data=f'ops_retry_uncertain_{job_id}')])
+        buttons.append([Button(text='Cancel', callback_data='ops_notifications_0')])
+    elif callback.data.startswith('ops_retry_uncertain_'):
+        try:
+            job_id = int(callback.data.rsplit('_', 1)[1])
+        except (TypeError, ValueError):
+            await callback.answer('Invalid notification.', show_alert=True)
+            return
+        from services.notification_outbox import retry_uncertain
+        error = await asyncio.to_thread(retry_uncertain, job_id, callback.bot.id, callback.from_user.id)
+        text = error or '✅ Uncertain notification queued for an explicit retry.'
+        buttons.append([Button(text='Notifications', callback_data='ops_notifications_0')])
     elif callback.data.startswith('ops_resolve_'):
         from services.notification_outbox import resolve_uncertain
-        error = await asyncio.to_thread(resolve_uncertain, int(callback.data.rsplit('_', 1)[1]), callback.bot.id, callback.from_user.id)
+        try:
+            job_id = int(callback.data.rsplit('_', 1)[1])
+        except (TypeError, ValueError):
+            await callback.answer('Invalid notification.', show_alert=True)
+            return
+        error = await asyncio.to_thread(resolve_uncertain, job_id, callback.bot.id, callback.from_user.id)
         text = error or 'Resolved without sending another message.'
         buttons.append([Button(text='Notifications', callback_data='ops_notifications_0')])
     elif callback.data.startswith('ops_retry_'):
         from services.notification_outbox import retry_failed
-        error = await asyncio.to_thread(retry_failed, int(callback.data.rsplit('_', 1)[1]), callback.bot.id, callback.from_user.id)
+        try:
+            job_id = int(callback.data.rsplit('_', 1)[1])
+        except (TypeError, ValueError):
+            await callback.answer('Invalid notification.', show_alert=True)
+            return
+        error = await asyncio.to_thread(retry_failed, job_id, callback.bot.id, callback.from_user.id)
         text = error or '✅ Notification queued again.'
         buttons.append([Button(text='Notifications', callback_data='ops_notifications_0')])
     elif callback.data.startswith('ops_notifications_'):
         from services.notification_outbox import report
-        page = max(0, int(callback.data.rsplit('_', 1)[1]))
+        raw_page = callback.data.rsplit('_', 1)[1]
+        if not raw_page.isascii() or not raw_page.isdigit() or len(raw_page) > 7:
+            await callback.answer('Invalid page.', show_alert=True)
+            return
+        page = max(0, int(raw_page))
         counts, rows = await asyncio.to_thread(report, callback.bot.id, page)
         text = '🔔 <b>Notification queue</b>\n' + ' · '.join(f'{escape(k)}: {v}' for k,v in counts.items())
         text += '\n\nUncertain sends need review; automatic retry is disabled.\n'
@@ -562,6 +621,7 @@ async def operations(callback: CallbackQuery, state: FSMContext):
                 buttons.append([Button(text=f"Retry failed #{row['id']}", callback_data=f"ops_retry_{row['id']}")])
             elif row['status'] == 'uncertain':
                 buttons.append([Button(text=f"Review uncertain #{row['id']}", callback_data=f"ops_resolveconfirm_{row['id']}")])
+                buttons.append([Button(text=f"Retry uncertain #{row['id']}", callback_data=f"ops_retry_uncertain_confirm_{row['id']}")])
         nav = [Button(text='Refresh', callback_data=f'ops_notifications_{page}')]
         if page:
             nav.append(Button(text='Previous', callback_data=f'ops_notifications_{page-1}'))

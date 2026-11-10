@@ -5,7 +5,10 @@ from services.screen_controller import current_screen, get_screen, GuardedState,
 
 def is_navigation(event):
     if isinstance(event, Message):
-        return True
+        # Free-text form replies are input, not a navigation action. Let
+        # actual bot commands supersede an in-flight screen render.
+        text = (event.text or event.caption or '').strip()
+        return text.startswith('/')
     value = event.data or ''
     exact = {'products_menu', 'products_all', 'freebies_menu', 'freebies_all', 'main_menu', 'orders_menu', 'my_profile',
              'favorites_menu', 'restock_alerts_menu', 'deposit_start', 'my_deposits',

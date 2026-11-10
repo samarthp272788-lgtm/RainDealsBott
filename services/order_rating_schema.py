@@ -11,4 +11,6 @@ def ensure_order_rating_schema() -> None:
     try:
         OrderRating.__table__.create(bind=engine, checkfirst=True)
     except Exception:
-        logger.exception("Could not initialize order ratings storage; bot will continue")
+        from sqlalchemy import inspect
+        if not inspect(engine).has_table(OrderRating.__tablename__):
+            raise

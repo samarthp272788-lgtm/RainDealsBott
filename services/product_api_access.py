@@ -17,9 +17,14 @@ def ensure_product_api_access_schema() -> None:
             )
         ).first()
         if not exists:
-            connection.execute(
-                text(
-                    "ALTER TABLE products "
-                    "ADD COLUMN api_enabled TINYINT(1) NOT NULL DEFAULT 1"
-                )
-            )
+            try:
+                connection.execute(text(
+                    "ALTER TABLE products ADD COLUMN api_enabled TINYINT(1) NOT NULL DEFAULT 1"
+                ))
+            except Exception:
+                exists = connection.execute(text(
+                    "SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() "
+                    "AND TABLE_NAME='products' AND COLUMN_NAME='api_enabled'"
+                )).first()
+                if not exists:
+                    raise

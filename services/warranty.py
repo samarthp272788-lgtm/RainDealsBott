@@ -191,7 +191,7 @@ def context(order_id, user_id, admin=False):
     from config import ADMIN_IDS
     from database import SessionLocal
     from models.order import Order
-    from models.bot_operations import WarrantyRequest
+    from models.bot_operations import WarrantyRequest, WarrantyRequestRevision
     from services.claim_details import recover_delivery_date, missing_metadata, invoice, metadata_invoice
     if admin and user_id not in ADMIN_IDS:
         return None
@@ -242,7 +242,7 @@ def submit(order_id, user_id, reason, evidence, deactivated_at=None, expected_re
     from config import ADMIN_IDS
     from database import transaction
     from models.order import Order
-    from models.bot_operations import WarrantyRequest
+    from models.bot_operations import WarrantyRequest, WarrantyRequestRevision
     from services.input_forms import text_value, InputError
     from services.order_workflow import record_event
     from services.notification_outbox import enqueue
@@ -273,8 +273,9 @@ def submit(order_id, user_id, reason, evidence, deactivated_at=None, expected_re
         error = eligibility(order, user_id)
         if error and not (order and order.telegram_id == user_id and missing_metadata(order)):
             return error
-        if db.query(WarrantyRequest.id).filter_by(order_id=order_id).first():
-            return 'A claim already exists. Open its status from this order.'
+        request = db.query(WarrantyRequest).filter_by(order_id=order_id).with_for_update().first()
+        if request and request.status not in ('rejected', 'declined'):
+            return 'A claim is already open or completed. Open its status from this order.'
         mode = policy(order)
         quote = refund_quote(order) if mode == 'refund' else None
         if mode == 'refund':
@@ -282,21 +283,61 @@ def submit(order_id, user_id, reason, evidence, deactivated_at=None, expected_re
                 return 'Add a screenshot of deactivation and when it stopped working.'
             if expected_refund is not None and (not quote or str(quote['refund_amount']) != str(expected_refund)):
                 return 'The refund estimate changed. Review the updated estimate and submit again.'
-        import config
         saved_invoice = invoice(order)
-        saved_invoice.update(referral_commission_rate=str(getattr(config,'REFERRAL_COMMISSION_RATE','.05')),
-                             referral_credit_to_balance=bool(getattr(config,'REFERRAL_CREDIT_TO_BALANCE',True)))
-        db.add(WarrantyRequest(order_id=order_id, telegram_id=user_id, reason=reason, evidence=evidence,
-                              status='submitted', request_type=mode, deactivated_at=deactivated_at,
-                              issue_type=issue_type, product_confirmed=1, invoice_snapshot=saved_invoice,
-                              delivery_snapshot=order.delivered_account, proof_image=proof_bytes,
-                              proof_mime=mime, bot_id=main_bot_id(),
-                              refund_amount=quote['refund_amount'] if quote else None,
-                              used_days=quote['used_days'] if quote else None,
-                              remaining_days=quote['remaining_days'] if quote else None))
-        record_event(db, order_id, mode+'_requested', f'{mode.title()} requested for admin review.', actor_id=user_id)
+        # Refunds must reverse the commission actually recorded at purchase,
+        # not whatever rate happens to be configured when the claim is filed.
+        saved_invoice.update(
+            referral_commission_amount=(
+                str(order.referral_commission_amount)
+                if getattr(order, 'referral_commission_amount', None) is not None else None
+            ),
+            referral_credit_to_balance=(
+                bool(order.referral_commission_to_balance)
+                if getattr(order, 'referral_commission_to_balance', None) is not None else None
+            ),
+        )
+        now = datetime.utcnow()
+        if request:
+            from sqlalchemy import func
+            revision = (db.query(func.count(WarrantyRequestRevision.id))
+                        .filter(WarrantyRequestRevision.request_id == request.id).scalar() or 0) + 1
+            db.add(WarrantyRequestRevision(
+                request_id=request.id, order_id=order_id, revision=revision,
+                telegram_id=request.telegram_id, status=request.status, reason=request.reason,
+                evidence=request.evidence, request_type=request.request_type,
+                refund_amount=request.refund_amount, used_days=request.used_days,
+                remaining_days=request.remaining_days, deactivated_at=request.deactivated_at,
+                issue_type=request.issue_type, product_confirmed=request.product_confirmed,
+                invoice_snapshot=request.invoice_snapshot, delivery_snapshot=request.delivery_snapshot,
+                proof_image=request.proof_image, proof_mime=request.proof_mime,
+                admin_id=request.admin_id, resolution=request.resolution,
+                created_at=request.created_at, updated_at=request.updated_at,
+            ))
+            request.telegram_id, request.status, request.reason = user_id, 'submitted', reason
+            request.evidence, request.request_type = evidence, mode
+            request.refund_amount = quote['refund_amount'] if quote else None
+            request.used_days = quote['used_days'] if quote else None
+            request.remaining_days = quote['remaining_days'] if quote else None
+            request.deactivated_at, request.issue_type = deactivated_at, issue_type
+            request.product_confirmed, request.invoice_snapshot = 1, saved_invoice
+            request.delivery_snapshot, request.proof_image, request.proof_mime = order.delivered_account, proof_bytes, mime
+            request.bot_id, request.admin_id, request.resolution = main_bot_id(), None, None
+            request.created_at = request.updated_at = now
+            revision_number = revision + 1
+        else:
+            request = WarrantyRequest(order_id=order_id, telegram_id=user_id, reason=reason, evidence=evidence,
+                                      status='submitted', request_type=mode, deactivated_at=deactivated_at,
+                                      issue_type=issue_type, product_confirmed=1, invoice_snapshot=saved_invoice,
+                                      delivery_snapshot=order.delivered_account, proof_image=proof_bytes,
+                                      proof_mime=mime, bot_id=main_bot_id(),
+                                      refund_amount=quote['refund_amount'] if quote else None,
+                                      used_days=quote['used_days'] if quote else None,
+                                      remaining_days=quote['remaining_days'] if quote else None)
+            db.add(request)
+            revision_number = 1
+        record_event(db, order_id, mode+'_requested', f'{mode.title()} request attempt {revision_number} submitted.', actor_id=user_id)
         from services.notification_outbox import enqueue_admin
-        enqueue_admin(db, f'warranty:{order_id}:submitted',
+        enqueue_admin(db, f'warranty:{order_id}:submitted:{revision_number}',
                       f'🛡 <b>{mode.title()} review needed</b>\nOrder #{order_id}\nAdmin → Warranty / refund requests.',
                       reply_markup={'inline_keyboard': [[{'text': 'Review claim', 'callback_data': f'warranty_admin_{order_id}'}]]})
     return None
@@ -347,14 +388,13 @@ def review(order_id, admin_id, operation, resolution=None):
 
 def _approve_refund(db, order, request, admin_id):
     """Called inside the locked review transaction; all accounting rolls back together."""
-    from sqlalchemy import func, case
+    from sqlalchemy import func
     from models.order import Order
     from models.user import User
     from models.bot_operations import WarrantyRequest
     from models.admin_audit_log import AdminAuditLog
     from services.order_workflow import record_event
     from services.notification_outbox import enqueue
-    import config
     amount = request.refund_amount
     if amount is None:
         return 'Confirm the saved subscription and delivery date before approving this refund.'
@@ -380,25 +420,23 @@ def _approve_refund(db, order, request, admin_id):
     db.refresh(buyer)
     from services.wallet_ledger import record_wallet
     record_wallet(db,buyer,f"Refund · order #{order.id}",before_balance)
+    commission_reversed = None
     if buyer.referred_by:
-        saved = request.invoice_snapshot or {}
-        rate = Decimal(str(saved.get('referral_commission_rate',getattr(config, 'REFERRAL_COMMISSION_RATE', '.05'))))
-        if not rate.is_finite() or not 0 <= rate <= 1:
-            raise RuntimeError('Invalid saved commission configuration; refund rolled back.')
-        commission = (amount * rate).quantize(Decimal('.00000001'), rounding=ROUND_DOWN)
-        if commission.is_finite() and commission > 0:
-            earnings = func.coalesce(User.referral_earnings, 0)
-            values = {User.referral_earnings: case((earnings > commission, earnings - commission), else_=0)}
-            if saved.get('referral_credit_to_balance',getattr(config, 'REFERRAL_CREDIT_TO_BALANCE', True)):
-                values[User.balance] = func.coalesce(User.balance, 0) - commission
-            db.query(User).filter(User.telegram_id == buyer.referred_by).update(values, synchronize_session=False)
+        from services.referral_commission import reverse_saved_commission
+        commission_reversed = reverse_saved_commission(
+            db, order, buyer.referred_by, amount, admin_id,
+            invoice_snapshot=request.invoice_snapshot,
+        )
     request.status, request.admin_id = 'completed', admin_id
     request.resolution = f'Approved refund: ${amount:.8f} USDT credited to your bot wallet.'
     order.refunded, order.status, order.refund_amount = True, 'refunded', amount
     # Used delivery credentials must never return to sellable inventory.
     record_event(db, order.id, 'refunded', request.resolution, actor_id=admin_id)
+    commission_note = ''
+    if commission_reversed and commission_reversed.get('status') == 'legacy_unrecorded':
+        commission_note = ' Legacy referral commission was not reversed because its historical amount was not recorded; see audit log.'
     db.add(AdminAuditLog(admin_telegram_id=admin_id, action='policy_refund', entity_type='order',
-                        entity_id=str(order.id), summary=f'Approved ${amount:.8f}; {request.used_days} days used; inventory unchanged.'))
+                        entity_id=str(order.id), summary=f'Approved ${amount:.8f}; {request.used_days} days used; inventory unchanged.{commission_note}'))
     enqueue(db, f'warranty:{order.id}:refund', order.telegram_id,
             f'💸 <b>Order #{order.id} · Refund approved</b>\n{request.resolution}')
     return None

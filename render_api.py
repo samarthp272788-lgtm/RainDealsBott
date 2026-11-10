@@ -38,6 +38,10 @@ from services.provider_schema import ensure_provider_schema
 from services.maintenance_mode import ensure_maintenance_schema, is_maintenance_enabled
 from services.order_rating_schema import ensure_order_rating_schema
 from services.order_requirements_schema import ensure_order_requirements_schema
+from services.warranty_revision_schema import ensure_warranty_revision_schema
+from services.task_supervisor import supervise
+from services.polling_lease import ensure_polling_lease_schema, run_polling_as_leader
+from services.session_resume import flush_pending_resume
 from services.upstream_callbacks import process_upstream_callback
 from services.cloudflare_bridge import dispatch_update, ensure_schema, verify_request
 from config import API_MAX_REQUEST_BYTES
@@ -92,6 +96,9 @@ async def lifespan(app: FastAPI):
         await asyncio.to_thread(ensure_maintenance_schema)
         await asyncio.to_thread(ensure_order_rating_schema)
         await asyncio.to_thread(ensure_order_requirements_schema)
+        await asyncio.to_thread(ensure_warranty_revision_schema)
+        if TELEGRAM_TRANSPORT != "cloudflare":
+            await asyncio.to_thread(ensure_polling_lease_schema)
 
         if TELEGRAM_TRANSPORT == "cloudflare":
             if len(CLOUDFLARE_BRIDGE_SECRET) < 32:
@@ -121,8 +128,8 @@ async def lifespan(app: FastAPI):
         await recover_interrupted_deposit_cards(bot)
 
         deposit_card_task = asyncio.create_task(
-            deposit_invoice_expiry_loop(bot),
-            name="deposit-invoice-card-expiry",
+            supervise("deposit-invoice-card-expiry", lambda: deposit_invoice_expiry_loop(bot)),
+            name="supervisor-deposit-invoice-card-expiry",
         )
 
         # ----------------------------------------------------
@@ -130,19 +137,22 @@ async def lifespan(app: FastAPI):
         # ----------------------------------------------------
 
         deposit_task = asyncio.create_task(
-            deposit_checker_loop(bot),
-            name="deposit-checker",
+            supervise("deposit-checker", lambda: deposit_checker_loop(bot)),
+            name="supervisor-deposit-checker",
         )
 
-        notification_outbox_task = asyncio.create_task(notification_loop(bot), name="notification-outbox")
+        notification_outbox_task = asyncio.create_task(
+            supervise("notification-outbox", lambda: notification_loop(bot)),
+            name="supervisor-notification-outbox",
+        )
 
         order_notification_task = asyncio.create_task(
-            order_notification_loop(bot),
-            name="admin-order-notifications",
+            supervise("admin-order-notifications", lambda: order_notification_loop(bot), retry_seconds=30),
+            name="supervisor-admin-order-notifications",
         )
         supplier_reconciliation_task = asyncio.create_task(
-            supplier_reconciliation_loop(bot),
-            name="supplier-order-reconciliation",
+            supervise("supplier-order-reconciliation", lambda: supplier_reconciliation_loop(bot)),
+            name="supervisor-supplier-order-reconciliation",
         )
 
         # ----------------------------------------------------
@@ -151,12 +161,8 @@ async def lifespan(app: FastAPI):
 
         if TELEGRAM_TRANSPORT != "cloudflare":
             polling_task = asyncio.create_task(
-                dp.start_polling(
-                    bot,
-                    handle_signals=False,
-                    close_bot_session=False,
-                ),
-                name="telegram-polling",
+                run_polling_as_leader(bot, dp),
+                name="telegram-polling-leader",
             )
         else:
             logger.info("Main bot polling disabled; waiting for signed Cloudflare queue updates")
@@ -190,6 +196,8 @@ async def lifespan(app: FastAPI):
             if task:
                 with suppress(asyncio.CancelledError):
                     await task
+
+        await flush_pending_resume()
 
         if bot.session:
             await bot.session.close()
@@ -434,10 +442,10 @@ async def root():
 
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
-    return {
-        "status": "ok",
-        "service": "Rain Reseller API",
-    }
+    from services.readiness import database_readiness
+    ready = await asyncio.to_thread(database_readiness, TELEGRAM_TRANSPORT != "cloudflare")
+    ready['service'] = "Rain Reseller API"
+    return JSONResponse(ready, status_code=200 if ready['status'] == 'ready' else 503)
 
 
 # ============================================================

@@ -71,6 +71,32 @@ def install_database_observers(engine):
         if execution is not None and hasattr(execution, '_bot_started'):
             observe('database', operation.get(), time.perf_counter()-execution._bot_started, True)
 
+    # SQL execution events start only after a pooled connection is checked
+    # out. Wrap the public pool.connect entry point to include queue wait and
+    # connection creation time in the latency totals.
+    pool = engine.pool
+    if not getattr(pool, '_bot_pool_wait_observer', False):
+        original_connect = pool.connect
+
+        def timed_pool_connect(*args, **kwargs):
+            started = time.perf_counter()
+            failed = False
+            try:
+                return original_connect(*args, **kwargs)
+            except BaseException:
+                failed = True
+                raise
+            finally:
+                observe('database_pool', 'checkout_wait', time.perf_counter() - started, failed)
+
+        try:
+            pool.connect = timed_pool_connect
+            pool._bot_pool_wait_observer = True
+        except Exception:
+            # Metrics must never prevent database startup if an alternate
+            # SQLAlchemy pool implementation makes the method read-only.
+            pass
+
 
 class TelegramTimings:
     async def __call__(self, make_request, bot, method):

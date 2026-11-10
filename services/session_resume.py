@@ -143,25 +143,31 @@ def make_snapshot(state, data, navigation=None, *, admin=False, prompt=None, las
     return json.loads(json.dumps(value, default=_json_value))
 
 
-def _resume_secrets():
+def _resume_write_secrets():
     import config
-    # API_KEY_ENCRYPTION_KEY was the original stable-key option for resume
-    # snapshots. Keep it as a compatibility fallback, then BOT_TOKEN for
-    # snapshots created before a dedicated key was configured.
+    # New snapshots must use stable encryption secrets. Bot-token rotation
+    # must not make newly persisted drafts unreadable.
     values = (
         getattr(config, 'SESSION_RESUME_ENCRYPTION_KEY', ''),
         getattr(config, 'API_KEY_ENCRYPTION_KEY', ''),
-        getattr(config, 'BOT_TOKEN', ''),
     )
+    return tuple(dict.fromkeys(str(value) for value in values if value))
+
+
+def _resume_read_secrets():
+    import config
+    # BOT_TOKEN is retained only as a legacy decryption key for snapshots
+    # written before SESSION_RESUME_ENCRYPTION_KEY was introduced.
+    values = (*_resume_write_secrets(), getattr(config, 'BOT_TOKEN', ''))
     return tuple(dict.fromkeys(str(value) for value in values if value))
 
 
 def _cipher(key, secret=None):
     from cryptography.fernet import Fernet
     if secret is None:
-        secrets = _resume_secrets()
+        secrets = _resume_write_secrets()
         if not secrets:
-            raise RuntimeError('Configure SESSION_RESUME_ENCRYPTION_KEY to encrypt saved sessions.')
+            raise RuntimeError('Configure SESSION_RESUME_ENCRYPTION_KEY or API_KEY_ENCRYPTION_KEY to encrypt saved sessions.')
         secret = secrets[0]
     seed = f'raindeals-resume-v1:{secret}:{key[0]}:{key[1]}'.encode()
     return Fernet(base64.urlsafe_b64encode(hashlib.sha256(seed).digest()))
@@ -178,7 +184,7 @@ def open_snapshot(key, payload):
     from cryptography.fernet import InvalidToken
     try:
         ciphertext = payload['ciphertext'].encode()
-        for secret in _resume_secrets():
+        for secret in _resume_read_secrets():
             try:
                 return json.loads(_cipher(key, secret).decrypt(ciphertext, ttl=MAX_AGE_SECONDS))
             except InvalidToken:
@@ -210,11 +216,13 @@ def _persist(key, snapshot):
 
 async def _flush(key):
     while key in _pending:
-        await asyncio.sleep(0.15)  # Coalesce rapid navigation without holding handlers.
         snapshot = _pending.pop(key)
         try:
             await asyncio.to_thread(_persist, key, snapshot)
         except Exception:
+            cached = _cache.get(key)
+            if cached and cached[1] == snapshot:
+                _cache.pop(key, None)
             logger.exception('Could not persist resumable customer session for %s', key[0])
 
 

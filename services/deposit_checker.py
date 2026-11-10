@@ -44,6 +44,8 @@ import json
 import logging
 import os
 import re
+import secrets
+import threading
 import time as time_module
 
 from dataclasses import dataclass, field
@@ -53,7 +55,7 @@ from email.header import decode_header
 from typing import Optional, Union
 
 import requests
-from sqlalchemy import func
+from sqlalchemy import func, or_
 
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
@@ -84,6 +86,13 @@ DEPOSIT_COINS = {"USDT"} & {
 BINANCE_CLAIM_WINDOW = timedelta(
     hours=max(1, int(getattr(config, "BINANCE_DEPOSIT_CLAIM_WINDOW_HOURS", 72)))
 )
+DEPOSIT_VERIFICATION_LEASE_SECONDS = max(
+    60, min(900, int(getattr(config, "DEPOSIT_VERIFICATION_LEASE_SECONDS", 300)))
+)
+DEPOSIT_VERIFICATION_CONCURRENCY = max(
+    1, min(8, int(getattr(config, "DEPOSIT_VERIFICATION_CONCURRENCY", 4)))
+)
+_binance_request_lock = threading.Lock()
 
 # ================================================================
 # WALLET ADDRESSES
@@ -282,13 +291,14 @@ FAMAPP_SENDER_EMAIL = getattr(
 )
 
 IMAP_LOOKBACK_DAYS = int(
-    getattr(config, "IMAP_LOOKBACK_DAYS", 1)
+    getattr(config, "IMAP_LOOKBACK_DAYS", 7)
 )
+IMAP_TIMEOUT_SECONDS = max(5, min(60, int(getattr(config, "IMAP_TIMEOUT_SECONDS", 20))))
 
 MAX_EMAILS_TO_SCAN = int(
     getattr(config,
             "UPI_MAX_EMAILS_TO_SCAN",
-            40)
+            200)
 )
 
 # ================================================================
@@ -450,6 +460,7 @@ _pending_deposit_scan_ceiling: int | None = None
 PENDING_DEPOSIT_BATCH_SIZE = 25
 
 _binance_client: Optional[Client] = None
+_binance_client_lock = threading.Lock()
 
 # Binance may reject all API requests from the server's jurisdiction.
 _binance_access_restricted = False
@@ -526,7 +537,7 @@ def valid_utr(utr: str) -> bool:
 # BINANCE CLIENT
 # ================================================================
 
-def _get_binance_client() -> Optional[Client]:
+def _initialize_binance_client() -> Optional[Client]:
     global _binance_client
 
     if _binance_access_restricted:
@@ -597,6 +608,20 @@ def _get_binance_client() -> Optional[Client]:
         _binance_client = None
 
         return None
+
+
+def _get_binance_client() -> Optional[Client]:
+    global _binance_client
+    if _binance_access_restricted or not BINANCE_API_KEY or not BINANCE_API_SECRET:
+        return None
+    if _binance_client is not None:
+        return _binance_client
+    with _binance_client_lock:
+        if _binance_access_restricted:
+            return None
+        if _binance_client is None:
+            return _initialize_binance_client()
+        return _binance_client
 
 
 # ================================================================
@@ -1092,11 +1117,16 @@ def _fetch_binance_deposits_sync(
     start_time = max(claim_start_time, max_window_start)
 
     try:
-        rows = client.get_deposit_history(
-            txId=tx_hash,
-            startTime=start_time,
-            endTime=end_time,
-        ) or []
+        # python-binance keeps a shared requests.Session; serialize access to
+        # that client while other deposit checks may run concurrently.
+        with _binance_request_lock:
+            if _binance_access_restricted:
+                return []
+            rows = client.get_deposit_history(
+                txId=tx_hash,
+                startTime=start_time,
+                endTime=end_time,
+            ) or []
         return rows if isinstance(rows, list) else []
     except BinanceAPIException as exc:
         if _is_binance_location_restriction(exc):
@@ -1122,6 +1152,8 @@ def _match_binance_row(
         rows: list[dict],
         requested_amount: Optional[Decimal],
         claim_started_at: Optional[datetime] = None,
+        invoice_created_at: Optional[datetime] = None,
+        invoice_expires_at: Optional[datetime] = None,
 ):
     row = next((item for item in rows if isinstance(item, dict) and str(
         item.get("txId") or item.get("txid") or ""
@@ -1191,6 +1223,20 @@ def _match_binance_row(
                 tx_hash[:18],
             )
             return False
+        if invoice_created_at is not None:
+            created = invoice_created_at
+            if created.tzinfo is not None:
+                created = created.astimezone(timezone.utc).replace(tzinfo=None)
+            if record_time < created - timedelta(minutes=5):
+                logger.warning("[%s] Binance deposit predates the invoice; leaving uncredited | tx=%s", chain.name, tx_hash[:18])
+                return False
+        if invoice_expires_at is not None:
+            expires = invoice_expires_at
+            if expires.tzinfo is not None:
+                expires = expires.astimezone(timezone.utc).replace(tzinfo=None)
+            if record_time > expires + timedelta(minutes=5):
+                logger.warning("[%s] Binance deposit arrived after invoice expiry; leaving uncredited | tx=%s", chain.name, tx_hash[:18])
+                return False
     except (TypeError, ValueError, OverflowError, OSError):
         logger.warning(
             "[%s] Binance deposit record has no valid timestamp | tx=%s",
@@ -1314,6 +1360,8 @@ def _match_binance_row(
             "binance_coin": binance_coin,
             "binance_network": row_network,
             "binance_address": binance_address,
+            "insert_time": row.get("insertTime"),
+            "source_address": row.get("sourceAddress"),
         }
 
     # ------------------------------------------------------------
@@ -1350,6 +1398,8 @@ async def verify_transaction(
         tx_hash: str,
         requested_amount: Optional[Decimal] = None,
         claim_started_at: Optional[datetime] = None,
+        invoice_created_at: Optional[datetime] = None,
+        invoice_expires_at: Optional[datetime] = None,
 ):
     """Verify an exchange deposit using Binance's signed history record only.
 
@@ -1383,6 +1433,8 @@ async def verify_transaction(
         rows,
         requested_amount,
         claim_started_at,
+        invoice_created_at,
+        invoice_expires_at,
     )
 
     if binance_result is None:
@@ -1618,7 +1670,8 @@ def _fetch_famapp_matches() -> dict:
     try:
 
         mail = imaplib.IMAP4_SSL(
-            IMAP_HOST
+            IMAP_HOST,
+            timeout=IMAP_TIMEOUT_SECONDS,
         )
 
         mail.login(
@@ -1843,9 +1896,8 @@ def _query_pay_trade_history_sync(
 
     try:
 
-        server_time = client.get_server_time()[
-            "serverTime"
-        ]
+        with _binance_request_lock:
+            server_time = client.get_server_time()["serverTime"]
 
     except Exception as exc:
 
@@ -2428,7 +2480,7 @@ def _locked_deposit(db, deposit_id: int):
         .first()
     )
 
-async def verify_deposit(
+async def _verify_deposit_claimed(
         deposit_or_id,
         upi_matches=None,
         result_info=None,
@@ -2679,17 +2731,10 @@ async def verify_deposit(
                 verification["amount"]
             )
 
-            if requested_amount is not None and requested_amount > Decimal("0"):
-
-                if (
-                        received_amount
-                        < requested_amount
-                        - AMOUNT_TOLERANCE
-                ):
-                    _hold_underpaid_for_review(
-                        db, deposit, received_amount, requested_amount, result_info,
-                    )
-                    return None
+            if requested_amount is not None and requested_amount > Decimal("0") and received_amount < requested_amount - AMOUNT_TOLERANCE:
+                if result_info is not None:
+                    result_info.update({"reason": "verified_partial_credit", "deposit_id": deposit.id,
+                                        "requested": str(requested_amount), "received": str(received_amount)})
 
             _clear_pending_attempts(
                 deposit.id
@@ -2749,6 +2794,8 @@ async def verify_deposit(
                 deposit.tx_hash,
                 requested_amount,
                 claim_started_at,
+                deposit.created_at,
+                deposit.invoice_expires_at,
             )
         )
 
@@ -2766,10 +2813,12 @@ async def verify_deposit(
         # --------------------------------------------------------
 
         if isinstance(verification, dict) and verification.get("underpaid"):
-            _hold_underpaid_for_review(
-                db, deposit, Decimal(str(verification["amount"])), requested_amount, result_info,
-            )
-            return None
+            # Binance confirmed a matching successful transfer. Credit only
+            # the actual amount received; no admin approval is needed.
+            received_amount = Decimal(str(verification["amount"]))
+            if result_info is not None:
+                result_info.update({"reason": "verified_partial_credit", "deposit_id": deposit.id,
+                                    "requested": str(requested_amount or 0), "received": str(received_amount)})
 
         if verification is None:
             # Binance may index a deposit late, or its API may be temporarily
@@ -2812,17 +2861,10 @@ async def verify_deposit(
             logger.error("Verified Binance response had an invalid amount; deposit remains pending id=%s", deposit.id)
             return None
 
-        if requested_amount is not None and requested_amount > Decimal("0"):
-
-            if (
-                    received_amount
-                    < requested_amount
-                    - AMOUNT_TOLERANCE
-            ):
-                _hold_underpaid_for_review(
-                    db, deposit, received_amount, requested_amount, result_info,
-                )
-                return None
+        if requested_amount is not None and requested_amount > Decimal("0") and received_amount < requested_amount - AMOUNT_TOLERANCE:
+            if result_info is not None:
+                result_info.update({"reason": "verified_partial_credit", "deposit_id": deposit.id,
+                                    "requested": str(requested_amount), "received": str(received_amount)})
 
         # --------------------------------------------------------
         # Final duplicate protection
@@ -2899,6 +2941,95 @@ async def verify_deposit(
 
         if db is not None:
             db.close()
+
+
+def _claim_verification_lease(deposit_id: int) -> str | None:
+    """Atomically claim one pending payment check across all bot processes."""
+    db = SessionLocal()
+    now = datetime.utcnow()
+    token = secrets.token_hex(24)
+    try:
+        state = db.query(Deposit.status).filter(Deposit.id == deposit_id).scalar()
+        if state == "completed":
+            return "completed"
+        if state == "failed":
+            return "failed"
+        claimed = db.query(Deposit).filter(
+            Deposit.id == deposit_id,
+            Deposit.status == "pending",
+            Deposit.tx_hash.is_not(None),
+            or_(Deposit.verification_lease_until.is_(None),
+                Deposit.verification_lease_until <= now),
+        ).update({
+            Deposit.verification_lease_token: token,
+            Deposit.verification_lease_until: now + timedelta(seconds=DEPOSIT_VERIFICATION_LEASE_SECONDS),
+        }, synchronize_session=False)
+        db.commit()
+        return token if claimed == 1 else None
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _release_verification_lease(deposit_id: int, token: str) -> None:
+    db = SessionLocal()
+    try:
+        db.query(Deposit).filter(
+            Deposit.id == deposit_id,
+            Deposit.verification_lease_token == token,
+        ).update({
+            Deposit.verification_lease_token: None,
+            Deposit.verification_lease_until: None,
+        }, synchronize_session=False)
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.warning("Could not release deposit verification lease id=%s", deposit_id)
+    finally:
+        db.close()
+
+
+async def verify_deposit(deposit_or_id, upi_matches=None, result_info=None):
+    deposit_id = deposit_or_id if isinstance(deposit_or_id, int) else deposit_or_id.id
+    try:
+        lease_token = await asyncio.to_thread(_claim_verification_lease, deposit_id)
+    except Exception:
+        logger.exception("Could not claim deposit verification lease id=%s", deposit_id)
+        if result_info is not None:
+            result_info.update({"reason": "verification_lease_unavailable", "deposit_id": deposit_id})
+        return None
+    if lease_token == "completed":
+        return True
+    if lease_token == "failed":
+        return False
+    if not lease_token:
+        if result_info is not None:
+            result_info.update({"reason": "verification_in_progress", "deposit_id": deposit_id})
+        return None
+    try:
+        return await _verify_deposit_claimed(deposit_id, upi_matches=upi_matches, result_info=result_info)
+    finally:
+        await asyncio.to_thread(_release_verification_lease, deposit_id, lease_token)
+
+
+async def _verify_pending_ids(deposit_ids, label, bot=None, upi_matches=None, binance_only=False):
+    semaphore = asyncio.Semaphore(DEPOSIT_VERIFICATION_CONCURRENCY)
+
+    async def run_one(deposit_id):
+        async with semaphore:
+            if binance_only and _binance_access_restricted:
+                return
+            try:
+                result_info: dict = {}
+                await verify_deposit(deposit_id, upi_matches=upi_matches, result_info=result_info)
+                await _notify_attempt_limit(bot, result_info)
+            except Exception:
+                logger.exception("%s deposit %s failed", label, deposit_id)
+
+    if deposit_ids:
+        await asyncio.gather(*(run_one(deposit_id) for deposit_id in deposit_ids))
 
 
 # ================================================================
@@ -3010,47 +3141,19 @@ async def check_pending_deposits(bot=None):
     # CRYPTO
     # ------------------------------------------------------------
 
-    for deposit_id in ([] if binance_credentials_missing or _binance_access_restricted else crypto_ids):
-        if _binance_access_restricted:
-            break
-
-        try:
-            result_info: dict = {}
-            await verify_deposit(
-                deposit_id,
-                result_info=result_info,
-            )
-            await _notify_attempt_limit(bot, result_info)
-
-        except Exception:
-
-            logger.exception(
-                "Crypto deposit %s failed",
-                deposit_id,
-            )
+    await _verify_pending_ids(
+        [] if binance_credentials_missing or _binance_access_restricted else crypto_ids,
+        "Crypto", bot, binance_only=True,
+    )
 
     # ------------------------------------------------------------
     # BINANCE PAY
     # ------------------------------------------------------------
 
-    for deposit_id in ([] if binance_credentials_missing or _binance_access_restricted else pay_ids):
-        if _binance_access_restricted:
-            break
-
-        try:
-            result_info: dict = {}
-            await verify_deposit(
-                deposit_id,
-                result_info=result_info,
-            )
-            await _notify_attempt_limit(bot, result_info)
-
-        except Exception:
-
-            logger.exception(
-                "Binance Pay %s failed",
-                deposit_id,
-            )
+    await _verify_pending_ids(
+        [] if binance_credentials_missing or _binance_access_restricted else pay_ids,
+        "Binance Pay", bot, binance_only=True,
+    )
 
     # ------------------------------------------------------------
     # UPI
@@ -3068,23 +3171,7 @@ async def check_pending_deposits(bot=None):
 
             upi_matches = {}
 
-        for deposit_id in upi_ids:
-
-            try:
-                result_info: dict = {}
-                await verify_deposit(
-                    deposit_id,
-                    upi_matches=upi_matches,
-                    result_info=result_info,
-                )
-                await _notify_attempt_limit(bot, result_info)
-
-            except Exception:
-
-                logger.exception(
-                    "UPI deposit %s failed",
-                    deposit_id,
-                )
+        await _verify_pending_ids(upi_ids, "UPI", bot, upi_matches=upi_matches)
 
 
 # ================================================================

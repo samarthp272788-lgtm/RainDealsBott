@@ -14,9 +14,12 @@ def ensure_provider_schema() -> None:
             )
         ).first()
         if not exists:
-            connection.execute(
-                text(
-                    "ALTER TABLE providers "
-                    "ADD COLUMN api_secret TEXT NULL"
-                )
-            )
+            try:
+                connection.execute(text("ALTER TABLE providers ADD COLUMN api_secret TEXT NULL"))
+            except Exception:
+                exists = connection.execute(text(
+                    "SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() "
+                    "AND TABLE_NAME='providers' AND COLUMN_NAME='api_secret'"
+                )).first()
+                if not exists:
+                    raise

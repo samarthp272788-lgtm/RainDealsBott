@@ -1,5 +1,5 @@
 """Bind one payment reference to its owner's invoice without replacing prior work."""
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
@@ -8,6 +8,7 @@ from sqlalchemy.exc import IntegrityError
 def bind_reference(deposit_id, reference, user_id, network):
     from database import transaction
     from models.deposit import Deposit
+    import config
     reference = reference.strip()
     if network in ('BEP20', 'POLYGON'):
         reference = reference.lower()
@@ -22,22 +23,40 @@ def bind_reference(deposit_id, reference, user_id, network):
                 return 'not_found'
             if deposit.status == 'completed':
                 return 'completed'
-            if deposit.status in ('failed', 'expired', 'cancelled'):
+            if deposit.status in ('failed', 'cancelled'):
                 return 'closed'
             if deposit.tx_hash:
                 # A repeat is acknowledged; a different reference needs another invoice.
                 return 'already_submitted' if deposit.tx_hash.casefold() == reference.casefold() else 'reference_locked'
-            if deposit.invoice_expires_at and deposit.invoice_expires_at <= datetime.utcnow():
-                deposit.status = 'expired'
-                return 'expired'
+            now = datetime.utcnow()
+            late_reference = False
+            invoice_expired = bool(deposit.invoice_expires_at and deposit.invoice_expires_at <= now)
+            if deposit.status == 'expired' or invoice_expired:
+                # A customer may submit a Binance-chain TXID after the invoice
+                # card's one-hour display window. The verifier still checks the
+                # Binance timestamp against the original invoice interval, so
+                # this cannot claim a payment made after the invoice expired.
+                late_hours = max(1, min(168, int(getattr(config, 'DEPOSIT_LATE_REFERENCE_HOURS', 72))))
+                late_deadline = (deposit.invoice_expires_at + timedelta(hours=late_hours)
+                                 if deposit.invoice_expires_at else None)
+                late_reference = (
+                    network in ('BEP20', 'POLYGON')
+                    and deposit.created_at is not None
+                    and late_deadline is not None
+                    and now <= late_deadline
+                    and deposit.status in ('waiting_hash', 'expired')
+                )
+                if not late_reference:
+                    deposit.status = 'expired'
+                    return 'expired'
             bound = db.query(Deposit).filter(Deposit.id == deposit_id, Deposit.tx_hash.is_(None),
                       Deposit.status == deposit.status).update({Deposit.tx_hash: reference, Deposit.status: 'pending',
-                          Deposit.verification_started_at: datetime.utcnow()}, synchronize_session=False)
+                          Deposit.verification_started_at: now}, synchronize_session=False)
             if bound != 1:
                 fresh = db.query(Deposit).filter(Deposit.id == deposit_id).populate_existing().with_for_update().first()
                 if fresh.status == 'completed':
                     return 'completed'
-                if fresh.status in ('failed', 'expired', 'cancelled'):
+                if fresh.status in ('failed', 'cancelled'):
                     return 'closed'
                 return 'already_submitted' if fresh.tx_hash and fresh.tx_hash.casefold() == reference.casefold() else 'reference_locked'
         return 'ok'

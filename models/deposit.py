@@ -33,6 +33,8 @@ class Deposit(Base):
     telegram_chat_id = Column(BigInteger, nullable=True)
     telegram_message_id = Column(BigInteger, nullable=True)
     verification_started_at = Column(DateTime, nullable=True, index=True)
+    verification_lease_token = Column(String(64), nullable=True)
+    verification_lease_until = Column(DateTime, nullable=True, index=True)
 
     tx_hash = Column(
         String(255),

@@ -6,6 +6,7 @@ from services.notification_outbox import enqueue, queue_message
 from datetime import datetime
 import asyncio
 import logging
+import re
 from html import escape
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -55,6 +56,11 @@ STATUS_LABELS = {
 ADMIN_ORDERS_PER_PAGE = 10
 
 
+def _callback_id(callback: CallbackQuery, prefix: str) -> int | None:
+    match = re.fullmatch(re.escape(prefix) + r'(\d{1,15})', str(callback.data or ''))
+    return int(match.group(1)) if match else None
+
+
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
@@ -82,27 +88,57 @@ def _credit_preorder_referral(db, order) -> dict | None:
     return {"referrer_telegram_id": referrer.telegram_id, "amount": commission}
 
 
-def _finalize_bridged_delivery(order_id: int, admin_id: int) -> dict:
-    """Mark delivery complete after the bridge confirms send or durable queue."""
+def _finalize_bridged_delivery(order_id: int, admin_id: int, bridge_status: str) -> dict:
+    """Complete only after Telegram confirms the send; keep waiting jobs pending."""
+    bridge_status = str(bridge_status or '').strip().lower()
+    if bridge_status not in {'sent', 'already_sent', 'queued', 'waiting_for_start'}:
+        return {"error": "Delivery Worker returned an unknown state."}
     with transaction() as db:
         order = db.query(Order).filter(Order.id == order_id).with_for_update().first()
         if not order:
             return {"error": "Order not found."}
         if order.refunded:
             return {"error": "This order has already been refunded."}
-        if order.status == "completed":
+        # Repair records completed by older code even though the delivery bot
+        # had not been started. The bridge's current waiting state is the
+        # authoritative indication that the recipient has not received it.
+        if order.status == "completed" and bridge_status not in {"queued", "waiting_for_start"}:
             return {"status": "completed", "already_completed": True}
+        if bridge_status in {"queued", "waiting_for_start"}:
+            if order.status not in {"delivery_pending", "completed"}:
+                return {"error": "Order is not waiting for delivery confirmation."}
+            was_completed = order.status == "completed"
+            if was_completed:
+                order.coverage_started_at = None
+                order.warranty_expires_at = None
+            order.status = "delivery_pending"
+            from models.order_workflow import OrderEvent
+            event_kind = "delivery_waiting_for_start" if bridge_status == "waiting_for_start" else "delivery_queued"
+            last_kind = db.query(OrderEvent.kind).filter_by(order_id=order.id).order_by(OrderEvent.id.desc()).limit(1).scalar()
+            if was_completed or last_kind != event_kind:
+                record_event(
+                    db, order.id, event_kind,
+                    "Delivery is saved by the Delivery Worker and is waiting for the recipient to start it.",
+                    actor_id=admin_id,
+                )
+                db.add(AdminAuditLog(
+                    admin_telegram_id=int(admin_id), action="delivery_waiting",
+                    entity_type="order", entity_id=str(order.id),
+                    summary=("Corrected legacy premature completion; Delivery Worker reports waiting."
+                             if was_completed else f"Delivery Worker state: {bridge_status}."),
+                ))
+            return {"status": bridge_status, "delivery_pending": True}
         if order.status != "delivery_pending":
             return {"error": "Order is not waiting for delivery confirmation."}
         order.status = "completed"
         order.manual_pending_quantity = 0
         commission = _credit_preorder_referral(db, order)
         start_coverage(order)
-        record_event(db, order.id, "completed", "Delivery Worker confirmed the delivery or saved it for the recipient to collect.", actor_id=admin_id)
+        record_event(db, order.id, "completed", "Delivery Worker confirmed that Telegram accepted the delivery.", actor_id=admin_id)
         db.add(AdminAuditLog(
             admin_telegram_id=int(admin_id), action="confirm_manual_delivery",
             entity_type="order", entity_id=str(order.id),
-            summary="Delivery Worker confirmed or durably queued the delivery.",
+            summary="Delivery Worker confirmed the Telegram send.",
         ))
         return {"status": "completed", "commission_paid": commission}
 
@@ -432,11 +468,12 @@ async def bulk_inventory_run(callback: CallbackQuery):
         try:
             delivery_result = await send_manual_delivery(item["order_id"], item["destination_id"], callback.from_user.id)
             finalized = await asyncio.to_thread(
-                _finalize_bridged_delivery, item["order_id"], callback.from_user.id
+                _finalize_bridged_delivery, item["order_id"], callback.from_user.id,
+                delivery_result.get("status"),
             )
             if finalized.get("error"):
                 raise DeliveryBridgeError(finalized["error"])
-            if delivery_result.get("status") == "waiting_for_start":
+            if delivery_result.get("status") in {"waiting_for_start", "queued"}:
                 waiting += 1
             else:
                 sent += 1
@@ -455,7 +492,7 @@ async def bulk_inventory_run(callback: CallbackQuery):
             failures.append((item["order_id"], "Delivery status could not be reconciled. Retry this order."))
     switched_notice = "\n⚠️ Inventory is empty; future orders now use manual fulfillment." if result["switched_to_manual"] else ""
     text = (f"📦 <b>Bulk delivery finished</b>\n\nProduct: <b>{escape(result['product_name'])}</b>\n"
-            f"Orders processed: <b>{len(result['orders'])}</b>\nSent: <b>{sent}</b> · Waiting for /start: <b>{waiting}</b> · Delivery errors: <b>{failed}</b>\n"
+            f"Orders processed: <b>{len(result['orders'])}</b>\nSent: <b>{sent}</b> · Pending delivery: <b>{waiting}</b> · Delivery errors: <b>{failed}</b>\n"
             f"Awaiting delivery confirmation: <b>{result['delivery_pending_count']}</b>\n"
             f"Remaining stock: <b>{result['remaining_stock']}</b> · Pending orders: <b>{result['remaining_orders']}</b>"
             f"{switched_notice}")
@@ -693,32 +730,10 @@ def _do_refund(order_id: int, admin_id: int, cancellation_only: bool = False) ->
         # commission was ever paid on that last one).
         commission_reversed = None
         if order.status != "preorder" and not order.is_preorder and buyer.referred_by:
-            referrer = (
-                db.query(User)
-                .filter(User.telegram_id == buyer.referred_by)
-                .with_for_update()
-                .first()
+            from services.referral_commission import reverse_saved_commission
+            commission_reversed = reverse_saved_commission(
+                db, order, buyer.referred_by, refund_amount, admin_id,
             )
-            if referrer is not None:
-                saved_commission = getattr(order, "referral_commission_amount", None)
-                commission = _money(
-                    saved_commission if saved_commission is not None
-                    else refund_amount * REFERRAL_COMMISSION_RATE
-                )
-                if commission > 0:
-                    referrer.referral_earnings = max(
-                        Decimal("0"),
-                        _money(referrer.referral_earnings) - commission,
-                    )
-                    credited_to_balance = getattr(order, "referral_commission_to_balance", None)
-                    if credited_to_balance is None:
-                        credited_to_balance = REFERRAL_CREDIT_TO_BALANCE
-                    if credited_to_balance:
-                        referrer.balance = _money(referrer.balance) - commission
-                    commission_reversed = {
-                        "referrer_telegram_id": referrer.telegram_id,
-                        "amount": commission,
-                    }
 
         # --- Refund the buyer -----------------------------------
         buyer.balance = _money(buyer.balance) + refund_amount
@@ -760,7 +775,10 @@ async def refund_order(callback: CallbackQuery):
         await callback.answer("Access denied.", show_alert=True)
         return
 
-    order_id = int(callback.data.split("_")[1])
+    order_id = _callback_id(callback, "refund_")
+    if order_id is None:
+        await callback.answer("Invalid order action.", show_alert=True)
+        return
 
     try:
         result = await _dispatch_blocking(_do_refund, order_id, callback.from_user.id)
@@ -793,14 +811,20 @@ async def delete_order(callback: CallbackQuery):
         await callback.answer("Access denied.", show_alert=True)
         return
 
-    order_id = int(callback.data.split("_")[2])
+    order_id = _callback_id(callback, "delete_order_")
+    if order_id is None:
+        await callback.answer("Invalid order action.", show_alert=True)
+        return
 
     db = SessionLocal()
     try:
-        order = db.query(Order).filter(Order.id == order_id).first()
+        order = db.query(Order).filter(Order.id == order_id).with_for_update().first()
 
         if not order:
             await callback.answer("Order not found.")
+            return
+        if order.status == "deleted":
+            await callback.answer("This order is already archived.", show_alert=True)
             return
 
         # Soft delete: keep the row (audit trail, refund history,
@@ -842,13 +866,19 @@ async def deliver_order_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Access denied.", show_alert=True)
         return
 
-    order_id = int(callback.data.split("_")[2])
+    order_id = _callback_id(callback, "deliver_order_")
+    if order_id is None:
+        await callback.answer("Invalid order action.", show_alert=True)
+        return
 
     db = SessionLocal()
     try:
         order = db.get(Order, order_id)
         is_api_order = bool(order and db.query(ApiOrder.id).filter(ApiOrder.order_id == order.id).first())
-        if order and order.delivery_type in {"manual", "hybrid"} and not (
+        if not order or order.refunded or order.status not in {"pending_manual", "preorder", "processing"}:
+            await callback.answer("This order is no longer waiting for manual delivery.", show_alert=True)
+            return
+        if order.delivery_type in {"manual", "hybrid"} and not (
             config.DELIVERY_BRIDGE_URL and config.DELIVERY_BRIDGE_SECRET
         ):
             await callback.answer(
@@ -890,8 +920,8 @@ async def deliver_order_start(callback: CallbackQuery, state: FSMContext):
     await answer_card(callback,
         "📤 Send the content to deliver to the buyer "
         "(account, key, or any message).\n\n"
-        "It will be sent to them exactly as you type it, "
-        "and the order will be marked completed."
+        "It will be queued exactly as you type it. The order remains pending "
+        "until Telegram accepts the delivery message."
         + destination_note
     )
     await callback.answer()
@@ -1083,7 +1113,8 @@ async def deliver_order_finish(message: Message, state: FSMContext):
                 )
                 return
             finalized = await asyncio.to_thread(
-                _finalize_bridged_delivery, order_id, message.from_user.id
+                _finalize_bridged_delivery, order_id, message.from_user.id,
+                delivery_result.get("status"),
             )
             if finalized.get("error"):
                 await answer_card(message,
@@ -1094,7 +1125,7 @@ async def deliver_order_finish(message: Message, state: FSMContext):
                     ]]),
                 )
                 return
-            waiting = delivery_result.get("status") == "waiting_for_start"
+            waiting = delivery_result.get("status") in {"waiting_for_start", "queued"}
             if not result["is_api_order"]:
                 try:
                     if waiting and config.DELIVERY_BOT_USERNAME:
@@ -1111,8 +1142,11 @@ async def deliver_order_finish(message: Message, state: FSMContext):
                 except Exception:
                     logger.info("Could not add delivery update to buyer inbox %s", destination_id, exc_info=True)
             status_text = (
-                f"⏳ Delivery is queued for {recipient_label}. The Delivery Bot will send it "
-                "automatically after the recipient opens it and sends /start."
+                (f"⏳ Delivery is pending for {recipient_label}. The Delivery Bot will send it "
+                 "after the recipient starts the bot, or confirms the queued job."
+                 if delivery_result.get("status") == "queued" else
+                 f"⏳ Delivery is queued for {recipient_label}. The Delivery Bot will send it "
+                 "automatically after the recipient opens it and sends /start.")
                 if waiting else
                 f"✅ Manual delivery sent through the Delivery Bot to {recipient_label}."
             )
@@ -1131,11 +1165,15 @@ async def deliver_order_finish(message: Message, state: FSMContext):
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
             )
             finalized = await asyncio.to_thread(
-                _finalize_bridged_delivery, order_id, message.from_user.id
+                _finalize_bridged_delivery, order_id, message.from_user.id,
+                "queued",
             )
             if finalized.get("error"):
                 await answer_card(message, "⚠️ Delivery was queued, but the order status needs reconciliation.")
                 return
+            await answer_card(message,
+                "📨 Delivery queued. The order will move to completed only after Telegram accepts the message."
+            )
     except Exception:
         logger.exception("Failed to notify delivery recipient %s", result.get("delivery_telegram_id") or result["buyer_id"])
         await answer_card(message,
@@ -1174,7 +1212,8 @@ async def retry_api_manual_delivery(callback: CallbackQuery):
         return
     try:
         finalized = await asyncio.to_thread(
-            _finalize_bridged_delivery, order_id, callback.from_user.id
+            _finalize_bridged_delivery, order_id, callback.from_user.id,
+            result.get("status"),
         )
     except Exception:
         logger.exception("Delivery accepted but could not reconcile order %s", order_id)
@@ -1183,16 +1222,21 @@ async def retry_api_manual_delivery(callback: CallbackQuery):
     if finalized.get("error"):
         await callback.answer(finalized["error"][:180], show_alert=True)
         return
+    is_pending = result.get("status") in {"waiting_for_start", "queued"}
     if not is_api_order:
         try:
             await queue_message(
-                callback.bot, f"order-delivery-reconciled:{order_id}", recipient_id,
-                "Your order delivery is confirmed. Open My Orders to view its status.",
+                callback.bot,
+                f"order-update:{order_id}:delivery-waiting" if is_pending else f"order-delivery-reconciled:{order_id}",
+                recipient_id,
+                "Your order is saved and delivery is still pending. Open My Orders to check its status." if is_pending
+                else "Your order delivery is confirmed. Open My Orders to view its status.",
             )
         except Exception:
             logger.info("Could not queue delivery retry notice for order %s", order_id, exc_info=True)
     await callback.answer(
         "Already sent; no duplicate was sent." if result.get("status") == "already_sent" else
+        "Delivery is queued; the order remains pending until Telegram confirms the send." if result.get("status") == "queued" else
         "Queued. It will be sent after the recipient starts the Delivery Bot." if result.get("status") == "waiting_for_start" else
         "Delivery sent.",
         show_alert=True,

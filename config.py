@@ -209,6 +209,15 @@ BINANCE_DEPOSIT_COINS = [
 
 # A submitted TXID may refer to a Binance deposit made during the prior 72 hours.
 BINANCE_DEPOSIT_CLAIM_WINDOW_HOURS = 72
+DEPOSIT_LATE_REFERENCE_HOURS = max(
+    1, min(168, int(os.getenv("DEPOSIT_LATE_REFERENCE_HOURS", "72")))
+)
+DEPOSIT_VERIFICATION_LEASE_SECONDS = max(
+    60, min(900, int(os.getenv("DEPOSIT_VERIFICATION_LEASE_SECONDS", "300")))
+)
+DEPOSIT_VERIFICATION_CONCURRENCY = max(
+    1, min(8, int(os.getenv("DEPOSIT_VERIFICATION_CONCURRENCY", "4")))
+)
 
 
 # ==========================================================
@@ -474,7 +483,13 @@ IMAP_APP_PASSWORD = os.getenv(
 
 FAMAPP_SENDER_EMAIL = "no-reply@famapp.in"
 
-IMAP_LOOKBACK_DAYS = 1
+IMAP_LOOKBACK_DAYS = max(1, min(30, int(os.getenv("IMAP_LOOKBACK_DAYS", "7"))))
+IMAP_TIMEOUT_SECONDS = max(5, min(60, int(os.getenv("IMAP_TIMEOUT_SECONDS", "20"))))
+UPI_MAX_EMAILS_TO_SCAN = max(40, min(500, int(os.getenv("UPI_MAX_EMAILS_TO_SCAN", "200"))))
+
+# Keep customer/admin notification history useful without allowing completed
+# outbox rows to grow forever. Active or uncertain jobs are never pruned.
+NOTIFICATION_RETENTION_DAYS = max(90, min(3650, int(os.getenv("NOTIFICATION_RETENTION_DAYS", "365"))))
 
 
 # ==========================================================

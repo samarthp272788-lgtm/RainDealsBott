@@ -3,7 +3,7 @@ import asyncio
 from datetime import datetime, timedelta
 import hashlib
 import logging
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import aliased
 
 logger = logging.getLogger(__name__)
@@ -75,7 +75,7 @@ def reroute_pending_admin_alerts(bot_id):
                 row.status, row.error_code, row.category = 'failed', 'admin_notify_unconfigured', 'admin'
                 continue
             digest = hashlib.sha256((row.body+str(row.reply_markup)).encode()).hexdigest()
-            enqueue(db, f'admin:reroute-admin:{digest}', destination, row.body, bot_id, reply_markup=row.reply_markup)
+            enqueue(db, f'admin:reroute-admin:{row.id}:{digest}', destination, row.body, bot_id, reply_markup=row.reply_markup)
             db.flush()  # The next old per-admin copy must see this unique notification.
             row.status, row.category = 'resolved', 'admin'
             row.error_code = 'moved_to_admin_notify'
@@ -98,8 +98,10 @@ def enqueue(db, event, chat_id, body, bot_id=None, source_order_id=None, reply_m
                 'wallet_adjustment' if prefix in ('wallet-adjustment', 'balance-adjustment') else
                 'subscription' if prefix == 'subscription' else
                 'restock' if prefix == 'restock' else
-                'order_update' if prefix in ('delivery-start', 'manual-delivery', 'order-information',
-                                             'order-progress', 'order-update', 'order-delivery',
+                'order_progress' if prefix in ('order-progress', 'order_progress') else
+                'order_delivery' if prefix == 'manual-delivery' else
+                'order_update' if prefix in ('delivery-start', 'order-information',
+                                             'order-update', 'order-delivery',
                                              'required-info', 'order-info-submitted', 'cancel-result', 'upstream') else
                 'refund' if prefix in ('refund', 'manager-refund') or (prefix == 'warranty' and 'refund' in str(event).lower()) else
                 'warranty' if prefix == 'warranty' else
@@ -109,27 +111,37 @@ def enqueue(db, event, chat_id, body, bot_id=None, source_order_id=None, reply_m
         from services.customer_tools import allows
         if not allows(db, int(chat_id), category):
             return
-    if source_order_id is None and category in ('subscription','order_progress','order_update','refund','warranty'):
+    if source_order_id is None and category in ('subscription','order_progress','order_update','order_delivery','refund','warranty'):
+        # Link records from the structured event key. Message wording is
+        # presentation and must not decide which order the inbox opens.
         import re
-        parts = str(event).split(':')
-        order_event = parts[0].lower() in ('subscription','delivery-start','manual-delivery','order-information',
-                                           'order-progress','order-update','order-delivery','required-info',
-                                           'order-info-submitted','cancel-result','upstream','refund','warranty','manager-refund')
-        if order_event and len(parts)>1 and parts[1].isdigit():
-            source_order_id = int(parts[1])
-        else:
-            match = re.search(r'(?i)order\s*#\s*(\d{1,12})', str(body))
-            if match:
-                source_order_id = int(match.group(1))
+        match = re.match(
+            r'(?i)^(?:subscription|delivery-start|manual-delivery|order-information|'
+            r'order-progress|order_progress|order-update|order-delivery|required-info|'
+            r'order-info-submitted|cancel-result|upstream|refund|warranty|manager-refund|'
+            r'bulk-order-update):(\d{1,12})(?:$|:)', str(event)
+        )
+        if match:
+            source_order_id = int(match.group(1))
     key = hashlib.sha256(f'{bot_id}:{event}:{chat_id}'.encode()).hexdigest()
     # Callers hold their originating order/request lock. Unique key is an extra backstop.
-    if db.query(NotificationJob.id).filter_by(event_key=key).first():
-        return
-    if unroutable_admin_notice:
-        logger.warning('Admin notification retained in failed outbox: Admin Notify destination is not configured')
     if reply_markup is not None:
         from aiogram.types import InlineKeyboardMarkup
         reply_markup = InlineKeyboardMarkup.model_validate(reply_markup).model_dump(mode='json', exclude_none=True)
+    existing = db.query(NotificationJob).filter_by(event_key=key).with_for_update().first()
+    if existing:
+        # Coalesce rapid updates to an event while it is still queued, so the
+        # delivered card reflects the newest status/body. Never mutate a sent,
+        # inboxed, failed, or uncertain record.
+        if existing.status == 'queued' or (existing.status == 'inbox' and existing.inbox_read_at is None):
+            existing.body = body
+            existing.reply_markup = reply_markup
+            existing.category = category
+            if source_order_id is not None:
+                existing.source_order_id = source_order_id
+        return
+    if unroutable_admin_notice:
+        logger.warning('Admin notification retained in failed outbox: Admin Notify destination is not configured')
     db.add(NotificationJob(event_key=key, bot_id=bot_id, chat_id=str(chat_id), body=body,
                            status='failed' if unroutable_admin_notice else 'queued', attempts=0, next_attempt_at=datetime.utcnow(),
                            error_code='admin_notify_unconfigured' if unroutable_admin_notice else None,
@@ -184,7 +196,7 @@ def claim_next(bot_id):
             # Recover category for queued rows created before admin-order
             # events were explicitly classified.
             row.category = 'admin_order'
-        if bot_id==main_bot_id() and row.category not in ('admin', 'admin_order') and str(row.chat_id).isdigit() and int(row.chat_id)>0:
+        if bot_id==main_bot_id() and row.category not in ('admin', 'admin_order', 'order_delivery') and str(row.chat_id).isdigit() and int(row.chat_id)>0:
             # The shop's private alerts live in Notifications, not extra chat cards.
             row.status, row.error_code = 'inbox', None
             return {'skipped':True,'inbox_user':int(row.chat_id)}
@@ -211,6 +223,28 @@ def finish(job_id, bot_id, status, message_id=None, error_code=None, delay=0):
             order = db.get(Order, row.source_order_id)
             if order:
                 order.admin_notification_sent_at = row.sent_at
+        if status == 'sent' and row.category == 'order_delivery' and row.source_order_id:
+            from models.order import Order
+            from models.admin_audit_log import AdminAuditLog
+            from services.order_workflow import record_event
+            from services.warranty import start_coverage
+            order = db.query(Order).filter(Order.id == row.source_order_id).with_for_update().first()
+            if order and not order.refunded and order.status == 'delivery_pending':
+                from handlers.admin_orders import _credit_preorder_referral
+                order.status = 'completed'
+                order.manual_pending_quantity = 0
+                commission = _credit_preorder_referral(db, order)
+                start_coverage(order)
+                record_event(db, order.id, 'completed',
+                             'Telegram accepted the saved delivery message.',
+                             actor_id=order.assigned_admin_id)
+                db.add(AdminAuditLog(
+                    admin_telegram_id=int(order.assigned_admin_id or 0),
+                    action='manual_delivery_sent', entity_type='order',
+                    entity_id=str(order.id),
+                    summary='Telegram accepted the outbox delivery message.' +
+                            (' Referral commission credited.' if commission else ''),
+                ))
 
 
 def recover_stale(bot_id):
@@ -257,6 +291,52 @@ def resolve_uncertain(job_id, bot_id, admin_id):
         db.add(AdminAuditLog(admin_telegram_id=admin_id, action='resolve_notification', entity_type='notification',
                              entity_id=str(job_id), summary='Uncertain send reviewed and closed without resending.'))
     return None
+
+
+def retry_uncertain(job_id, bot_id, admin_id):
+    """Explicitly retry an ambiguous send after an admin accepts duplicate risk."""
+    from config import ADMIN_IDS
+    from database import transaction
+    from models.bot_operations import NotificationJob as Job
+    from models.admin_audit_log import AdminAuditLog
+    if admin_id not in ADMIN_IDS:
+        return 'Access denied.'
+    with transaction() as db:
+        row = db.query(Job).filter(Job.id == job_id, Job.bot_id == bot_id).with_for_update().first()
+        if not row or row.status != 'uncertain':
+            return 'Only an uncertain notification can be retried this way.'
+        if row.attempts >= 10:
+            return 'Retry limit reached. Review the recipient and message first.'
+        row.status, row.next_attempt_at, row.error_code = 'queued', datetime.utcnow(), None
+        db.add(AdminAuditLog(
+            admin_telegram_id=admin_id,
+            action='retry_uncertain_notification',
+            entity_type='notification',
+            entity_id=str(job_id),
+            summary='Admin explicitly retried an ambiguous Telegram send; a duplicate may result.',
+        ))
+    return None
+
+
+def cleanup_terminal_notifications(bot_id, retention_days=None, batch_size=1000):
+    """Prune only old, terminal notification history; keep unread/active/review rows."""
+    import config
+    from database import transaction
+    from models.bot_operations import NotificationJob as Job
+    days = max(90, min(3650, int(retention_days or config.NOTIFICATION_RETENTION_DAYS)))
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    with transaction() as db:
+        ids = [row[0] for row in db.query(Job.id).filter(
+            Job.bot_id == bot_id,
+            Job.created_at < cutoff,
+            or_(
+                Job.status.in_(('sent', 'resolved')),
+                (Job.status == 'inbox') & Job.inbox_read_at.is_not(None) & (Job.inbox_read_at < cutoff),
+            ),
+        ).order_by(Job.id.asc()).limit(max(1, min(5000, int(batch_size)))).all()]
+        if not ids:
+            return 0
+        return db.query(Job).filter(Job.id.in_(ids)).delete(synchronize_session=False)
 
 
 def report(bot_id, page=0):
@@ -310,7 +390,7 @@ async def send_one(bot):
 async def notification_loop(bot):
     from services.provider_health import flush_health
     from time import monotonic
-    maintenance_at = reminders_at = 0
+    maintenance_at = reminders_at = retention_at = 0
     while True:
         try:
             now = monotonic()
@@ -319,6 +399,9 @@ async def notification_loop(bot):
                 await asyncio.to_thread(recover_stale, bot.id)
                 await asyncio.to_thread(flush_health)
                 maintenance_at = now+10
+            if now >= retention_at:
+                await asyncio.to_thread(cleanup_terminal_notifications, bot.id)
+                retention_at = now + 6 * 60 * 60
             if now >= reminders_at:
                 from services.customer_tools import subscription_reminders
                 await asyncio.to_thread(subscription_reminders)

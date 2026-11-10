@@ -31,6 +31,36 @@ class WarrantyRequest(Base):
     updated_at = Column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
 
 
+class WarrantyRequestRevision(Base):
+    """Archived rejected claims kept before a customer resubmits an order."""
+    __tablename__ = 'bot_warranty_request_revisions'
+    __table_args__ = (Index('ix_warranty_revision_order', 'order_id', 'archived_at'),)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    request_id = Column(Integer, nullable=False, index=True)
+    order_id = Column(Integer, nullable=False, index=True)
+    revision = Column(Integer, nullable=False)
+    telegram_id = Column(BigInteger, nullable=False)
+    status = Column(String(20), nullable=False)
+    reason = Column(Text, nullable=False)
+    evidence = Column(JSON, nullable=False)
+    request_type = Column(String(16), nullable=False)
+    refund_amount = Column(Numeric(20, 8), nullable=True)
+    used_days = Column(Integer, nullable=True)
+    remaining_days = Column(Integer, nullable=True)
+    deactivated_at = Column(String(200), nullable=True)
+    issue_type = Column(String(32), nullable=True)
+    product_confirmed = Column(Integer, nullable=False, default=0)
+    invoice_snapshot = Column(JSON, nullable=True)
+    delivery_snapshot = deferred(Column(Text, nullable=True))
+    proof_image = deferred(Column(LargeBinary().with_variant(MEDIUMBLOB(), 'mysql'), nullable=True))
+    proof_mime = Column(String(32), nullable=True)
+    admin_id = Column(BigInteger, nullable=True)
+    resolution = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False)
+    updated_at = Column(DateTime, nullable=False)
+    archived_at = Column(DateTime, nullable=False, server_default=func.now())
+
+
 class NotificationJob(Base):
     __tablename__ = 'bot_notification_jobs'
     __table_args__ = (
@@ -55,6 +85,15 @@ class NotificationJob(Base):
     error_code = Column(String(80), nullable=True)
     source_order_id = Column(Integer, nullable=True)
     created_at = Column(DateTime, nullable=False, server_default=func.now())
+
+
+class BotPollingLease(Base):
+    """Database-backed single leader lease for a polling Telegram bot."""
+    __tablename__ = 'bot_polling_leases'
+    bot_id = Column(BigInteger, primary_key=True)
+    owner_token = Column(String(64), nullable=False)
+    lease_until = Column(DateTime, nullable=False, index=True)
+    updated_at = Column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
 
 
 class ProviderHealth(Base):

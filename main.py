@@ -23,6 +23,10 @@ from services.provider_schema import ensure_provider_schema
 from services.maintenance_mode import ensure_maintenance_schema
 from services.order_rating_schema import ensure_order_rating_schema
 from services.order_requirements_schema import ensure_order_requirements_schema
+from services.warranty_revision_schema import ensure_warranty_revision_schema
+from services.task_supervisor import supervise
+from services.polling_lease import ensure_polling_lease_schema, run_polling_as_leader
+from services.session_resume import flush_pending_resume
 
 
 # ============================================================
@@ -42,10 +46,9 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 async def health(request):
-
-    return web.Response(
-        text="NomanBot is running!"
-    )
+    from services.readiness import database_readiness
+    ready = await asyncio.to_thread(database_readiness, True)
+    return web.json_response(ready, status=200 if ready['status'] == 'ready' else 503)
 
 
 # ============================================================
@@ -115,26 +118,34 @@ async def main():
     await asyncio.to_thread(ensure_maintenance_schema)
     await asyncio.to_thread(ensure_order_rating_schema)
     await asyncio.to_thread(ensure_order_requirements_schema)
+    await asyncio.to_thread(ensure_warranty_revision_schema)
+    await asyncio.to_thread(ensure_polling_lease_schema)
 
     # --------------------------------------------------------
     # DEPOSIT CHECKER
     # --------------------------------------------------------
 
     deposit_task = asyncio.create_task(
-        deposit_checker_loop(bot)
+        supervise("deposit-checker", lambda: deposit_checker_loop(bot)),
+        name="supervisor-deposit-checker",
     )
 
     logger.info(
         "Deposit checker started"
     )
 
-    notification_outbox_task = asyncio.create_task(notification_loop(bot), name="notification-outbox")
+    notification_outbox_task = asyncio.create_task(
+        supervise("notification-outbox", lambda: notification_loop(bot)),
+        name="supervisor-notification-outbox",
+    )
 
     order_notification_task = asyncio.create_task(
-        order_notification_loop(bot)
+        supervise("admin-order-notifications", lambda: order_notification_loop(bot), retry_seconds=30),
+        name="supervisor-admin-order-notifications",
     )
     supplier_reconciliation_task = asyncio.create_task(
-        supplier_reconciliation_loop(bot), name="supplier-order-reconciliation"
+        supervise("supplier-order-reconciliation", lambda: supplier_reconciliation_loop(bot)),
+        name="supervisor-supplier-order-reconciliation",
     )
 
     logger.info(
@@ -150,8 +161,8 @@ async def main():
     await recover_interrupted_deposit_cards(bot)
 
     deposit_card_task = asyncio.create_task(
-        deposit_invoice_expiry_loop(bot),
-        name="deposit-invoice-card-expiry",
+        supervise("deposit-invoice-card-expiry", lambda: deposit_invoice_expiry_loop(bot)),
+        name="supervisor-deposit-invoice-card-expiry",
     )
 
     logger.info(
@@ -173,9 +184,7 @@ async def main():
 
     try:
 
-        await dp.start_polling(
-            bot
-        )
+        await run_polling_as_leader(bot, dp)
 
     finally:
 
@@ -228,6 +237,8 @@ async def main():
                 await supplier_reconciliation_task
             except asyncio.CancelledError:
                 pass
+
+        await flush_pending_resume()
 
         if runner:
 

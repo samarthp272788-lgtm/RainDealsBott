@@ -201,6 +201,7 @@ def _status_emoji(status: str) -> str:
         "waiting_hash": "🔍",
         "failed": "❌",
         "expired": "⏰",
+        "cancelled": "🚫",
     }
     return status_map.get(status, "❓")
 
@@ -213,6 +214,7 @@ def _status_label(status: str) -> str:
         "waiting_hash": "Awaiting TXID",
         "failed": "Failed",
         "expired": "Expired",
+        "cancelled": "Cancelled",
     }
     return status_map.get(status, status.capitalize())
 
@@ -1043,10 +1045,11 @@ def _create_invoice(telegram_id: int, amount_usdt: Decimal, network: str) -> dic
                           Deposit.invoice_expires_at > datetime.utcnow())
                   .order_by(Deposit.id.desc()).with_for_update().first())
         if active:
-            active.network = network
-            active.invoice_usdt_amount = amount_usdt
-            active.amount = Decimal("0") if network in {"UPI", "BINANCE"} else amount_usdt
-            db.commit()
+            # Reuse the common invoice without changing its original amount
+            # or expiry. Only the selected verification network may change.
+            if active.network != network:
+                active.network = network
+                db.commit()
             return {"id": active.id, "code": active.invoice_code or active.order_id,
                     "expires_at": active.invoice_expires_at.isoformat(),
                     "amount_usdt": str(active.invoice_usdt_amount)}
@@ -1187,7 +1190,7 @@ def _cancel_invoice(deposit_id: int, telegram_id: int) -> str:
             return "submitted"
         if deposit.status != "waiting_hash":
             return "inactive"
-        deposit.status = "expired"
+        deposit.status = "cancelled"
         db.commit()
         return "cancelled"
     except Exception:
@@ -1637,6 +1640,13 @@ async def process_txid(message: Message, state: FSMContext):
             except Exception:
                 logger.exception("Failed to send group deposit notification")
 
+        credit_note = ""
+        if result_info.get("reason") == "verified_partial_credit":
+            try:
+                credited = Decimal(str(result_info.get("received")))
+                credit_note = f"📥 <b>Verified amount credited:</b> {_format_usdt(credited)}\n"
+            except Exception:
+                credit_note = "📥 <b>Verified payment amount credited to your wallet.</b>\n"
         await update_card(
             message, None,
             (
@@ -1649,6 +1659,7 @@ async def process_txid(message: Message, state: FSMContext):
                 f"🕐 <b>Time:</b> {_format_timestamp()}\n\n"
                 f"{_divider('═', 28)}\n\n"
                 f"✅ <b>Status:</b> Balance Credited\n"
+                f"{credit_note}"
                 f"💰 Funds added to your account.\n\n"
                 f"<i>Thank you for your deposit! 🙏</i>"
             ),
