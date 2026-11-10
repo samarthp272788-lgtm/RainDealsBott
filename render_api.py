@@ -211,6 +211,60 @@ app = FastAPI(
 )
 
 
+class _ApiBodyTooLarge(Exception):
+    pass
+
+
+class ApiBodySizeLimitMiddleware:
+    """Enforce API_MAX_REQUEST_BYTES even when a client omits Content-Length."""
+
+    def __init__(self, app, max_bytes: int):
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "")
+        if scope.get("type") != "http" or not path.startswith("/api/v1/"):
+            await self.app(scope, receive, send)
+            return
+
+        size = 0
+        response_started = False
+
+        async def limited_receive():
+            nonlocal size
+            message = await receive()
+            if message.get("type") == "http.request":
+                size += len(message.get("body", b""))
+                if size > self.max_bytes:
+                    raise _ApiBodyTooLarge
+            return message
+
+        async def track_send(message):
+            nonlocal response_started
+            if message.get("type") == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, track_send)
+        except _ApiBodyTooLarge:
+            if response_started:
+                return
+            response = JSONResponse(
+                status_code=413,
+                content={
+                    "success": False,
+                    "error": "request_too_large",
+                    "message": f"API request body must not exceed {self.max_bytes} bytes.",
+                },
+            )
+            await response(scope, receive, send)
+
+
+app.add_middleware(ApiBodySizeLimitMiddleware, max_bytes=API_MAX_REQUEST_BYTES)
+
+
 @app.post("/internal/cloudflare/telegram/update")
 async def cloudflare_telegram_update(request: Request):
     if TELEGRAM_TRANSPORT != "cloudflare":

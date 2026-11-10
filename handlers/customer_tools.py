@@ -113,7 +113,14 @@ async def checkout_result(target,token):
             buttons.append([Button(text=f"Order #{row['order_id']}",callback_data=f"order_detail_{row['order_id']}")])
         else:
             text+=escape(row['error'] or row['status'])
-    text+='\n\nEach successful item creates its own order and wallet charge. Failed or unprocessed items remain in the cart.'
+    if data['status']=='completed':
+        text+='\n\n✅ Every cart item was placed as its own order. Charges and delivery are shown in My Orders.'
+    elif data['status']=='partial':
+        text+='\n\n⚠️ Some items succeeded. Failed or unprocessed items remain in your cart; review them before trying again.'
+    elif data['status']=='failed':
+        text+='\n\nNo cart item was completed. Your items remain in the cart and no unconfirmed item should be reordered.'
+    else:
+        text+='\n\nEach successful item creates its own order and wallet charge. Failed or unprocessed items remain in the cart.'
     if data['status']=='held':
         text+='\nA supplier result needs staff review. Do not buy it again.'
     buttons.append([Button(text='Refresh',callback_data=f'ct_result_{token}'),Button(text='Cart',callback_data='ct_cart')])

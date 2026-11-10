@@ -50,3 +50,13 @@ class ApiOrder(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now(), onupdate=func.now()
     )
+
+
+class ApiRateLimitBucket(Base):
+    """Shared fixed-window API counters; only opaque hashes are stored."""
+
+    __tablename__ = "api_rate_limit_buckets"
+
+    bucket_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    request_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)

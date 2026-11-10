@@ -53,6 +53,12 @@ def _post_delivery(order_id: int, recipient_id: int, admin_id: int) -> dict:
 
     if not result.get("success"):
         raise DeliveryBridgeError(result.get("message") or "Delivery Worker could not send this order.")
+    # A successful HTTP response alone is not enough to complete the order:
+    # require a durable/known delivery state so malformed or partial Worker
+    # responses leave the order retryable as delivery_pending.
+    status = str(result.get("status") or "").strip().lower()
+    if status not in {"sent", "queued", "waiting_for_start", "already_sent"}:
+        raise DeliveryBridgeError("Delivery Worker did not return a confirmed delivery state.")
     return result
 
 

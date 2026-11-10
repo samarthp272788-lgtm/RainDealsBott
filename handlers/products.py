@@ -3,6 +3,7 @@ import json
 import logging
 import threading
 import time
+from collections import Counter
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from html import escape as _esc
 from datetime import datetime
@@ -33,6 +34,7 @@ from models.product_engagement import ProductEngagement
 from models.custom_rate import CustomRate
 from models.rate_control import ProductRateControl, RateControlAssignment
 from services.fulfillment_policy import (
+    account_lines,
     order_capacity,
     api_order_capacity,
     manual_allowed,
@@ -70,6 +72,14 @@ router = Router()
 PREORDER_MAX_QTY = 10
 DEFAULT_LOW_STOCK_THRESHOLD = 3
 MAX_SEARCH_RESULTS = 15
+ALLOWED_REQUIREMENT_TYPES = {"email", "phone", "photo", "contact", "text"}
+PRODUCTS_CACHE_TTL_SECONDS = 30
+PRODUCTS_CACHE_MAX_STALE_SECONDS = 120
+CATALOG_PAGE_SIZE = 40
+
+
+class ProductCatalogUnavailable(RuntimeError):
+    """The catalog refresh failed and its last-good snapshot is too old."""
 
 try:
     REFERRAL_COMMISSION_RATE = Decimal(
@@ -553,14 +563,41 @@ CATEGORY_CONFIG = {
 DEFAULT_CATEGORY_CONFIG = {"icon": "📦", "label": "General", "style": "primary", "color": "🔵"}
 
 
+def _normalized_category_name(category: str | None) -> str:
+    return " ".join(str(category or "").split()).casefold()
+
+
 def _get_category_config(category: str | None) -> dict:
     if not category:
         return DEFAULT_CATEGORY_CONFIG
-    category_name = category.strip()
-    config = CATEGORY_CONFIG.get(category_name.lower())
+    category_name = " ".join(category.split())
+    config = CATEGORY_CONFIG.get(_normalized_category_name(category_name))
     if config:
         return config
     return {**DEFAULT_CATEGORY_CONFIG, "label": category_name}
+
+
+def _category_presentation(products: list) -> tuple[Product, str, str, dict]:
+    """Choose stable category label/icon/config when stored casing varies."""
+    representative = min(products, key=lambda product: int(product.id))
+    labels = [" ".join(str(getattr(product, "category", "") or "").split()) for product in products]
+    labels = [label for label in labels if label]
+    label = min(
+        Counter(labels).items(),
+        key=lambda item: (-item[1], item[0].casefold(), item[0]),
+    )[0] if labels else "General"
+    config = _get_category_config(label)
+    category_key = _normalized_category_name(label)
+    if category_key in CATEGORY_CONFIG:
+        return representative, config["label"], config["icon"], config
+
+    icons = [str(getattr(product, "icon", "") or "").strip() for product in products]
+    icons = [icon for icon in icons if icon]
+    icon = min(
+        Counter(icons).items(),
+        key=lambda item: (-item[1], item[0]),
+    )[0] if icons else config["icon"]
+    return representative, label, icon, config
 
 
 def _category_style(category: str | None) -> str:
@@ -623,7 +660,7 @@ def _get_bulk_price(bulk_pricing, quantity: int):
 
     try:
         tiers = json.loads(bulk_pricing) if isinstance(bulk_pricing, str) else bulk_pricing
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError, ValueError, InvalidOperation, OverflowError):
         return None
 
     if not tiers:
@@ -633,11 +670,15 @@ def _get_bulk_price(bulk_pricing, quantity: int):
     best_min = 0
 
     for tier in tiers.values():
-        min_qty = int(tier.get("min", 1))
-        max_qty = tier.get("max")
-        if max_qty is not None:
-            max_qty = int(max_qty)
-        price = float(tier.get("price", 0))
+        try:
+            min_qty = int(tier.get("min", 1))
+            max_qty = tier.get("max")
+            if max_qty is not None:
+                max_qty = int(max_qty)
+            price = float(tier.get("price", 0))
+        except (AttributeError, TypeError, ValueError, InvalidOperation, OverflowError):
+            # Malformed legacy data must never take down product browsing.
+            return None
 
         if quantity >= min_qty:
             if max_qty is None or quantity <= max_qty:
@@ -655,7 +696,7 @@ def _format_bulk_pricing_text(bulk_pricing) -> str:
 
     try:
         tiers = json.loads(bulk_pricing) if isinstance(bulk_pricing, str) else bulk_pricing
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError, ValueError, InvalidOperation, OverflowError):
         return "  ❌ <i>Not Available</i>"
 
     if not tiers:
@@ -825,10 +866,10 @@ async def _search_products(query: str) -> list:
     db = SessionLocal()
     try:
         search_term = f"%{query}%"
-        return (
+        query = (
             db.query(Product)
+            .filter(Product.is_active == True, Product.price >= 0)
             .filter(
-                Product.is_active == True,
                 (
                         Product.name.ilike(search_term) |
                         Product.category.ilike(search_term) |
@@ -837,8 +878,8 @@ async def _search_products(query: str) -> list:
             )
             .order_by(Product.id.asc())
             .limit(MAX_SEARCH_RESULTS)
-            .all()
         )
+        return _load_product_models_safely(query)
     finally:
         db.close()
 
@@ -869,7 +910,6 @@ _products_cache_lock = asyncio.Lock()
 _products_cache_state_lock = threading.Lock()
 _products_cache_generation = 0
 _products_refresh_task = None
-PRODUCTS_CACHE_TTL_SECONDS = 30
 
 
 def invalidate_products_cache() -> None:
@@ -883,8 +923,6 @@ def invalidate_products_cache() -> None:
 def _purchase_configuration_errors(required_info, bulk_pricing) -> list[str]:
     """Reject malformed purchase rules instead of silently dropping them."""
     errors = []
-    allowed_requirement_types = {"email", "phone", "photo", "contact", "text"}
-
     if isinstance(required_info, str):
         try:
             required_info = json.loads(required_info)
@@ -901,9 +939,14 @@ def _purchase_configuration_errors(required_info, bulk_pricing) -> list[str]:
                 if not isinstance(item, dict):
                     errors.append("required_info")
                     break
-                kind = str(item.get("type") or "text").strip().lower()
-                label = str(item.get("label") or kind.title()).strip()[:100]
-                if kind not in allowed_requirement_types or not label or label.casefold() in seen_labels:
+                raw_kind = item.get("type")
+                raw_label = item.get("label")
+                if not isinstance(raw_kind, str) or (raw_label is not None and not isinstance(raw_label, str)):
+                    errors.append("required_info")
+                    break
+                kind = raw_kind.strip().lower()
+                label = (raw_label or kind.title()).strip()[:100]
+                if kind not in ALLOWED_REQUIREMENT_TYPES or not label or label.casefold() in seen_labels:
                     errors.append("required_info")
                     break
                 seen_labels.add(label.casefold())
@@ -916,25 +959,80 @@ def _purchase_configuration_errors(required_info, bulk_pricing) -> list[str]:
         except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
             errors.append("bulk_pricing")
     if bulk_pricing is not None:
-        if not isinstance(bulk_pricing, dict):
+        if not isinstance(bulk_pricing, dict) or len(bulk_pricing) > 50:
             errors.append("bulk_pricing")
         else:
+            seen_minimums = set()
+            tier_ranges = []
             for tier in bulk_pricing.values():
                 if not isinstance(tier, dict) or not {"min", "price"}.issubset(tier):
                     errors.append("bulk_pricing")
                     break
                 try:
-                    minimum = int(tier.get("min", 1))
-                    maximum = int(tier["max"]) if tier.get("max") is not None else None
+                    minimum_value = Decimal(str(tier.get("min", 1)))
+                    maximum_value = Decimal(str(tier["max"])) if tier.get("max") is not None else None
                     price = Decimal(str(tier.get("price", 0)))
-                    if minimum < 1 or (maximum is not None and maximum < minimum) or not price.is_finite() or price < 0:
+                    if (
+                        not minimum_value.is_finite()
+                        or minimum_value != minimum_value.to_integral_value()
+                        or minimum_value < 1
+                        or minimum_value > 1_000_000
+                        or (maximum_value is not None and (
+                            not maximum_value.is_finite()
+                            or maximum_value != maximum_value.to_integral_value()
+                            or maximum_value > 1_000_000
+                        ))
+                    ):
                         errors.append("bulk_pricing")
                         break
+                    minimum = int(minimum_value)
+                    maximum = int(maximum_value) if maximum_value is not None else None
+                    if (
+                        minimum < 1
+                        or minimum > 1_000_000
+                        or minimum in seen_minimums
+                        or (maximum is not None and maximum < minimum)
+                        or (maximum is not None and maximum > 1_000_000)
+                        or not price.is_finite()
+                        or price < 0
+                        or price > Decimal("999999999999.99999999")
+                    ):
+                        errors.append("bulk_pricing")
+                        break
+                    seen_minimums.add(minimum)
+                    tier_ranges.append((minimum, maximum))
                 except (ValueError, TypeError, InvalidOperation, OverflowError):
                     errors.append("bulk_pricing")
                     break
+            if not errors:
+                tier_ranges.sort(key=lambda item: item[0])
+                if any(
+                    previous_maximum is None or previous_maximum >= next_minimum
+                    for (_, previous_maximum), (next_minimum, _) in zip(tier_ranges, tier_ranges[1:])
+                ):
+                    errors.append("bulk_pricing")
 
     return sorted(set(errors))
+
+
+def _product_purchase_configuration_errors(product) -> list[str]:
+    """Fail closed for both invalid source JSON and malformed persisted rules."""
+    marked = set(getattr(product, "_invalid_purchase_configuration", ()) or ())
+    errors = marked | set(_purchase_configuration_errors(
+        getattr(product, "required_info", None),
+        getattr(product, "bulk_pricing", None),
+    ))
+    try:
+        price = Decimal(str(getattr(product, "price", "")))
+        if (
+            not price.is_finite()
+            or price < 0
+            or price > Decimal("999999999999.99999999")
+        ):
+            errors.add("price")
+    except (InvalidOperation, TypeError, ValueError):
+        errors.add("price")
+    return sorted(errors)
 
 
 def _load_product_models_safely(query) -> list[Product]:
@@ -951,7 +1049,10 @@ def _load_product_models_safely(query) -> list[Product]:
         else getattr(Product, column.name)
         for column in product_columns
     ]
-    rows = query.with_entities(*selected).all()
+    # Iterate in bounded batches. The active catalog can grow large, so do
+    # not first materialize every database row (including account text) in a
+    # second temporary list.
+    rows = query.with_entities(*selected).yield_per(128)
     expected_json_shapes = {
         "required_info": list,
         "bulk_pricing": dict,
@@ -1010,9 +1111,14 @@ def _load_product_models_safely(query) -> list[Product]:
                     if not isinstance(item, dict):
                         valid = False
                         break
-                    kind = str(item.get("type") or "text").strip().lower()
-                    label = str(item.get("label") or kind.title()).strip()[:100]
-                    if kind not in allowed_requirement_types or not label or label.casefold() in seen_labels:
+                    raw_kind = item.get("type")
+                    raw_label = item.get("label")
+                    if not isinstance(raw_kind, str) or (raw_label is not None and not isinstance(raw_label, str)):
+                        valid = False
+                        break
+                    kind = raw_kind.strip().lower()
+                    label = (raw_label or kind.title()).strip()[:100]
+                    if kind not in ALLOWED_REQUIREMENT_TYPES or not label or label.casefold() in seen_labels:
                         valid = False
                         break
                     seen_labels.add(label.casefold())
@@ -1043,9 +1149,17 @@ def _load_product_models_safely(query) -> list[Product]:
                     invalid_purchase_fields.append(field)
                     continue
             values[field] = parsed
+        # Run the exact checkout validator after safe decoding as well. This
+        # catches cross-tier overlap and protects both display and purchase.
+        invalid_purchase_fields.extend(
+            _purchase_configuration_errors(
+                values.get("required_info"),
+                values.get("bulk_pricing"),
+            )
+        )
         if invalid_purchase_fields:
             logger.warning(
-                "Product remains visible but checkout is disabled for invalid configuration product_id=%s fields=%s",
+                "Product remains visible with purchases disabled for invalid configuration product_id=%s fields=%s",
                 values.get("id"),
                 ",".join(sorted(set(invalid_purchase_fields))),
             )
@@ -1059,6 +1173,34 @@ def _load_product_models_safely(query) -> list[Product]:
         product = Product(**values)
         product._invalid_purchase_configuration = tuple(sorted(set(invalid_purchase_fields)))
         products.append(product)
+    return products
+
+
+def _catalog_snapshot(products: list[Product]) -> list[Product]:
+    """Drop account credentials from the process-wide browse cache.
+
+    Product detail and checkout paths fetch a fresh row. The cached catalog
+    needs only stock counts, so it must never retain credential payloads.
+    """
+    for product in products:
+        accounts = account_lines(product.file_content)
+        product._catalog_account_count = len(accounts)
+        product._catalog_reusable_content_present = bool(str(product.reusable_delivery or "").strip())
+        product.file_content = None
+        product.reusable_delivery = None
+        # These large or sensitive fields are loaded only for the detail or
+        # checkout path, never retained in the shared browse cache.
+        product.description = None
+        product.delivery_instruction = None
+        product.required_info = None
+        product.reseller_cost = None
+        product.aftercare_policy = None
+        product.warranty_days = 0
+        product.term_days = 0
+        product.subscription_days = 0
+        product.api_enabled = False
+        product.created_at = None
+        product.updated_at = None
     return products
 
 
@@ -1080,12 +1222,18 @@ async def _refresh_active_products():
                 try:
                     # Read JSON columns as text first so an invalid legacy
                     # product is isolated instead of crashing the catalog.
-                    return _load_product_models_safely(
+                    invalid_price_ids = [row[0] for row in db.query(Product.id).filter(
+                        Product.is_active == True, Product.price < 0
+                    ).order_by(Product.id.asc()).limit(20).all()]
+                    if invalid_price_ids:
+                        logger.error("Active products with negative prices are hidden from catalogs product_ids=%s",
+                                     ",".join(map(str, invalid_price_ids)))
+                    products = _load_product_models_safely(
                         db.query(Product)
-                        # Keep zero-price items in the dedicated Freebies menu.
-                        .filter(Product.is_active == True, Product.price > 0)
+                        .filter(Product.is_active == True, Product.price >= 0)
                         .order_by(Product.id.asc())
                     )
+                    return _catalog_snapshot(products)
                 finally:
                     db.close()
 
@@ -1105,8 +1253,8 @@ async def _refresh_products_cache_background():
         logger.exception("Background product catalog refresh failed")
 
 
-async def _fetch_active_products():
-    """Return active paid products using a short-lived cache."""
+async def _fetch_catalog_snapshot():
+    """Return the shared paid/free snapshot; stale data has a hard age limit."""
     global _products_refresh_task
     now = asyncio.get_running_loop().time()
     with _products_cache_state_lock:
@@ -1115,11 +1263,24 @@ async def _fetch_active_products():
             cached_products is not None
             and now - _products_cache["timestamp"] < PRODUCTS_CACHE_TTL_SECONDS
         )
-    if cached_products is not None:
-        if not is_fresh and (_products_refresh_task is None or _products_refresh_task.done()):
-            _products_refresh_task = asyncio.create_task(_refresh_products_cache_background())
+    if cached_products is not None and is_fresh:
         return cached_products
-    return await _refresh_active_products()
+    if cached_products is not None and (_products_refresh_task is None or _products_refresh_task.done()):
+        _products_refresh_task = asyncio.create_task(_refresh_products_cache_background())
+    if cached_products is not None:
+        age = max(0.0, now - _products_cache["timestamp"])
+        if age <= PRODUCTS_CACHE_MAX_STALE_SECONDS:
+            return cached_products
+    try:
+        return await _refresh_active_products()
+    except Exception as exc:
+        logger.exception("Product catalog refresh failed")
+        raise ProductCatalogUnavailable("Product catalog is temporarily unavailable.") from exc
+
+
+async def _fetch_active_products():
+    """Return cached active paid products."""
+    return [product for product in await _fetch_catalog_snapshot() if _money(product.price) > 0]
 
 
 def _fetch_product(product_id: int):
@@ -1128,22 +1289,47 @@ def _fetch_product(product_id: int):
         products = _load_product_models_safely(
             db.query(Product).filter(Product.id == product_id).limit(1)
         )
+        if not products:
+            # A browse snapshot may outlive a deletion from another process.
+            invalidate_products_cache()
         return products[0] if products else None
     finally:
         db.close()
 
 
-def _fetch_free_products() -> list:
-    """Load active zero-price products for the dedicated Freebies catalog."""
-    db = SessionLocal()
-    try:
-        return _load_product_models_safely(
-            db.query(Product)
-            .filter(Product.is_active == True, Product.price == 0)
-            .order_by(Product.id.asc())
-        )
-    finally:
-        db.close()
+async def _fetch_free_products() -> list:
+    """Return active zero-price products from the same short-lived cache."""
+    return [product for product in await _fetch_catalog_snapshot() if _money(product.price) == 0]
+
+
+def _page_navigation(page: int, page_count: int, callback_for_page) -> list[list[InlineKeyboardButton]]:
+    if page_count <= 1:
+        return []
+    buttons = []
+    if page > 0:
+        buttons.append(InlineKeyboardButton(
+            text="⬅ Previous", callback_data=callback_for_page(page - 1), style="primary"
+        ))
+    if page + 1 < page_count:
+        buttons.append(InlineKeyboardButton(
+            text="Next ➡", callback_data=callback_for_page(page + 1), style="primary"
+        ))
+    return [buttons] if buttons else []
+
+
+async def _show_catalog_unavailable(callback: CallbackQuery, *, freebies: bool = False):
+    title = "FREEBIES" if freebies else "PRODUCTS"
+    home_callback = "freebies_menu" if freebies else "products_menu"
+    await show(
+        callback,
+        f"⚠️ <b>{title} temporarily unavailable</b>\n\n"
+        "The catalog could not be refreshed. Please try again in a moment.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Try again", callback_data=home_callback, style="primary")],
+            [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")],
+        ]),
+    )
 
 
 def _fetch_products_by_ids(product_ids: list[int]) -> list:
@@ -1157,10 +1343,27 @@ def _fetch_products_by_ids(product_ids: list[int]) -> list:
         db.close()
 
 
+def _category_representative_is_current(product_id: int, *, freebies: bool, category: str | None) -> bool:
+    """Check the small representative row so deleted/recategorized buttons recover immediately."""
+    db = SessionLocal()
+    try:
+        row = db.query(Product.id, Product.category, Product.price).filter(
+            Product.id == product_id,
+            Product.is_active == True,
+            Product.price >= 0,
+        ).first()
+        if row is None:
+            return False
+        price_is_free = _money(row.price) == 0
+        return price_is_free == freebies and _category_key(row) == category
+    finally:
+        db.close()
+
+
 def _accounts(product) -> list[str]:
     if not product.file_content:
         return []
-    return [a.strip() for a in product.file_content.splitlines() if a.strip()]
+    return account_lines(product.file_content)
 
 
 def _real_stock(product) -> int:
@@ -1408,11 +1611,15 @@ async def notify_new_product(bot, product):
 @router.callback_query(F.data == "freebies_menu")
 async def freebies_menu(callback: CallbackQuery):
     await callback.answer()
-    products = await asyncio.to_thread(_fetch_free_products)
+    try:
+        products = await _fetch_free_products()
+    except ProductCatalogUnavailable:
+        await _show_catalog_unavailable(callback, freebies=True)
+        return
     await _show_freebies_categories(callback, products)
 
 
-async def _show_freebies_categories(callback: CallbackQuery, products: list):
+async def _show_freebies_categories(callback: CallbackQuery, products: list, page: int = 0):
     if not products:
         await show(
             callback,
@@ -1435,31 +1642,36 @@ async def _show_freebies_categories(callback: CallbackQuery, products: list):
         else:
             groups.setdefault(key, []).append(product)
 
+    entries = []
+    for category_products in groups.values():
+        representative, label, icon, config = _category_presentation(category_products)
+        entries.append(("category", label.casefold(), category_products, representative, label, icon, config))
+    entries.extend(("product", product.name.casefold(), product) for product in standalone)
+    entries.sort(key=lambda entry: (entry[1], int(entry[3].id) if entry[0] == "category" else int(entry[2].id)))
+    page_count = max(1, (len(entries) + CATALOG_PAGE_SIZE - 1) // CATALOG_PAGE_SIZE)
+    page = min(max(0, int(page)), page_count - 1)
+    page_entries = entries[page * CATALOG_PAGE_SIZE:(page + 1) * CATALOG_PAGE_SIZE]
+
     rows = []
     category_row = []
-    for _, category_products in sorted(
-        groups.items(),
-        key=lambda item: _get_category_config(item[1][0].category)["label"].casefold(),
-    ):
-        first = category_products[0]
-        config = _get_category_config(first.category)
-        category_name = str(getattr(first, "category", "") or "").strip().lower()
-        icon = first.icon if category_name not in CATEGORY_CONFIG and first.icon else config["icon"]
-        label = config["label"]
-        if len(label) > 40:
-            label = label[:37].rstrip() + "…"
-        category_row.append(InlineKeyboardButton(
-            text=f"{icon} {label} ({len(category_products)})",
-            callback_data=f"freebies_cat_{first.id}",
-            style=config["style"],
-        ))
-        if len(category_row) == 3:
+    for entry in page_entries:
+        if entry[0] == "category":
+            _, _, category_products, representative, label, icon, config = entry
+            if len(label) > 40:
+                label = label[:37].rstrip() + "…"
+            category_row.append(InlineKeyboardButton(
+                text=f"{icon} {label} ({len(category_products)})",
+                callback_data=f"freebies_cat_{representative.id}",
+                style=config["style"],
+            ))
+            if len(category_row) == 3:
+                rows.append(category_row)
+                category_row = []
+            continue
+        if category_row:
             rows.append(category_row)
             category_row = []
-    if category_row:
-        rows.append(category_row)
-
-    for product in standalone:
+        product = entry[2]
         config = _get_category_config(product.category)
         stock_badge = _catalog_stock_badge(product, _real_stock(product))
         rows.append([InlineKeyboardButton(
@@ -1467,15 +1679,21 @@ async def _show_freebies_categories(callback: CallbackQuery, products: list):
             callback_data=f"product_{product.id}",
             style=config["style"],
         )])
+    if category_row:
+        rows.append(category_row)
 
+    rows.extend(_page_navigation(
+        page, page_count, lambda target: f"freebies_categories_page_{target}"
+    ))
     rows.extend([
-        [InlineKeyboardButton(text=f"🎁 All Freebies ({len(products)})", callback_data="freebies_all", style="success")],
+        [InlineKeyboardButton(text=f"🎁 All Freebies ({len(products)})", callback_data="freebies_page_a_0", style="success")],
         [InlineKeyboardButton(text="🛍 Paid Products", callback_data="products_menu", style="primary"),
          InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu", style="primary")],
     ])
     await show(
         callback,
-        "🎁 <b>FREEBIES</b>\n\nChoose a category, or browse every free item.\nFree products are listed here separately from the paid shop.",
+        f"🎁 <b>FREEBIES</b>\n\nChoose a category, or browse every free item.\n"
+        f"Page {page + 1}/{page_count} · Free products are separate from the paid shop.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
@@ -1484,23 +1702,99 @@ async def _show_freebies_categories(callback: CallbackQuery, products: list):
 @router.callback_query(F.data == "freebies_all")
 async def freebies_all(callback: CallbackQuery):
     await callback.answer()
-    await _show_freebies_catalog(callback, await asyncio.to_thread(_fetch_free_products), show_all=True)
+    await _show_freebies_page(callback, 0, show_all=True)
+
+
+@router.callback_query(F.data.startswith("freebies_categories_page_"))
+async def freebies_categories_page(callback: CallbackQuery):
+    await callback.answer()
+    try:
+        page = int(callback.data.rsplit("_", 1)[1])
+    except (TypeError, ValueError):
+        page = 0
+    try:
+        products = await _fetch_free_products()
+    except ProductCatalogUnavailable:
+        await _show_catalog_unavailable(callback, freebies=True)
+        return
+    await _show_freebies_categories(callback, products, page=page)
+
+
+async def _show_freebies_page(callback: CallbackQuery, page: int, *, show_all: bool = False,
+                              category_representative_id: int | None = None):
+    try:
+        products = await _fetch_free_products()
+    except ProductCatalogUnavailable:
+        await _show_catalog_unavailable(callback, freebies=True)
+        return
+    category = None
+    if category_representative_id is not None:
+        representative = next((p for p in products if int(p.id) == category_representative_id), None)
+        expected_category = _category_key(representative) if representative else None
+        try:
+            representative_is_current = await asyncio.to_thread(
+                _category_representative_is_current,
+                category_representative_id,
+                freebies=True,
+                category=expected_category,
+            )
+        except Exception:
+            logger.exception("Could not validate freebies category button product_id=%s", category_representative_id)
+            await _show_catalog_unavailable(callback, freebies=True)
+            return
+        if representative is None or not representative_is_current:
+            invalidate_products_cache()
+            try:
+                products = await _fetch_free_products()
+            except ProductCatalogUnavailable:
+                await _show_catalog_unavailable(callback, freebies=True)
+                return
+            representative = next((p for p in products if int(p.id) == category_representative_id), None)
+        if representative is None:
+            await _show_freebies_categories(callback, products)
+            return
+        category = _category_key(representative)
+    await _show_freebies_catalog(
+        callback, products, category=category, show_all=show_all, page=page,
+        category_representative_id=category_representative_id,
+    )
+
+
+@router.callback_query(F.data.startswith("freebies_page_"))
+async def freebies_page(callback: CallbackQuery):
+    await callback.answer()
+    try:
+        parts = callback.data.split("_")
+        if parts[2] == "a":
+            page = int(parts[3])
+            await _show_freebies_page(callback, page, show_all=True)
+        elif parts[2] == "c":
+            representative_id, page = int(parts[3]), int(parts[4])
+            await _show_freebies_page(
+                callback, page, category_representative_id=representative_id
+            )
+        else:
+            raise ValueError("Unknown freebies page scope")
+    except (IndexError, TypeError, ValueError):
+        await _show_freebies_page(callback, 0, show_all=True)
 
 
 @router.callback_query(F.data.startswith("freebies_cat_"))
 async def freebies_category(callback: CallbackQuery):
     await callback.answer()
-    products = await asyncio.to_thread(_fetch_free_products)
     try:
         representative_id = int(callback.data.removeprefix("freebies_cat_"))
     except (TypeError, ValueError):
+        try:
+            products = await _fetch_free_products()
+        except ProductCatalogUnavailable:
+            await _show_catalog_unavailable(callback, freebies=True)
+            return
         await _show_freebies_categories(callback, products)
         return
-    representative = next((product for product in products if int(product.id) == representative_id), None)
-    if representative is None:
-        await _show_freebies_categories(callback, products)
-        return
-    await _show_freebies_catalog(callback, products, category=_category_key(representative))
+    await _show_freebies_page(
+        callback, 0, category_representative_id=representative_id
+    )
 
 
 async def _show_freebies_catalog(
@@ -1508,11 +1802,13 @@ async def _show_freebies_catalog(
     products: list,
     category: str | None = None,
     show_all: bool = False,
+    page: int = 0,
+    category_representative_id: int | None = None,
 ):
     visible = products if show_all else [product for product in products if _category_key(product) == category]
     if visible:
-        config = _get_category_config(visible[0].category)
-        title = "All Freebies" if show_all else config["label"]
+        _, category_label, _, _ = _category_presentation(visible) if not show_all else (None, "All Freebies", None, None)
+        title = "All Freebies" if show_all else category_label
     else:
         title = "Freebies"
     if not visible:
@@ -1527,8 +1823,11 @@ async def _show_freebies_catalog(
         )
         return
 
+    page_count = max(1, (len(visible) + CATALOG_PAGE_SIZE - 1) // CATALOG_PAGE_SIZE)
+    page = min(max(0, int(page)), page_count - 1)
+    page_products = visible[page * CATALOG_PAGE_SIZE:(page + 1) * CATALOG_PAGE_SIZE]
     keyboard = []
-    for product in visible:
+    for product in page_products:
         config = _get_category_config(product.category)
         stock_badge = _catalog_stock_badge(product, _real_stock(product))
         keyboard.append([InlineKeyboardButton(
@@ -1536,6 +1835,11 @@ async def _show_freebies_catalog(
             callback_data=f"product_{product.id}",
             style=config["style"],
         )])
+    if show_all:
+        callback_for_page = lambda target: f"freebies_page_a_{target}"
+    else:
+        callback_for_page = lambda target: f"freebies_page_c_{category_representative_id}_{target}"
+    keyboard.extend(_page_navigation(page, page_count, callback_for_page))
     keyboard.extend([
         [InlineKeyboardButton(text="⬅ Freebies", callback_data="freebies_menu", style="primary")],
         [InlineKeyboardButton(text="🛍 Paid Products", callback_data="products_menu", style="primary"),
@@ -1543,7 +1847,8 @@ async def _show_freebies_catalog(
     ])
     await show(
         callback,
-        f"🎁 <b>{_esc(title)}</b>\n\nSelect a free product to view details and claim it.",
+        f"🎁 <b>{_esc(title)}</b>\n\n"
+        f"Select a free product to view details and claim it.\nPage {page + 1}/{page_count}.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
     )
@@ -1564,6 +1869,8 @@ async def products_menu(callback: CallbackQuery):
         products = await _fetch_active_products()
         catalog_ms = (time.perf_counter() - catalog_started) * 1000
         await _show_product_categories(callback, products)
+    except ProductCatalogUnavailable:
+        await _show_catalog_unavailable(callback)
     finally:
         total_ms = (time.perf_counter() - started) * 1000
         logger.info(
@@ -1578,10 +1885,10 @@ def _category_key(product) -> str | None:
     value = getattr(product, "category", None)
     if value is None or not str(value).strip():
         return None
-    return str(value).strip().casefold()
+    return _normalized_category_name(str(value))
 
 
-async def _show_product_categories(callback: CallbackQuery, products: list):
+async def _show_product_categories(callback: CallbackQuery, products: list, page: int = 0):
     if not products:
         await show(
             callback,
@@ -1602,52 +1909,64 @@ async def _show_product_categories(callback: CallbackQuery, products: list):
         else:
             groups.setdefault(key, []).append(product)
 
-    rows = []
-    pending_row = []
-    sorted_groups = sorted(
-        groups.items(),
-        key=lambda item: _get_category_config(item[1][0].category)["label"].casefold(),
-    )
-    for _, category_products in sorted_groups:
-        first_product = category_products[0]
-        config = _get_category_config(first_product.category)
-        category_name = (getattr(first_product, "category", None) or "").strip().lower()
-        is_custom_category = category_name not in CATEGORY_CONFIG
-        icon = first_product.icon if is_custom_category and first_product.icon else config["icon"]
-        label = config["label"]
-        if len(label) > 40:
-            label = label[:37].rstrip() + "…"
-        pending_row.append(InlineKeyboardButton(
-            text=f"{icon} {label} ({len(category_products)})",
-            callback_data=f"products_cat_{first_product.id}",
-            style=config["style"],
-        ))
-        if len(pending_row) == 3:
-            rows.append(pending_row)
-            pending_row = []
-    if pending_row:
-        rows.append(pending_row)
-    if standalone:
+    entries = []
+    for category_products in groups.values():
+        representative, label, icon, config = _category_presentation(category_products)
+        entries.append(("category", label.casefold(), category_products, representative, label, icon, config))
+    entries.extend(("product", product.name.casefold(), product) for product in standalone)
+    entries.sort(key=lambda entry: (entry[1], int(entry[3].id) if entry[0] == "category" else int(entry[2].id)))
+    page_count = max(1, (len(entries) + CATALOG_PAGE_SIZE - 1) // CATALOG_PAGE_SIZE)
+    page = min(max(0, int(page)), page_count - 1)
+    page_entries = entries[page * CATALOG_PAGE_SIZE:(page + 1) * CATALOG_PAGE_SIZE]
+    page_standalone = [entry[2] for entry in page_entries if entry[0] == "product"]
+    custom_prices = {}
+    if page_standalone:
         custom_prices = await asyncio.to_thread(
             _get_catalog_custom_prices,
             callback.from_user.id,
-            [product.id for product in standalone],
+            [product.id for product in page_standalone],
         )
-        _fire_stock_scan(callback.bot, standalone)
-        for product in standalone:
-            price = custom_prices.get(product.id)
-            price = price if price is not None else _money(product.price)
-            stock = _real_stock(product)
-            stock_badge = _catalog_stock_badge(product, stock)
-            price_label = "FREE" if price == 0 else f"${price:.2f}"
-            label = f"{product.icon or '📦'} {product.name} — {price_label} | {stock_badge}"
-            rows.append([InlineKeyboardButton(
-                text=label[:64],
-                callback_data=f"product_{product.id}",
-                style="primary",
-            )])
+        _fire_stock_scan(callback.bot, page_standalone)
+
+    rows = []
+    pending_row = []
+    for entry in page_entries:
+        if entry[0] == "category":
+            _, _, category_products, representative, label, icon, config = entry
+            if len(label) > 40:
+                label = label[:37].rstrip() + "…"
+            pending_row.append(InlineKeyboardButton(
+                text=f"{icon} {label} ({len(category_products)})",
+                callback_data=f"products_cat_{representative.id}",
+                style=config["style"],
+            ))
+            if len(pending_row) == 3:
+                rows.append(pending_row)
+                pending_row = []
+            continue
+        if pending_row:
+            rows.append(pending_row)
+            pending_row = []
+        product = entry[2]
+        config = _get_category_config(product.category)
+        price = custom_prices.get(product.id)
+        price = price if price is not None else _money(product.price)
+        stock_badge = _catalog_stock_badge(product, _real_stock(product))
+        price_label = "FREE" if price == 0 else f"${price:.2f}"
+        label = f"{product.icon or '📦'} {product.name} — {price_label} | {stock_badge}"
+        rows.append([InlineKeyboardButton(
+            text=label[:64],
+            callback_data=f"product_{product.id}",
+            style=config["style"],
+        )])
+    if pending_row:
+        rows.append(pending_row)
+
+    rows.extend(_page_navigation(
+        page, page_count, lambda target: f"products_categories_page_{target}"
+    ))
     rows.extend([
-        [InlineKeyboardButton(text=f"🛍 All Products ({len(products)})", callback_data="products_all", style="primary")],
+        [InlineKeyboardButton(text=f"🛍 All Products ({len(products)})", callback_data="products_page_a_0", style="primary")],
         [InlineKeyboardButton(text="⭐ Favorites", callback_data="favorites_menu", style="success"),
          InlineKeyboardButton(text="🔔 Restock alerts", callback_data="restock_alerts_menu", style="primary")],
         [InlineKeyboardButton(text="🔍 Search products", callback_data="search_start", style="primary")],
@@ -1655,7 +1974,8 @@ async def _show_product_categories(callback: CallbackQuery, products: list):
     ])
     await show(
         callback,
-        "🛍 <b>SHOP BY CATEGORY</b>\n\nChoose a category to browse, or open the full catalog.",
+        f"🛍 <b>SHOP BY CATEGORY</b>\n\nChoose a category to browse, or open the full catalog.\n"
+        f"Page {page + 1}/{page_count}.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
@@ -1664,7 +1984,79 @@ async def _show_product_categories(callback: CallbackQuery, products: list):
 @router.callback_query(F.data == "products_all")
 async def products_all(callback: CallbackQuery):
     await callback.answer()
-    await _show_products_catalog(callback, await _fetch_active_products(), show_all=True)
+    await _show_products_page(callback, 0, show_all=True)
+
+
+@router.callback_query(F.data.startswith("products_categories_page_"))
+async def products_categories_page(callback: CallbackQuery):
+    await callback.answer()
+    try:
+        page = int(callback.data.rsplit("_", 1)[1])
+    except (TypeError, ValueError):
+        page = 0
+    try:
+        products = await _fetch_active_products()
+    except ProductCatalogUnavailable:
+        await _show_catalog_unavailable(callback)
+        return
+    await _show_product_categories(callback, products, page=page)
+
+
+async def _show_products_page(callback: CallbackQuery, page: int, *, show_all: bool = False,
+                              category_representative_id: int | None = None):
+    try:
+        products = await _fetch_active_products()
+    except ProductCatalogUnavailable:
+        await _show_catalog_unavailable(callback)
+        return
+    category = None
+    if category_representative_id is not None:
+        representative = next((p for p in products if int(p.id) == category_representative_id), None)
+        expected_category = _category_key(representative) if representative else None
+        try:
+            representative_is_current = await asyncio.to_thread(
+                _category_representative_is_current,
+                category_representative_id,
+                freebies=False,
+                category=expected_category,
+            )
+        except Exception:
+            logger.exception("Could not validate product category button product_id=%s", category_representative_id)
+            await _show_catalog_unavailable(callback)
+            return
+        if representative is None or not representative_is_current:
+            invalidate_products_cache()
+            try:
+                products = await _fetch_active_products()
+            except ProductCatalogUnavailable:
+                await _show_catalog_unavailable(callback)
+                return
+            representative = next((p for p in products if int(p.id) == category_representative_id), None)
+        if representative is None:
+            await _show_product_categories(callback, products)
+            return
+        category = _category_key(representative)
+    await _show_products_catalog(
+        callback, products, category=category, show_all=show_all, page=page,
+        category_representative_id=category_representative_id,
+    )
+
+
+@router.callback_query(F.data.startswith("products_page_"))
+async def products_page(callback: CallbackQuery):
+    await callback.answer()
+    try:
+        parts = callback.data.split("_")
+        if parts[2] == "a":
+            await _show_products_page(callback, int(parts[3]), show_all=True)
+        elif parts[2] == "c":
+            await _show_products_page(
+                callback, int(parts[4]), category_representative_id=int(parts[3])
+            )
+        else:
+            raise ValueError("Unknown product page scope")
+    except (IndexError, TypeError, ValueError):
+        await _show_products_page(callback, 0, show_all=True)
 
 
 @router.callback_query(F.data.startswith("products_cat_"))
@@ -1674,14 +2066,14 @@ async def products_category(callback: CallbackQuery):
     try:
         representative_id = int(callback.data.removeprefix("products_cat_"))
     except (TypeError, ValueError):
-        await _show_product_categories(callback, await _fetch_active_products())
-        return
-    products = await _fetch_active_products()
-    representative = next((p for p in products if int(p.id) == representative_id), None)
-    if representative is None:
+        try:
+            products = await _fetch_active_products()
+        except ProductCatalogUnavailable:
+            await _show_catalog_unavailable(callback)
+            return
         await _show_product_categories(callback, products)
         return
-    await _show_products_catalog(callback, products, category=_category_key(representative))
+    await _show_products_page(callback, 0, category_representative_id=representative_id)
     logger.info("button_timing button=category user_id=%s total_ms=%.1f",
                 callback.from_user.id, (time.perf_counter() - started) * 1000)
 
@@ -1691,6 +2083,8 @@ async def _show_products_catalog(
     products: list,
     category: str | None = None,
     show_all: bool = False,
+    page: int = 0,
+    category_representative_id: int | None = None,
 ):
     if not products:
         await show(
@@ -1705,10 +2099,11 @@ async def _show_products_catalog(
         return
 
     visible_products = products if show_all else [p for p in products if _category_key(p) == category]
-    category_label = (
-        "All Products" if show_all else
-        _get_category_config(visible_products[0].category)["label"] if visible_products else "Products"
-    )
+    category_label = "All Products"
+    if not show_all and visible_products:
+        _, category_label, _, _ = _category_presentation(visible_products)
+    elif not show_all:
+        category_label = "Products"
     if not visible_products:
         await show(
             callback,
@@ -1721,17 +2116,21 @@ async def _show_products_catalog(
         )
         return
 
+    page_count = max(1, (len(visible_products) + CATALOG_PAGE_SIZE - 1) // CATALOG_PAGE_SIZE)
+    page = min(max(0, int(page)), page_count - 1)
+    page_products = visible_products[page * CATALOG_PAGE_SIZE:(page + 1) * CATALOG_PAGE_SIZE]
+
     # Keep reseller refresh in the background so category screens remain fast.
-    if any((getattr(product, "source", "own") or "own") == "reseller" for product in visible_products):
+    if any((getattr(product, "source", "own") or "own") == "reseller" for product in page_products):
         _schedule_reseller_stock_refresh()
 
-    _fire_stock_scan(callback.bot, visible_products)
+    _fire_stock_scan(callback.bot, page_products)
     custom_prices = await asyncio.to_thread(
-        _get_catalog_custom_prices, callback.from_user.id, [product.id for product in visible_products]
+        _get_catalog_custom_prices, callback.from_user.id, [product.id for product in page_products]
     )
-    text = f"🛍 <b>{_esc(category_label)}</b>\nPlease select a product to proceed"
+    text = f"🛍 <b>{_esc(category_label)}</b>\nPlease select a product to proceed\nPage {page + 1}/{page_count}."
     keyboard = []
-    for p in visible_products:
+    for p in page_products:
         cat_config = _get_category_config(p.category)
         stock = _real_stock(p)
         custom_price = custom_prices.get(p.id)
@@ -1745,6 +2144,12 @@ async def _show_products_catalog(
             callback_data=f"product_{p.id}",
             style=cat_config["style"],
         )])
+
+    if show_all:
+        callback_for_page = lambda target: f"products_page_a_{target}"
+    else:
+        callback_for_page = lambda target: f"products_page_c_{category_representative_id}_{target}"
+    keyboard.extend(_page_navigation(page, page_count, callback_for_page))
 
     if show_all:
         keyboard.append([InlineKeyboardButton(text="⬅ Categories", callback_data="products_menu", style="primary")])
@@ -2175,7 +2580,8 @@ async def product_info(
 
     _fire_stock_scan(callback.bot, [product])
 
-    max_qty = _get_max_qty(product)
+    configuration_errors = _product_purchase_configuration_errors(product)
+    max_qty = 0 if configuration_errors else _get_max_qty(product)
     stock_count = _real_stock(product)
     real_stock_available = stock_count > 0
     cat_config = _get_category_config(product.category)
@@ -2223,6 +2629,12 @@ async def product_info(
         f"  {delivery_info['icon']} <b>Delivery:</b> {delivery_info['label']}\n"
     )
 
+    if configuration_errors:
+        text += (
+            "\n⚠️ <b>Purchases are temporarily unavailable.</b> "
+            "The product’s purchase settings need administrator review."
+        )
+
     if policy_snapshot(product)['aftercare_policy'] != 'skip':
         text += f"  <b>{policy_label(product)}</b> after delivery\n"
 
@@ -2263,7 +2675,12 @@ async def product_info(
 
     buttons = []
 
-    if max_qty <= 0:
+    if configuration_errors:
+        text += "\n❌ <b>Checkout disabled until settings are repaired.</b>"
+        buttons.append([InlineKeyboardButton(
+            text="🛍 Browse Products", callback_data=catalog_home_callback, style="primary"
+        )])
+    elif max_qty <= 0:
         text += f"\n❌ <b>Currently Unavailable</b>"
         buttons.append([
             InlineKeyboardButton(text="🔔 Notify When Available", callback_data=f"notify_available_{product_id}",
@@ -2427,6 +2844,15 @@ async def select_qty(callback: CallbackQuery, state: FSMContext):
                    ]))
         return
 
+    configuration_errors = _product_purchase_configuration_errors(product)
+    if configuration_errors:
+        await show(callback,
+                   "⚠️ <b>Purchase unavailable</b>\n\nThis product’s purchase settings need administrator review. No order was placed.",
+                   parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                       [InlineKeyboardButton(text="🛍 Browse Products", callback_data="products_menu", style="primary")]
+                   ]))
+        return
+
     max_qty = _get_max_qty(product)
     if max_qty <= 0:
         await show(callback,
@@ -2521,6 +2947,17 @@ async def receive_qty(message: Message, state: FSMContext):
                           ]))
         return
 
+    configuration_errors = _product_purchase_configuration_errors(product)
+    if configuration_errors:
+        await state.clear()
+        await update_card(message, None,
+                          "⚠️ <b>Purchase unavailable</b>\n\nThis product’s purchase settings need administrator review. No order was placed.",
+                          chat_id=card_chat_id, message_id=card_message_id, parse_mode="HTML",
+                          reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                              InlineKeyboardButton(text="🛍 Browse Products", callback_data="products_menu", style="primary")
+                          ]]))
+        return
+
     is_free = float(product.price) == 0
     if is_free:
         await state.update_data(**{f"qty_{product_id}": 1})
@@ -2584,6 +3021,7 @@ def _do_purchase(
     buyer_info: dict | None = None,
     require_buyer_info: bool = False,
     allow_preorder: bool = True,
+    api_key_id: int | None = None,
 ) -> dict:
     with transaction() as db:
         user = db.query(User).filter(User.telegram_id == telegram_id).with_for_update().first()
@@ -2591,6 +3029,16 @@ def _do_purchase(
             return {"error": "User not found."}
         if getattr(user, "is_banned", False):
             return {"error": "Your account is banned from making purchases."}
+
+        if api_key_id is not None:
+            from models.api_key import ApiKey
+            active_key = db.query(ApiKey).filter(
+                ApiKey.id == api_key_id,
+                ApiKey.telegram_id == telegram_id,
+                ApiKey.is_active == True,
+            ).with_for_update().first()
+            if not active_key:
+                return {"error": "api_key_revoked"}
 
         if checkout_key:
             existing = db.query(Order).filter(Order.checkout_key == checkout_key, Order.telegram_id == telegram_id).first()
@@ -2602,10 +3050,7 @@ def _do_purchase(
             return {"error": "Product not found."}
         if not product.is_active:
             return {"error": "Product unavailable."}
-        configuration_errors = _purchase_configuration_errors(
-            product.required_info,
-            product.bulk_pricing,
-        )
+        configuration_errors = _product_purchase_configuration_errors(product)
         if configuration_errors:
             logger.error(
                 "Blocked purchase for invalid product configuration product_id=%s fields=%s",
@@ -2843,6 +3288,7 @@ async def _do_reseller_purchase(
     expected_total: str | None = None,
     buyer_info: dict | None = None,
     require_buyer_info: bool = False,
+    api_key_id: int | None = None,
 ) -> dict:
     """Serialize purchases for one supplier service within this bot process."""
     def _lock_identity():
@@ -2870,6 +3316,7 @@ async def _do_reseller_purchase(
             expected_total=expected_total,
             buyer_info=buyer_info,
             require_buyer_info=require_buyer_info,
+            api_key_id=api_key_id,
         )
 
 
@@ -2882,6 +3329,7 @@ async def _do_reseller_purchase_unlocked(
     expected_total: str | None = None,
     buyer_info: dict | None = None,
     require_buyer_info: bool = False,
+    api_key_id: int | None = None,
 ) -> dict:
     async def report_progress(percent: int, stage: str) -> None:
         if progress_callback is None:
@@ -2899,10 +3347,7 @@ async def _do_reseller_purchase_unlocked(
         product = db.query(Product).filter(Product.id == product_id).first()
         if not product or not product.is_active:
             return {"error": "Product is no longer available."}
-        configuration_errors = _purchase_configuration_errors(
-            product.required_info,
-            product.bulk_pricing,
-        )
+        configuration_errors = _product_purchase_configuration_errors(product)
         if configuration_errors:
             logger.error(
                 "Blocked reseller purchase for invalid product configuration product_id=%s fields=%s",
@@ -2988,6 +3433,22 @@ async def _do_reseller_purchase_unlocked(
 
     if not api_key or not base_url:
         return {"error": "Reseller service is not configured properly."}
+
+    if api_key_id is not None:
+        # Serialize the dispatch authorization check with API-key revocation.
+        # Once the provider request has started, a later key revocation does
+        # not cancel a purchase the provider may already have accepted.
+        def _api_key_is_active():
+            from models.api_key import ApiKey
+            with transaction() as check_db:
+                return check_db.query(ApiKey.id).filter(
+                    ApiKey.id == api_key_id,
+                    ApiKey.telegram_id == telegram_id,
+                    ApiKey.is_active == True,
+                ).with_for_update().first() is not None
+
+        if not await asyncio.to_thread(_api_key_is_active):
+            return {"error": "api_key_revoked"}
 
     await report_progress(30, "Checking your balance and product availability")
     external_order_id = f"RD-{checkout_key[:32]}" if checkout_key else f"ORD-{telegram_id}-{int(time.time())}"

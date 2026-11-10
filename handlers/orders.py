@@ -132,6 +132,14 @@ STATUS_CONFIG = {
         "progress": 50,
         "description": "Awaiting manual delivery"
     },
+    "delivery_pending": {
+        "emoji": "📨",
+        "label": "Delivery Confirmation Pending",
+        "icon": "🟠",
+        "style": "primary",
+        "progress": 85,
+        "description": "Delivery is queued; awaiting confirmation"
+    },
     "preorder": {
         "emoji": "📦",
         "label": "Pre-ordered",
@@ -807,6 +815,11 @@ async def order_detail(callback: CallbackQuery):
             f"⏱ Estimated delivery: {DELIVERY_ETA.get(order.delivery_type, '24 hours')}\n\n"
             "<i>You'll be notified when it's ready! 🔔</i>"
         ),
+        "delivery_pending": (
+            "📨 <b>Delivery Confirmation Pending</b>\n\n"
+            "Your delivery has been saved and is waiting for the delivery service to confirm or queue it. "
+            "You do not need to place the order again. Check this order again shortly."
+        ),
         "preorder": (
             "📦 <b>Preorder Status</b>\n\n"
             "🔄 We're restocking this product.\n"
@@ -906,7 +919,7 @@ async def order_detail(callback: CallbackQuery):
         ])
 
     # Support button for active issues
-    if order.status in ["pending_manual", "preorder", "pending"]:
+    if order.status in ["pending_manual", "preorder", "pending", "delivery_pending"]:
         action_buttons.append([
             InlineKeyboardButton(
                 text="🆘 Get Support",
@@ -1538,7 +1551,7 @@ async def apply_order_filter(callback: CallbackQuery):
         if filter_type.startswith("filter_status_"):
             status = filter_type.replace("filter_status_", "")
             if status == "pending":
-                query = query.filter(Order.status.in_(["pending_manual", "preorder", "pending"]))
+                query = query.filter(Order.status.in_(["pending_manual", "preorder", "pending", "delivery_pending"]))
             else:
                 query = query.filter(Order.status == status)
             filter_label = status.capitalize()

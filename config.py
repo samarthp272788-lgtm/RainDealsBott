@@ -121,6 +121,17 @@ API_ORDER_LIMIT_PER_MINUTE = max(1, int(os.getenv("API_ORDER_LIMIT_PER_MINUTE", 
 API_MAX_CONCURRENT_ORDERS = max(1, int(os.getenv("API_MAX_CONCURRENT_ORDERS", "1")))
 API_INVALID_AUTH_LIMIT_PER_MINUTE = max(1, int(os.getenv("API_INVALID_AUTH_LIMIT_PER_MINUTE", "20")))
 API_MAX_REQUEST_BYTES = max(1024, int(os.getenv("API_MAX_REQUEST_BYTES", "16384")))
+# Only trust forwarded client IP headers when the immediate peer belongs to
+# one of these explicitly configured reverse-proxy networks.
+API_TRUSTED_PROXY_CIDRS = tuple(
+    value.strip() for value in os.getenv("API_TRUSTED_PROXY_CIDRS", "").split(",")
+    if value.strip()
+)
+# A reservation older than this is never replayed automatically if no local
+# order exists; supplier-side success may be ambiguous and requires review.
+API_ORDER_RECONCILE_AFTER_SECONDS = max(
+    300, int(os.getenv("API_ORDER_RECONCILE_AFTER_SECONDS", "900"))
+)
 
 # The gateway on Wasmer sends this value to the bot for every internal API
 # request.  It must be a long random value, identical in Vercel/Render and

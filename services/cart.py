@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 import hashlib
 import json
+import logging
 import secrets
 
 from database import SessionLocal, transaction
@@ -11,6 +12,8 @@ from models.customer_tools import CartItem, CartCheckout
 from models.product import Product
 from models.user import User
 from models.order import Order
+
+logger = logging.getLogger(__name__)
 
 
 def _reseller_stock(product):
@@ -30,6 +33,16 @@ def _busy(db, user_id):
     return db.query(CartCheckout).filter_by(telegram_id=user_id).filter(CartCheckout.status.in_(['processing', 'held'])).first()
 
 
+def _checkout_status(results, line_count):
+    """Distinguish a finished batch from a fully successful batch."""
+    if len(results) < line_count:
+        return 'partial' if any(row.get('order_id') for row in results) else 'failed'
+    successful = sum(bool(row.get('order_id')) for row in results)
+    if successful == line_count:
+        return 'completed'
+    return 'partial' if successful else 'failed'
+
+
 def change(user_id, product_id, quantity):
     if not isinstance(quantity, int) or not 0 <= quantity <= 1000:
         raise ValueError('Quantity must be 0–1,000; zero removes the item.')
@@ -45,6 +58,12 @@ def change(user_id, product_id, quantity):
         product = db.get(Product, product_id)
         if not product or not product.is_active:
             raise ValueError('Product is unavailable.')
+        from handlers.products import _product_purchase_configuration_errors
+        config_errors = _product_purchase_configuration_errors(product)
+        if config_errors:
+            raise ValueError('Product checkout is temporarily disabled because its purchase settings need repair.')
+        if Decimal(str(product.price)) < 0:
+            raise ValueError('Product is unavailable because its price is invalid.')
         is_free = Decimal(str(product.price)) == 0
         if is_free:
             quantity = 1
@@ -75,32 +94,58 @@ def clear(user_id):
 
 
 def _quote(db, user_id):
-    from handlers.products import _active_custom_price, _get_bulk_price, _money
-    from services.fulfillment_policy import plan_delivery
+    from handlers.products import _active_custom_price, _get_bulk_price, _money, _product_purchase_configuration_errors
+    from services.fulfillment_policy import plan_delivery, effective_delivery_type
     lines = []
     for item in db.query(CartItem).filter_by(telegram_id=user_id).order_by(CartItem.id).all():
         product = db.get(Product, item.product_id)
-        price, error = Decimal(0), None
+        price, error, plan = Decimal(0), None, None
         if not product or not product.is_active:
             error = 'Unavailable'
         else:
-            custom = _active_custom_price(db, user_id, product.id)
-            price = _money(custom if custom is not None else product.price)
-            bulk = _get_bulk_price(product.bulk_pricing, item.quantity) if custom is None and product.bulk_pricing else None
-            if bulk is not None:
-                price = _money(bulk)
-            try:
-                if product.source != 'reseller':
-                    plan_delivery(product, item.quantity)
-                else:
-                    available = _reseller_stock(product)
-                    if item.quantity > available:
-                        error = f'Only {available} supplier units are currently available'
-            except ValueError as exc:
-                error = str(exc)
+            config_errors = _product_purchase_configuration_errors(product)
+            if config_errors:
+                error = 'Product checkout is temporarily disabled because its purchase settings need repair.'
+            elif Decimal(str(product.price)) < 0:
+                error = 'Product is unavailable because its price is invalid.'
+            else:
+                custom = _active_custom_price(db, user_id, product.id)
+                price = _money(custom if custom is not None else product.price)
+                bulk = _get_bulk_price(product.bulk_pricing, item.quantity) if custom is None and product.bulk_pricing else None
+                if bulk is not None:
+                    price = _money(bulk)
+                try:
+                    if product.source != 'reseller':
+                        plan = plan_delivery(product, item.quantity)
+                    else:
+                        available = _reseller_stock(product)
+                        if item.quantity > available:
+                            error = f'Only {available} supplier units are currently available'
+                except ValueError as exc:
+                    error = str(exc)
+        requirements = getattr(product, 'required_info', None) if product else None
+        settings = {
+            'delivery_type': getattr(product, 'delivery_type', None),
+            'effective_delivery_type': effective_delivery_type(product) if product else None,
+            'manual_fallback': bool(getattr(product, 'manual_fallback', False)),
+            'preorder': bool(getattr(product, 'preorder', False)),
+            'required_info': requirements,
+            'delivery_instruction': getattr(product, 'delivery_instruction', None),
+            'aftercare_policy': getattr(product, 'aftercare_policy', None),
+            'warranty_days': getattr(product, 'warranty_days', 0),
+            'subscription_days': getattr(product, 'subscription_days', 0),
+            'term_days': getattr(product, 'term_days', 0),
+        }
+        settings_fingerprint = hashlib.sha256(json.dumps(
+            settings, sort_keys=True, separators=(',', ':'), ensure_ascii=False, default=str
+        ).encode('utf-8')).hexdigest()
         lines.append(dict(product_id=item.product_id, name=product.name if product else 'Removed product',
                           quantity=item.quantity, revision=item.revision, total=str(_money(price*item.quantity)),
-                          source=getattr(product, 'source', 'own'), error=error))
+                          source=getattr(product, 'source', 'own'),
+                          delivery_mode=(plan.order_mode if plan else settings['effective_delivery_type']),
+                          automatic_quantity=(plan.automatic_quantity if plan else item.quantity if product and product.source == 'reseller' else 0),
+                          manual_quantity=(plan.manual_quantity if plan else 0),
+                          settings_fingerprint=settings_fingerprint, error=error))
     return lines
 
 
@@ -117,6 +162,11 @@ def prepare(user_id):
         busy = _busy(db,user_id)
         if busy:
             raise ValueError('Your earlier checkout must finish or be reviewed first.')
+        # A cart has one live review card. Old Telegram buttons remain harmless
+        # because claim() accepts only a row whose status is still "ready".
+        db.query(CartCheckout).filter_by(telegram_id=user_id, status='ready').update(
+            {CartCheckout.status: 'expired'}, synchronize_session=False
+        )
         lines = _quote(db,user_id)
         if not lines or any(line['error'] for line in lines):
             raise ValueError('Remove unavailable items or adjust quantities before checkout.')
@@ -169,8 +219,20 @@ def save_result(user_id,token,index,result):
         if result.get('needs_review'):
             batch.status = 'held'
         elif len(results) == len(batch.lines):
-            batch.status = 'completed'
+            batch.status = _checkout_status(results, len(batch.lines))
         return batch.status == 'processing'
+
+
+def touch_processing(user_id, token):
+    """Heartbeat a live checkout so a slow supplier call is not mistaken for a crash."""
+    with transaction() as db:
+        batch = db.query(CartCheckout).filter_by(
+            token=token, telegram_id=user_id, status='processing'
+        ).with_for_update().first()
+        if not batch:
+            return False
+        batch.updated_at = datetime.utcnow()
+        return True
 
 
 def result(user_id,token):
@@ -181,17 +243,22 @@ def result(user_id,token):
             raise ValueError('Checkout not found.')
         results = list(batch.results)
         if batch.status in ('held','processing') and batch.updated_at < datetime.utcnow()-timedelta(minutes=5):
-            # Only the first unresolved item could have been dispatched.
-            index = len(results)
+            # A result already marked held is the unresolved item. Otherwise
+            # the first item without a saved result may have been dispatched.
+            index = next((i for i, row in enumerate(results) if row.get('status') == 'held'), len(results))
             if index < len(batch.lines):
                 line = batch.lines[index]
                 key = hashlib.sha256(f'cart:{token}:{index}'.encode()).hexdigest()
                 order = db.query(Order).filter_by(checkout_key=key,telegram_id=user_id).first()
                 if order:
-                    results.append(dict(product_id=line['product_id'],name=line['name'],order_id=order.id,status='ordered',error=''))
+                    recovered = dict(product_id=line['product_id'],name=line['name'],order_id=order.id,status='ordered',error='')
+                    if index < len(results):
+                        results[index] = recovered
+                    else:
+                        results.append(recovered)
                     db.query(CartItem).filter_by(telegram_id=user_id,product_id=line['product_id'],revision=line['revision']).delete()
                     batch.results = results
-                    batch.status = 'completed' # Remaining items were never dispatched and remain in cart.
+                    batch.status = _checkout_status(results, len(batch.lines))
                 else:
                     batch.status = 'held'
                     from services.notification_outbox import enqueue_admin
@@ -227,7 +294,7 @@ def resolve_hold(admin_id,token,order_id,note):
             row=dict(product_id=line['product_id'],name=line['name'],order_id=None,status='failed',error='Staff confirmed no supplier order / no charge.')
         if index<len(results): results[index]=row
         else: results.append(row)
-        batch.results,batch.status=results,'completed'
+        batch.results,batch.status=results,_checkout_status(results,len(batch.lines))
         db.add(AdminAuditLog(admin_telegram_id=admin_id,action='resolve_cart_hold',entity_type='cart',entity_id=token,
                               summary=json.dumps({'order_id':order_id,'provider_investigation':note})))
 
@@ -241,28 +308,47 @@ async def checkout(user_id,token,bot_id):
         lines = await asyncio.to_thread(claim,user_id,token)
         if lines is None:
             return await asyncio.to_thread(result,user_id,token)
-        for index,line in enumerate(lines):
-            key = hashlib.sha256(f'cart:{token}:{index}'.encode()).hexdigest()
-            claimed = await asyncio.to_thread(claim_checkout,key,user_id,line['product_id'],line['quantity'],True)
-            if not claimed['new']:
-                outcome = {'duplicate_order_id':claimed['order_id']} if claimed.get('order_id') else {'needs_review':True}
-            else:
+        async def heartbeat():
+            while True:
+                await asyncio.sleep(45)
                 try:
-                    if line['source']=='reseller':
-                        outcome = await _do_reseller_purchase(user_id,line['product_id'],line['quantity'],checkout_key=key,expected_total=line['total'])
-                    else:
-                        outcome = await asyncio.to_thread(_do_purchase,user_id,line['product_id'],line['quantity'],None,key,line['total'])
+                    active = await asyncio.to_thread(touch_processing,user_id,token)
                 except Exception:
-                    outcome = {'needs_review':True}
-                await asyncio.to_thread(finish_checkout,key,outcome)
-            keep_processing = await asyncio.to_thread(save_result,user_id,token,index,outcome)
-            if outcome.get('needs_review'):
-                def alert():
-                    with transaction() as db:
-                        enqueue_admin(db,f'cart-held:{token}',f'Cart checkout {token} needs reconciliation for user {user_id}. Do not reorder the supplier item before checking its result.',
-                                      reply_markup={'inline_keyboard':[[{'text':'Review held cart','callback_data':f'ct_hold_{token}'}]]})
-                await asyncio.to_thread(alert)
-                break
-            if not keep_processing:
-                break
-        return await asyncio.to_thread(result,user_id,token)
+                    logger.warning("Cart checkout heartbeat failed temporarily")
+                    continue
+                if not active:
+                    return
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+        try:
+            for index,line in enumerate(lines):
+                key = hashlib.sha256(f'cart:{token}:{index}'.encode()).hexdigest()
+                claimed = await asyncio.to_thread(claim_checkout,key,user_id,line['product_id'],line['quantity'],True)
+                if not claimed['new']:
+                    outcome = {'duplicate_order_id':claimed['order_id']} if claimed.get('order_id') else {'needs_review':True}
+                else:
+                    try:
+                        if line['source']=='reseller':
+                            outcome = await _do_reseller_purchase(user_id,line['product_id'],line['quantity'],checkout_key=key,expected_total=line['total'])
+                        else:
+                            outcome = await asyncio.to_thread(_do_purchase,user_id,line['product_id'],line['quantity'],None,key,line['total'])
+                    except Exception:
+                        outcome = {'needs_review':True}
+                    await asyncio.to_thread(finish_checkout,key,outcome)
+                keep_processing = await asyncio.to_thread(save_result,user_id,token,index,outcome)
+                if outcome.get('needs_review'):
+                    def alert():
+                        with transaction() as db:
+                            enqueue_admin(db,f'cart-held:{token}',f'Cart checkout {token} needs reconciliation for user {user_id}. Do not reorder the supplier item before checking its result.',
+                                          reply_markup={'inline_keyboard':[[{'text':'Review held cart','callback_data':f'ct_hold_{token}'}]]})
+                    await asyncio.to_thread(alert)
+                    break
+                if not keep_processing:
+                    break
+            return await asyncio.to_thread(result,user_id,token)
+        finally:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass

@@ -2,7 +2,7 @@
 from datetime import datetime
 from html import escape
 
-ACTIVE_STATUSES = ('pending_manual', 'pending_info', 'preorder', 'processing')
+ACTIVE_STATUSES = ('pending_manual', 'pending_info', 'preorder', 'processing', 'delivery_pending')
 
 
 def record_event(db, order_id, kind, summary, actor_id=None, customer_visible=True):
@@ -86,6 +86,8 @@ def queue_orders(view, page, admin_id):
 
 def remaining_units(order):
     if order.status not in ACTIVE_STATUSES or order.refunded:
+        return 0
+    if order.status == 'delivery_pending':
         return 0
     return order.manual_pending_quantity or max(0, (order.quantity or 1) - (order.automatic_quantity or 0))
 

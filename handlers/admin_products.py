@@ -4,7 +4,7 @@ from utils.uploads import text_from_message
 import json
 import logging
 import secrets
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from html import escape as _esc
 import asyncio
 
@@ -28,6 +28,7 @@ from database import SessionLocal
 
 from models.product import Product
 from models.reseller import Reseller
+from services.fulfillment_policy import account_lines
 
 try:
     from models.provider import Provider
@@ -48,7 +49,11 @@ except ImportError:
     get_reseller = None
 
 # Notification function import
-from handlers.products import notify_new_product, invalidate_products_cache
+from handlers.products import (
+    notify_new_product,
+    invalidate_products_cache,
+    _purchase_configuration_errors,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -262,7 +267,7 @@ def _parse_bulk_pricing(raw_text: str) -> dict | None:
                     "max": int(t["max"]) if t.get("max") else None,
                     "price": float(t.get("price", 0))
                 }
-            return result if result else None
+            return _validated_bulk_pricing(result)
         elif isinstance(tiers, dict):
             # Validate structure
             for k, v in tiers.items():
@@ -270,8 +275,8 @@ def _parse_bulk_pricing(raw_text: str) -> dict | None:
                     return None
                 if "min" not in v or "price" not in v:
                     return None
-            return tiers
-    except (json.JSONDecodeError, ValueError, TypeError):
+            return _validated_bulk_pricing(tiers)
+    except (json.JSONDecodeError, ValueError, TypeError, AttributeError, OverflowError):
         pass
 
     # Try line-by-line format: 1-10=5.00
@@ -295,26 +300,28 @@ def _parse_bulk_pricing(raw_text: str) -> dict | None:
         if price < 0:
             return None
 
-        if "+" in range_part:
-            # 51+ format
-            min_qty = int(range_part.replace("+", "").strip())
-            key = str(min_qty)
-            tiers[key] = {"min": min_qty, "max": None, "price": price}
-        elif "-" in range_part:
-            # 1-10 format
-            parts = range_part.split("-")
-            if len(parts) != 2:
+        try:
+            if "+" in range_part:
+                min_qty = int(range_part.replace("+", "").strip())
+                tiers[str(min_qty)] = {"min": min_qty, "max": None, "price": price}
+            elif "-" in range_part:
+                parts = range_part.split("-")
+                if len(parts) != 2:
+                    return None
+                min_qty, max_qty = int(parts[0].strip()), int(parts[1].strip())
+                tiers[str(min_qty)] = {"min": min_qty, "max": max_qty, "price": price}
+            else:
                 return None
-            min_qty = int(parts[0].strip())
-            max_qty = int(parts[1].strip())
-            if min_qty >= max_qty:
-                return None
-            key = str(min_qty)
-            tiers[key] = {"min": min_qty, "max": max_qty, "price": price}
-        else:
+        except (TypeError, ValueError, OverflowError):
             return None
 
-    return tiers if tiers else None
+    return _validated_bulk_pricing(tiers)
+
+
+def _validated_bulk_pricing(tiers: dict | None) -> dict | None:
+    if not isinstance(tiers, dict) or not tiers:
+        return None
+    return tiers if not _purchase_configuration_errors(None, tiers) else None
 
 
 def _bulk_pricing_dict(bulk_pricing) -> dict | None:
@@ -1296,8 +1303,10 @@ async def product_price(message: Message, state: FSMContext):
 
     try:
         price_val = Decimal(message.text.strip())
+        if not price_val.is_finite() or price_val < 0 or price_val > Decimal("999999999999.99999999"):
+            raise ValueError("Price outside supported range")
         price = float(price_val)
-    except Exception:
+    except (InvalidOperation, TypeError, ValueError, OverflowError):
         await answer_card(message, "❌ <b>Invalid price!</b>\nPlease send a positive number like 0.99 or 9.99",
                              parse_mode="HTML")
         return
@@ -1859,7 +1868,7 @@ async def save_product(message: Message, state: FSMContext):
         accounts = []
         file_content = ""
     else:
-        accounts = list(dict.fromkeys(x.strip() for x in raw_text.splitlines() if x.strip()))
+        accounts = account_lines(raw_text)
         file_content = "\n".join(accounts)
 
     await state.update_data(draft_accounts=accounts)

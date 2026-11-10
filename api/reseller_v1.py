@@ -27,14 +27,17 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import logging
 import re
+import threading
 import time
 
 from collections import defaultdict, deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from fastapi import (
@@ -47,24 +50,27 @@ from fastapi import (
     status,
 )
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictStr, field_validator
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy import text
 
 from config import (
     API_INVALID_AUTH_LIMIT_PER_MINUTE,
     API_MAX_CONCURRENT_ORDERS,
     API_ORDER_LIMIT_PER_MINUTE,
+    API_ORDER_RECONCILE_AFTER_SECONDS,
     API_RATE_LIMIT_PER_MINUTE,
     API_RATE_LIMIT_PER_SECOND,
+    API_TRUSTED_PROXY_CIDRS,
 )
-from database import SessionLocal
+from database import SessionLocal, transaction
 
 from models.api_key import ApiKey, ApiOrder
 from models.order import Order
 from models.product import Product
 from models.user import User
 
-from services.checkout_actions import api_checkout_key, recover_checkout
+from services.checkout_actions import api_checkout_key
 from services.fulfillment_policy import api_order_capacity
 from services.input_forms import InputError, api_requirement_values
 
@@ -121,6 +127,19 @@ _in_flight_orders: dict[int, int] = defaultdict(int)
 _rate_lock = asyncio.Lock()
 _last_rate_cleanup = 0.0
 _RATE_CLEANUP_INTERVAL_SECONDS = 300
+_last_db_bucket_cleanup = 0.0
+_db_bucket_cleanup_lock = threading.Lock()
+def _load_trusted_proxy_networks():
+    networks = []
+    for value in API_TRUSTED_PROXY_CIDRS:
+        try:
+            networks.append(ipaddress.ip_network(value, strict=False))
+        except ValueError:
+            logger.error("Ignoring invalid API_TRUSTED_PROXY_CIDRS entry")
+    return tuple(networks)
+
+
+_trusted_proxy_networks = _load_trusted_proxy_networks()
 
 
 # ============================================================
@@ -133,11 +152,21 @@ class ApiPrincipal:
     telegram_id: int
 
 
+class ApiOrderInProgress(RuntimeError):
+    pass
+
+
+class ApiKeyRevokedBeforeReservation(RuntimeError):
+    pass
+
+
 # ============================================================
 # REQUEST MODEL
 # ============================================================
 
 class OrderRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     service_id: int = Field(
         description="Product ID returned by GET /api/v1/products",
         gt=0,
@@ -164,14 +193,34 @@ class OrderRequest(BaseModel):
         ),
     )
 
-    buyer_info: dict[str, str] | None = Field(
+    buyer_info: dict[StrictStr, StrictStr] | None = Field(
         default=None,
+        max_length=8,
         description=(
             "Required product fields, keyed by the exact labels returned in "
             "the product's required_info list. Email, phone, and text fields "
             "are supported; Telegram photo/contact fields must use the bot."
         ),
     )
+
+    @field_validator("buyer_info")
+    @classmethod
+    def bound_buyer_info(cls, values):
+        if values is None:
+            return None
+        total_bytes = 0
+        for label, value in values.items():
+            if not label.strip() or len(label) > 100:
+                raise ValueError("buyer_info labels must contain 1–100 characters.")
+            if len(value) > 3000:
+                raise ValueError("Each buyer_info value must be at most 3,000 characters.")
+            try:
+                total_bytes += len(label.encode("utf-8")) + len(value.encode("utf-8"))
+            except UnicodeEncodeError as exc:
+                raise ValueError("buyer_info must contain valid UTF-8 text.") from exc
+        if total_bytes > 12_000:
+            raise ValueError("Combined buyer_info values must not exceed 12,000 UTF-8 bytes.")
+        return values
 
 
 # ============================================================
@@ -251,6 +300,30 @@ async def _limit_key(key_id: int) -> None:
 
         minute_window.append(now)
 
+    try:
+        allowed, retry_after = await asyncio.to_thread(
+            _consume_shared_rate_bucket,
+            f"api-key:{key_id}",
+            "request-minute",
+            minute_limit,
+            60,
+        )
+    except Exception:
+        logger.exception("Shared reseller API rate limiter is unavailable")
+        raise _api_error(
+            "rate_limit_unavailable",
+            "Request protection is temporarily unavailable. Retry shortly.",
+            503,
+            headers={"Retry-After": "2"},
+        )
+    if not allowed:
+        raise _api_error(
+            "rate_limited",
+            f"Maximum {minute_limit} requests per minute per API key across service instances.",
+            429,
+            headers={"Retry-After": str(retry_after)},
+        )
+
 
 async def _limit_order(key_id: int) -> None:
     """Allow only a small number of purchases and one active purchase per key."""
@@ -294,6 +367,32 @@ async def _limit_order(key_id: int) -> None:
 
         _in_flight_orders[key_id] += 1
 
+    try:
+        allowed, retry_after = await asyncio.to_thread(
+            _consume_shared_rate_bucket,
+            f"api-key:{key_id}",
+            "order-minute",
+            limit,
+            60,
+        )
+    except Exception:
+        await _release_order(key_id)
+        logger.exception("Shared reseller API order limiter is unavailable")
+        raise _api_error(
+            "rate_limit_unavailable",
+            "Order protection is temporarily unavailable. Retry shortly.",
+            503,
+            headers={"Retry-After": "2"},
+        )
+    if not allowed:
+        await _release_order(key_id)
+        raise _api_error(
+            "order_rate_limited",
+            f"Maximum {limit} order requests per minute per API key across service instances.",
+            429,
+            headers={"Retry-After": str(retry_after)},
+        )
+
 
 async def _release_order(key_id: int) -> None:
     """Release a purchase slot after the endpoint has completed."""
@@ -307,9 +406,63 @@ async def _release_order(key_id: int) -> None:
 
 
 def _client_address(request: Request) -> str:
-    """Use the direct peer address; do not trust spoofable forwarding headers."""
+    """Resolve X-Forwarded-For only when the direct peer is explicitly trusted."""
+    peer = request.client.host if request.client else "unknown"
+    if not _trusted_proxy_networks:
+        return peer
+    try:
+        peer_ip = ipaddress.ip_address(peer)
+    except ValueError:
+        return peer
+    if not any(peer_ip in network for network in _trusted_proxy_networks):
+        return peer
 
-    return request.client.host if request.client else "unknown"
+    forwarded = request.headers.get("x-forwarded-for", "")
+    # Proxies append addresses. Walk from the trusted edge toward the client,
+    # stopping at the first untrusted address; never accept arbitrary XFF from
+    # a direct client.
+    for candidate in reversed(forwarded.split(",")):
+        try:
+            address = ipaddress.ip_address(candidate.strip())
+        except ValueError:
+            continue
+        if any(address in network for network in _trusted_proxy_networks):
+            continue
+        return str(address)
+    return peer
+
+
+def _consume_shared_rate_bucket(subject: str, scope: str, limit: int, period: int) -> tuple[bool, int]:
+    """Atomically count a fixed-window limit in the shared SQL database."""
+    global _last_db_bucket_cleanup
+    now_epoch = time.time()
+    window = int(now_epoch // period)
+    digest = hashlib.sha256(f"{scope}:{subject}:{window}".encode("utf-8")).hexdigest()
+    expires_at = datetime.utcfromtimestamp((window + 2) * period)
+    cleanup = False
+    with _db_bucket_cleanup_lock:
+        if time.monotonic() - _last_db_bucket_cleanup >= _RATE_CLEANUP_INTERVAL_SECONDS:
+            _last_db_bucket_cleanup = time.monotonic()
+            cleanup = True
+
+    with transaction() as db:
+        if cleanup:
+            db.execute(text(
+                "DELETE FROM api_rate_limit_buckets "
+                "WHERE expires_at < UTC_TIMESTAMP() LIMIT 1000"
+            ))
+        db.execute(text(
+            "INSERT INTO api_rate_limit_buckets (bucket_hash, request_count, expires_at) "
+            "VALUES (:bucket_hash, 1, :expires_at) "
+            "ON DUPLICATE KEY UPDATE request_count = LEAST(request_count + 1, :cap)"
+        ), {"bucket_hash": digest, "expires_at": expires_at, "cap": limit + 1})
+        count = db.execute(text(
+            "SELECT request_count FROM api_rate_limit_buckets "
+            "WHERE bucket_hash = :bucket_hash"
+        ), {"bucket_hash": digest}).scalar_one()
+
+    retry_after = max(1, int(((window + 1) * period) - now_epoch) + 1)
+    return int(count) <= limit, retry_after
 
 
 async def _reject_invalid_auth_flood(client_address: str) -> None:
@@ -947,6 +1100,15 @@ def _reserve_order(
 
     try:
 
+        # Serialize reservations by API key so the one-order-at-a-time rule is
+        # shared across Render instances, not just one Python process.
+        key = db.query(ApiKey).filter(
+            ApiKey.id == api_key_id,
+            ApiKey.is_active == True,
+        ).with_for_update().first()
+        if not key:
+            raise ApiKeyRevokedBeforeReservation
+
         existing = (
             db.query(ApiOrder)
             .filter(
@@ -960,6 +1122,32 @@ def _reserve_order(
         if existing:
 
             return existing, False
+
+        cutoff = datetime.utcnow() - timedelta(seconds=API_ORDER_RECONCILE_AFTER_SECONDS)
+        other_processing = (
+            db.query(ApiOrder)
+            .filter(
+                ApiOrder.api_key_id == api_key_id,
+                ApiOrder.status == "processing",
+            )
+            .order_by(ApiOrder.id.asc())
+            .with_for_update()
+            .first()
+        )
+        if other_processing:
+            last_update = other_processing.updated_at or other_processing.created_at
+            if last_update and last_update <= cutoff:
+                other_processing.status = "needs_review"
+                other_processing.error_message = "Order outcome is being reconciled. Do not retry this purchase yet."
+                from services.notification_outbox import enqueue_admin
+                enqueue_admin(
+                    db,
+                    f"api-order-reconcile:{other_processing.id}",
+                    f"Reseller API reservation #{other_processing.id} is stale and has no confirmed local result. "
+                    "Check the provider and API Developer → Orders before retrying it.",
+                )
+                db.commit()
+            raise ApiOrderInProgress
 
         row = ApiOrder(
             api_key_id=api_key_id,
@@ -1009,6 +1197,7 @@ def _set_api_order_result(
     api_order_id: int,
     order_id: int | None,
     error_message: str | None = None,
+    final_status: str | None = None,
 ) -> None:
 
     db = SessionLocal()
@@ -1025,11 +1214,7 @@ def _set_api_order_result(
 
         row.order_id = order_id
 
-        row.status = (
-            "completed"
-            if order_id
-            else "failed"
-        )
+        row.status = final_status or ("completed" if order_id else "failed")
 
         row.error_message = (
             (error_message or "")[:500]
@@ -1041,6 +1226,65 @@ def _set_api_order_result(
     finally:
 
         db.close()
+
+
+def _reconcile_stale_api_order(api_order_id: int) -> dict:
+    """Recover a committed order or stop an old reservation from being replayed."""
+    from services.notification_outbox import enqueue_admin
+
+    now = datetime.utcnow()
+    cutoff = now - timedelta(seconds=API_ORDER_RECONCILE_AFTER_SECONDS)
+    with transaction() as db:
+        row = db.query(ApiOrder).filter(ApiOrder.id == api_order_id).with_for_update().first()
+        if not row:
+            return {"status": "missing", "order_id": None}
+        if row.status != "processing":
+            return {"status": row.status, "order_id": row.order_id}
+
+        checkout_key = api_checkout_key(row.api_key_id, row.client_order_id)
+        order = db.query(Order).filter(Order.checkout_key == checkout_key).first()
+        if order:
+            row.order_id = order.id
+            row.status = "completed"
+            row.error_message = None
+            return {"status": "completed", "order_id": order.id}
+
+        last_update = row.updated_at or row.created_at
+        if not last_update or last_update > cutoff:
+            return {"status": "processing", "order_id": None}
+
+        # A remote supplier may have accepted the order before the process
+        # stopped. Never mark it retryable or issue another supplier request.
+        row.status = "needs_review"
+        row.error_message = "Order outcome is being reconciled. Do not retry this purchase yet."
+        enqueue_admin(
+            db,
+            f"api-order-reconcile:{row.id}",
+            f"Reseller API reservation #{row.id} remained processing for at least "
+            f"{API_ORDER_RECONCILE_AFTER_SECONDS // 60} minutes without a local order. "
+            "Check the provider and RainDeals API Developer → Orders before resolving it. "
+            "Do not submit another provider purchase until the remote outcome is known.",
+        )
+        return {"status": "needs_review", "order_id": None}
+
+
+async def _queue_api_order_review(api_order_id: int) -> None:
+    """Record an idempotent admin alert without blocking the ASGI event loop."""
+    from services.notification_outbox import enqueue_admin
+
+    def _write():
+        with transaction() as db:
+            enqueue_admin(
+                db,
+                f"api-order-reconcile:{api_order_id}",
+                f"Reseller API order reservation #{api_order_id} needs reconciliation. "
+                "Check the supplier and API Developer → Orders before resolving it; do not repeat a possible supplier purchase.",
+            )
+
+    try:
+        await asyncio.to_thread(_write)
+    except Exception:
+        logger.exception("Could not queue API order reconciliation alert reservation_id=%s", api_order_id)
 
 
 # ============================================================
@@ -1198,12 +1442,22 @@ async def create_order(
     # Reserve idempotency key
     # --------------------------------------------------------
 
-    request_row, is_new = await asyncio.to_thread(
-        _reserve_order,
-        principal.key_id,
-        payload.client_order_id,
-        request_fingerprint,
-    )
+    try:
+        request_row, is_new = await asyncio.to_thread(
+            _reserve_order,
+            principal.key_id,
+            payload.client_order_id,
+            request_fingerprint,
+        )
+    except ApiOrderInProgress:
+        raise _api_error(
+            "order_in_progress",
+            "Another order for this API key is still being processed. Retry after checking its client_order_id.",
+            429,
+            headers={"Retry-After": "3"},
+        )
+    except ApiKeyRevokedBeforeReservation:
+        raise _api_error("invalid_api_key", "This API key was revoked before the purchase was reserved.", 401)
 
     if not request_row:
 
@@ -1227,12 +1481,13 @@ async def create_order(
                 "This client_order_id is already bound to a different purchase request. Use a new ID for a changed order.",
                 409,
             )
-        if not request_row.order_id:
-            recovered = await asyncio.to_thread(recover_checkout,
-                api_checkout_key(principal.key_id, payload.client_order_id), principal.telegram_id)
-            if recovered:
-                await asyncio.to_thread(_set_api_order_result, request_row.id, recovered)
-                request_row.order_id = recovered
+        if not request_row.order_id and request_row.status == "processing":
+            recovered = await asyncio.to_thread(_reconcile_stale_api_order, request_row.id)
+            if recovered.get("order_id"):
+                request_row.order_id = recovered["order_id"]
+                request_row.status = "completed"
+            else:
+                request_row.status = recovered.get("status", request_row.status)
 
 
         if request_row.order_id:
@@ -1253,6 +1508,13 @@ async def create_order(
                     ),
                 }
 
+        if request_row.status == "needs_review":
+            raise _api_error(
+                "order_needs_review",
+                "The previous order outcome is still being reconciled. Do not retry or create a replacement order until support confirms its status.",
+                409,
+            )
+
         if request_row.status == "processing":
 
             raise _api_error(
@@ -1267,12 +1529,7 @@ async def create_order(
 
         raise _api_error(
             "previous_order_failed",
-            (
-                request_row.error_message
-                or
-                "This client_order_id previously failed. "
-                "Use a new ID after fixing the issue."
-            ),
+            "This client_order_id previously failed. Check the order status before using a new ID.",
             409,
         )
 
@@ -1315,6 +1572,7 @@ async def create_order(
                 checkout_key=api_checkout_key(principal.key_id, payload.client_order_id),
                 buyer_info=payload.buyer_info,
                 require_buyer_info=True,
+                api_key_id=principal.key_id,
             )
 
         else:
@@ -1329,21 +1587,35 @@ async def create_order(
                 buyer_info=payload.buyer_info,
                 require_buyer_info=True,
                 allow_preorder=False,
+                api_key_id=principal.key_id,
             )
 
-    except Exception as exc:
+    except Exception:
 
         logger.exception(
             "Order processing exception"
         )
 
-        message = str(exc)
+        if source == "reseller":
+            await asyncio.to_thread(
+                _set_api_order_result,
+                request_row.id,
+                None,
+                "Supplier outcome may be ambiguous. Support must reconcile it before another order is placed.",
+                "needs_review",
+            )
+            await _queue_api_order_review(request_row.id)
+            raise _api_error(
+                "order_needs_review",
+                "The supplier outcome could not be confirmed. Do not retry this purchase; support will reconcile its status.",
+                409,
+            )
 
         await asyncio.to_thread(
             _set_api_order_result,
             request_row.id,
             None,
-            message,
+            "Order processing failed. No completed order was recorded.",
         )
 
         raise _api_error(
@@ -1382,11 +1654,27 @@ async def create_order(
             result["error"]
         )
 
+        if result.get("needs_review"):
+            safe_message = "Supplier outcome may be ambiguous. Support must reconcile it before another order is placed."
+            await asyncio.to_thread(
+                _set_api_order_result,
+                request_row.id,
+                None,
+                safe_message,
+                "needs_review",
+            )
+            await _queue_api_order_review(request_row.id)
+            raise _api_error(
+                "order_needs_review",
+                "The supplier outcome could not be confirmed. Do not retry this purchase; support will reconcile its status.",
+                409,
+            )
+
         await asyncio.to_thread(
             _set_api_order_result,
             request_row.id,
             None,
-            message,
+            "Order failed. No completed order was recorded.",
         )
 
         if message == "insufficient_balance":
@@ -1395,6 +1683,13 @@ async def create_order(
                 "insufficient_balance",
                 "Insufficient wallet balance.",
                 400,
+            )
+
+        if message == "api_key_revoked":
+            raise _api_error(
+                "invalid_api_key",
+                "This API key was revoked before the purchase was dispatched.",
+                401,
             )
 
         if message.startswith("buyer_info_invalid:"):
@@ -1418,11 +1713,9 @@ async def create_order(
                 409,
             )
 
-        raise _api_error(
-            "order_failed",
-            message,
-            400,
-        )
+        # Provider exception text is not safe to return; some integrations
+        # echo request headers or identifiers. Keep the public response stable.
+        raise _api_error("order_failed", "Order could not be completed. Check the order status before retrying.", 400)
 
     # --------------------------------------------------------
     # Get order ID

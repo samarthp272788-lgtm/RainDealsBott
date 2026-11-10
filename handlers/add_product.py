@@ -11,6 +11,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from config import ADMIN_IDS
 from database import SessionLocal
 from models.product import Product
+from services.fulfillment_policy import account_lines
 from states.product_states import AddProduct
 
 router = Router()
@@ -199,18 +200,9 @@ async def product_accounts(
         await answer_card(message, "❌ Send account lines as text. No product was created.")
         return
 
-    accounts = []
-    seen_accounts = set()
-
-    for line in message.text.splitlines():
-
-        line = line.strip()
-
-        if line and line not in seen_accounts:
-            seen_accounts.add(line)
-            accounts.append(
-                line
-            )
+    # Keep the first copy of each credential. Email identifiers are matched
+    # case-insensitively while password/key contents remain case-sensitive.
+    accounts = account_lines(message.text)
 
     stock = len(accounts)
 

@@ -24,6 +24,7 @@ import config
 from config import ADMIN_IDS
 from database import SessionLocal, transaction, retry_on_write_conflict
 from services.delivery_bridge import DeliveryBridgeError, send_manual_delivery
+from services.fulfillment_policy import account_identity, account_lines
 from models.api_key import ApiOrder
 from models.order import Order
 from models.user import User
@@ -44,6 +45,7 @@ router = Router()
 
 STATUS_LABELS = {
     "completed": "✅ Completed",
+    "delivery_pending": "📨 Delivery queued / confirmation pending",
     "pending_manual": "⏳ Pending (manual fulfillment)",
     "pending_info": "🧾 Waiting for buyer information",
     "preorder": "📦 Preorder (waitlisted)",
@@ -55,6 +57,54 @@ ADMIN_ORDERS_PER_PAGE = 10
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+def _credit_preorder_referral(db, order) -> dict | None:
+    """Credit a preorder referral once, only after delivery is accepted."""
+    if not order.is_preorder:
+        return None
+    order.is_preorder = False
+    order.referral_commission_amount = Decimal("0")
+    order.referral_commission_to_balance = bool(REFERRAL_CREDIT_TO_BALANCE)
+    buyer = db.query(User).filter(User.telegram_id == order.telegram_id).with_for_update().first()
+    if not buyer or not buyer.referred_by:
+        return None
+    referrer = db.query(User).filter(User.telegram_id == buyer.referred_by).with_for_update().first()
+    if not referrer:
+        return None
+    commission = _money(_money(order.amount) * REFERRAL_COMMISSION_RATE)
+    if commission <= 0:
+        return None
+    referrer.referral_earnings = _money(referrer.referral_earnings) + commission
+    if REFERRAL_CREDIT_TO_BALANCE:
+        referrer.balance = _money(referrer.balance) + commission
+    order.referral_commission_amount = commission
+    return {"referrer_telegram_id": referrer.telegram_id, "amount": commission}
+
+
+def _finalize_bridged_delivery(order_id: int, admin_id: int) -> dict:
+    """Mark delivery complete after the bridge confirms send or durable queue."""
+    with transaction() as db:
+        order = db.query(Order).filter(Order.id == order_id).with_for_update().first()
+        if not order:
+            return {"error": "Order not found."}
+        if order.refunded:
+            return {"error": "This order has already been refunded."}
+        if order.status == "completed":
+            return {"status": "completed", "already_completed": True}
+        if order.status != "delivery_pending":
+            return {"error": "Order is not waiting for delivery confirmation."}
+        order.status = "completed"
+        order.manual_pending_quantity = 0
+        commission = _credit_preorder_referral(db, order)
+        start_coverage(order)
+        record_event(db, order.id, "completed", "Delivery Worker confirmed the delivery or saved it for the recipient to collect.", actor_id=admin_id)
+        db.add(AdminAuditLog(
+            admin_telegram_id=int(admin_id), action="confirm_manual_delivery",
+            entity_type="order", entity_id=str(order.id),
+            summary="Delivery Worker confirmed or durably queued the delivery.",
+        ))
+        return {"status": "completed", "commission_paid": commission}
 
 
 # ==========================================================
@@ -169,7 +219,7 @@ def _bulk_inventory_options(admin_id: int) -> list[dict]:
                 Order.status.in_(("pending_manual", "preorder", "processing")),
                 Order.assigned_admin_id.is_(None) | (Order.assigned_admin_id == admin_id),
             ).count())
-            accounts = [x.strip() for x in (product.file_content or "").splitlines() if x.strip()]
+            accounts = account_lines(product.file_content)
             reusable_content = str(getattr(product, "reusable_delivery", "") or "").strip()
             reusable_units = max(0, int(getattr(product, "reusable_stock", 0) or 0)) if reusable_content else 0
             available = len(accounts) + reusable_units
@@ -255,7 +305,7 @@ def _do_bulk_inventory_fulfill(product_id: int, admin_id: int, limit: int = 20) 
             Order.status.in_(("pending_manual", "preorder", "processing")),
             Order.assigned_admin_id.is_(None) | (Order.assigned_admin_id == admin_id),
         ).order_by(Order.id.asc()).with_for_update().limit(limit).all())
-        accounts = [x.strip() for x in (product.file_content or "").splitlines() if x.strip()]
+        accounts = account_lines(product.file_content)
         product_stock = max(0, int(product.stock or 0))
         product_delivery_type = (product.delivery_type or "automatic").lower()
         product_manual_fallback = bool(product.manual_fallback)
@@ -303,24 +353,14 @@ def _do_bulk_inventory_fulfill(product_id: int, admin_id: int, limit: int = 20) 
                 order.stock_deducted_quantity = int(order.stock_deducted_quantity or 0) + quantity
             order.assigned_admin_id = order.assigned_admin_id or admin_id
             order.assigned_at = order.assigned_at or datetime.utcnow()
-            was_preorder = bool(order.is_preorder)
-            order.is_preorder = False
-            order.status = "completed"
-            start_coverage(order)
-            record_event(db, order.id, "completed", "Team delivered this order from bulk inventory.", actor_id=admin_id)
+            # Inventory is reserved on the order, but delivery is not complete
+            # until the Delivery Worker acknowledges or durably queues it.
+            order.status = "delivery_pending"
+            record_event(db, order.id, "delivery_pending", "Inventory reserved; waiting for Delivery Worker confirmation.", actor_id=admin_id)
             db.add(AdminAuditLog(
-                admin_telegram_id=int(admin_id), action="bulk_inventory_deliver", entity_type="order",
-                entity_id=str(order.id), summary=f"Bulk delivered {quantity} unit(s) from product #{product_id} inventory.",
+                admin_telegram_id=int(admin_id), action="bulk_inventory_queue", entity_type="order",
+                entity_id=str(order.id), summary=f"Reserved {quantity} unit(s) from product #{product_id} inventory for delivery.",
             ))
-            if was_preorder:
-                buyer = db.query(User).filter(User.telegram_id == order.telegram_id).with_for_update().first()
-                referrer = db.query(User).filter(User.telegram_id == buyer.referred_by).with_for_update().first() if buyer and buyer.referred_by else None
-                if referrer:
-                    commission = _money(_money(order.amount) * REFERRAL_COMMISSION_RATE)
-                    if commission > 0:
-                        referrer.referral_earnings = _money(referrer.referral_earnings) + commission
-                        if REFERRAL_CREDIT_TO_BALANCE:
-                            referrer.balance = _money(referrer.balance) + commission
             is_api_order = bool(db.query(ApiOrder.id).filter(ApiOrder.order_id == order.id).first())
             destination_id = order.delivery_telegram_id or (admin_id if is_api_order else order.telegram_id)
             results.append({"order_id": order.id, "buyer_id": order.telegram_id,
@@ -348,8 +388,14 @@ def _do_bulk_inventory_fulfill(product_id: int, admin_id: int, limit: int = 20) 
             Order.status.in_(("pending_manual", "preorder", "processing")),
             Order.assigned_admin_id.is_(None) | (Order.assigned_admin_id == admin_id),
         ).count()
+        delivery_pending_count = db.query(Order.id).filter(
+            Order.product_id == product_id,
+            Order.refunded.is_(False),
+            Order.status == "delivery_pending",
+        ).count()
         return {"orders": results, "skipped": skipped, "remaining_orders": remaining_orders,
                 "remaining_stock": len(accounts) + reusable, "product_name": product.name,
+                "delivery_pending_count": delivery_pending_count,
                 "switched_to_manual": switched_to_manual}
 
 
@@ -385,6 +431,11 @@ async def bulk_inventory_run(callback: CallbackQuery):
     for item in result["orders"]:
         try:
             delivery_result = await send_manual_delivery(item["order_id"], item["destination_id"], callback.from_user.id)
+            finalized = await asyncio.to_thread(
+                _finalize_bridged_delivery, item["order_id"], callback.from_user.id
+            )
+            if finalized.get("error"):
+                raise DeliveryBridgeError(finalized["error"])
             if delivery_result.get("status") == "waiting_for_start":
                 waiting += 1
             else:
@@ -398,9 +449,14 @@ async def bulk_inventory_run(callback: CallbackQuery):
         except DeliveryBridgeError as exc:
             failed += 1
             failures.append((item["order_id"], str(exc)))
+        except Exception:
+            failed += 1
+            logger.exception("Could not reconcile bulk delivery order %s", item["order_id"])
+            failures.append((item["order_id"], "Delivery status could not be reconciled. Retry this order."))
     switched_notice = "\n⚠️ Inventory is empty; future orders now use manual fulfillment." if result["switched_to_manual"] else ""
     text = (f"📦 <b>Bulk delivery finished</b>\n\nProduct: <b>{escape(result['product_name'])}</b>\n"
             f"Orders processed: <b>{len(result['orders'])}</b>\nSent: <b>{sent}</b> · Waiting for /start: <b>{waiting}</b> · Delivery errors: <b>{failed}</b>\n"
+            f"Awaiting delivery confirmation: <b>{result['delivery_pending_count']}</b>\n"
             f"Remaining stock: <b>{result['remaining_stock']}</b> · Pending orders: <b>{result['remaining_orders']}</b>"
             f"{switched_notice}")
     rows = [[InlineKeyboardButton(text=f"🔁 Retry order #{order_id}", callback_data=f"retry_api_delivery_{order_id}")] for order_id, _ in failures[:8]]
@@ -480,12 +536,14 @@ Refunded:
             text += f"• <b>{escape(str(label))}:</b> <code>{escape(str(value))}</code>\n"
 
     text += f"\nTeam owner: {order.assigned_admin_id or 'Unassigned'}\nAutomatic: {order.automatic_quantity or 0} · Remaining: {order.manual_pending_quantity or 0}\n"
+    if order.status == "delivery_pending":
+        text += "📨 Inventory and delivery content are saved; the Delivery Worker still needs to confirm or queue this order.\n"
     keyboard = [[InlineKeyboardButton(text="🕒 Timeline", callback_data=f"admin_timeline_{order.id}"),
                  InlineKeyboardButton(text="📋 Team workspace", callback_data=f"work_view_{order.id}")]]
     if getattr(order,'_cancellation_status',None):
         keyboard.append([InlineKeyboardButton(text=f"Cancellation · {order._cancellation_status}",callback_data=f'ct_cancelreview_{order.id}')])
     from services.warranty import policy
-    if policy(order) != 'skip':
+    if policy(order) != 'skip' and order.status == "completed" and not order.refunded:
         keyboard.append([InlineKeyboardButton(text='🛡 Warranty / refund claim', callback_data=f'warranty_admin_{order.id}')])
 
     needs_fulfillment = (
@@ -496,11 +554,17 @@ Refunded:
         keyboard.append([
             InlineKeyboardButton(text="📤 Deliver", callback_data=f"deliver_order_{order.id}")
         ])
+    if order.status == "delivery_pending" and not order.refunded:
+        keyboard.append([
+            InlineKeyboardButton(text="🔁 Check / retry delivery", callback_data=f"retry_api_delivery_{order.id}")
+        ])
 
-    if not order.refunded and order.status != "deleted":
+    if not order.refunded and order.status not in {"deleted", "delivery_pending"}:
         keyboard.append([
             InlineKeyboardButton(text="💸 Refund", callback_data=f"refund_{order.id}")
         ])
+    elif order.status == "delivery_pending":
+        text += "\n⚠️ Refund is paused until remote delivery status is reconciled.\n"
 
     if order.status != "deleted":
         keyboard.append([
@@ -550,6 +614,8 @@ def _do_refund(order_id: int, admin_id: int, cancellation_only: bool = False) ->
             return {"error": "Already refunded."}
         if order.status == "deleted":
             return {"error": "This order was deleted and can no longer be refunded."}
+        if order.status == "delivery_pending":
+            return {"error": "Delivery is awaiting remote confirmation. Check or retry the delivery first so a refund cannot race an accepted delivery."}
 
         buyer = (
             db.query(User)
@@ -562,15 +628,11 @@ def _do_refund(order_id: int, admin_id: int, cancellation_only: bool = False) ->
 
         refund_amount = _money(order.amount)
 
-        # --- Restore stock -------------------------------------
-        # Only automatically-delivered accounts can be meaningfully
-        # "put back" (as text, appended back onto file_content) — a
-        # manual-fulfillment unit that was hand-delivered has no
-        # generic representation to restore, so for "manual"/hybrid
-        # orders without a delivered_account we restore the numeric
-        # stock counter instead. Preorders and never-fulfilled manual
-        # orders never decremented stock in the first place, so there
-        # is nothing to restore for those.
+        # --- Restore safe inventory/capacity only ----------------
+        # Credentials already delivered to a customer are exposed and must
+        # never be returned to the sellable pool. Only credentials held in a
+        # pending-info reservation (not yet shown to the customer) are safe
+        # to restore. Supplier inventory is never copied into local stock.
         product = (
             db.query(Product)
             .filter(Product.id == order.product_id)
@@ -579,68 +641,47 @@ def _do_refund(order_id: int, admin_id: int, cancellation_only: bool = False) ->
         )
 
         stock_restored = False
-        if product is not None and order.stock_deducted_quantity is not None:
-            restored = [line.strip() for line in (order.reserved_delivery or order.delivered_account or "").splitlines() if line.strip()]
-            reusable_account = str(getattr(order, "reusable_delivery_account", "") or "").strip()
-            if reusable_account and reusable_account in restored:
-                restored.remove(reusable_account)
-            existing = [line.strip() for line in (product.file_content or "").splitlines() if line.strip()]
-            product.file_content = "\n".join(restored + existing) or None
-            reusable_quantity = max(0, int(getattr(order, "reusable_delivery_quantity", 0) or 0))
-            if reusable_quantity and reusable_account:
-                if str(getattr(product, "reusable_delivery", "") or "").strip() in ("", reusable_account):
-                    product.reusable_delivery = reusable_account
-                    product.reusable_stock = max(0, int(getattr(product, "reusable_stock", 0) or 0)) + reusable_quantity
-            product.stock = (product.stock or 0) + order.stock_deducted_quantity
-            order.reserved_delivery = None
-            stock_restored = bool(order.stock_deducted_quantity)
-        elif product is not None and not order.is_preorder:
-            if order.reserved_delivery and order.status == "pending_info":
-                restored_accounts = [
-                    account.strip() for account in order.reserved_delivery.splitlines() if account.strip()
-                ]
+        if product is not None and getattr(product, "source", "own") == "own" and not order.is_preorder:
+            status_before_refund = order.status
+            quantity = max(0, int(order.quantity or 0))
+            raw_deducted = getattr(order, "stock_deducted_quantity", None)
+            deducted = max(0, int(raw_deducted or 0))
+            automatic_units = min(quantity, max(0, int(order.automatic_quantity or 0)))
+            manual_units = max(0, quantity - automatic_units)
+            safe_reserved = []
+            if status_before_refund == "pending_info" and order.reserved_delivery:
+                safe_reserved = account_lines(order.reserved_delivery)
                 reusable_account = str(getattr(order, "reusable_delivery_account", "") or "").strip()
-                if reusable_account and reusable_account in restored_accounts:
-                    restored_accounts.remove(reusable_account)
-                existing = [
-                    account.strip() for account in (product.file_content or "").splitlines() if account.strip()
-                ]
-                product.file_content = "\n".join(restored_accounts + existing)
-                product.stock = len(restored_accounts) + len(existing)
+                if reusable_account:
+                    reusable_key = account_identity(reusable_account)
+                    safe_reserved = [line for line in safe_reserved if account_identity(line) != reusable_key]
+                existing = account_lines(product.file_content)
+                product.file_content = "\n".join(account_lines("\n".join(safe_reserved + existing))) or None
+                if safe_reserved:
+                    stock_restored = True
+
                 reusable_quantity = max(0, int(getattr(order, "reusable_delivery_quantity", 0) or 0))
-                if reusable_quantity and reusable_account and str(getattr(product, "reusable_delivery", "") or "").strip() in ("", reusable_account):
-                    product.reusable_delivery = reusable_account
+                current_shared = str(getattr(product, "reusable_delivery", "") or "").strip()
+                if (reusable_quantity and reusable_account
+                        and account_identity(current_shared) == account_identity(reusable_account)):
                     product.reusable_stock = max(0, int(getattr(product, "reusable_stock", 0) or 0)) + reusable_quantity
+                    stock_restored = True
                 order.reserved_delivery = None
-                stock_restored = bool(restored_accounts)
-            elif order.delivered_account and order.status == "completed":
-                # Automatic (or hybrid-auto) delivery: the exact
-                # account strings were consumed from file_content —
-                # put them back so they can be resold.
-                restored_accounts = [
-                    a.strip() for a in order.delivered_account.splitlines() if a.strip()
-                ]
-                reusable_account = str(getattr(order, "reusable_delivery_account", "") or "").strip()
-                if reusable_account and reusable_account in restored_accounts:
-                    restored_accounts.remove(reusable_account)
-                if restored_accounts:
-                    existing = (
-                        [a.strip() for a in product.file_content.splitlines() if a.strip()]
-                        if product.file_content else []
-                    )
-                    product.file_content = "\n".join(restored_accounts + existing)
-                    product.stock = len(restored_accounts) + len(existing)
+
+            if (order.delivery_type or "").lower() in {"manual", "hybrid"}:
+                # In a hybrid order, automatic credentials were already
+                # consumed/exposed. Restore only the manual-capacity portion;
+                # pending-info credentials above are restored separately.
+                # Legacy rows often carry a backfilled zero in this column,
+                # even though their manual capacity was deducted at purchase.
+                capacity_to_restore = (
+                    min(manual_units, deducted)
+                    if raw_deducted is not None and deducted > 0
+                    else manual_units
+                )
+                if capacity_to_restore:
+                    product.stock = max(0, int(product.stock or 0)) + capacity_to_restore
                     stock_restored = True
-                reusable_quantity = max(0, int(getattr(order, "reusable_delivery_quantity", 0) or 0))
-                if reusable_quantity and reusable_account and str(getattr(product, "reusable_delivery", "") or "").strip() in ("", reusable_account):
-                    product.reusable_delivery = reusable_account
-                    product.reusable_stock = max(0, int(getattr(product, "reusable_stock", 0) or 0)) + reusable_quantity
-                    stock_restored = True
-            elif order.status in ("pending_info", "pending_manual", "completed"):
-                # Manual/hybrid-manual fulfillment: only the numeric
-                # counter moved, so give the units back there.
-                product.stock = (product.stock or 0) + (order.quantity or 1)
-                stock_restored = True
 
         # --- Reverse referral commission, if one was paid ------
         # Commission is paid at purchase time for completed /
@@ -651,7 +692,7 @@ def _do_refund(order_id: int, admin_id: int, cancellation_only: bool = False) ->
         # pending_manual, or preorder-that-was-never-delivered (no
         # commission was ever paid on that last one).
         commission_reversed = None
-        if order.status != "preorder" and buyer.referred_by:
+        if order.status != "preorder" and not order.is_preorder and buyer.referred_by:
             referrer = (
                 db.query(User)
                 .filter(User.telegram_id == buyer.referred_by)
@@ -898,52 +939,15 @@ def _do_deliver(order_id: int, delivered_text: str, admin_id: int) -> dict:
             }
         order.assigned_admin_id = admin_id
         order.assigned_at = order.assigned_at or datetime.utcnow()
-        record_event(db, order.id, "completed", "Team delivery completed.", actor_id=admin_id)
-        was_preorder = order.is_preorder
-
+        record_event(db, order.id, "delivery_pending", "Delivery content saved; waiting for Delivery Worker confirmation.", actor_id=admin_id)
         order.delivered_account = "\n".join(filter(None, [order.delivered_account, delivered_text]))
         order.manual_pending_quantity = 0
-        order.status = "completed"
-        start_coverage(order)
-        order.is_preorder = False
+        order.status = "delivery_pending"
         db.add(AdminAuditLog(
-            admin_telegram_id=int(admin_id), action="manual_deliver_order",
-            entity_type="order", entity_id=str(order.id), summary="Order manually marked delivered.",
+            admin_telegram_id=int(admin_id), action="manual_delivery_queued",
+            entity_type="order", entity_id=str(order.id), summary="Manual delivery content saved; waiting for bridge confirmation.",
         ))
-
-        # Referral commission for a preorder is deliberately deferred
-        # until it's actually fulfilled (see handlers/products.py) —
-        # pay it now, exactly once, on that transition. A
-        # non-preorder pending_manual order already had its
-        # commission paid at purchase time, so it must NOT be paid
-        # again here.
-        commission_paid = None
-        if was_preorder:
-            buyer = (
-                db.query(User)
-                .filter(User.telegram_id == order.telegram_id)
-                .with_for_update()
-                .first()
-            )
-            if buyer and buyer.referred_by:
-                referrer = (
-                    db.query(User)
-                    .filter(User.telegram_id == buyer.referred_by)
-                    .with_for_update()
-                    .first()
-                )
-                if referrer is not None:
-                    commission = _money(_money(order.amount) * REFERRAL_COMMISSION_RATE)
-                    if commission > 0:
-                        referrer.referral_earnings = _money(referrer.referral_earnings) + commission
-                        if REFERRAL_CREDIT_TO_BALANCE:
-                            referrer.balance = _money(referrer.balance) + commission
-                        commission_paid = {
-                            "referrer_telegram_id": referrer.telegram_id,
-                            "amount": commission,
-                        }
-
-        logger.info("Order %s delivered manually (was_preorder=%s)", order.id, was_preorder)
+        logger.info("Order %s delivery payload reserved for bridge confirmation", order.id)
 
         return {
             "order_id": order.id,
@@ -955,7 +959,6 @@ def _do_deliver(order_id: int, delivered_text: str, admin_id: int) -> dict:
             "product_id": order.product_id,
             "product_name": order.product_name,
             "delivered_text": delivered_text,
-            "commission_paid": commission_paid,
         }
 
 
@@ -1073,7 +1076,19 @@ async def deliver_order_finish(message: Message, state: FSMContext):
                 delivery_result = await send_manual_delivery(order_id, destination_id, message.from_user.id)
             except DeliveryBridgeError as exc:
                 await answer_card(message,
-                    f"⚠️ Order was marked delivered, but the Delivery Bot could not confirm delivery: {exc}",
+                    f"⚠️ Delivery content is saved, but the Delivery Bot has not confirmed it yet: {exc}",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text="🔁 Check / retry delivery", callback_data=f"retry_api_delivery_{order_id}")
+                    ]]),
+                )
+                return
+            finalized = await asyncio.to_thread(
+                _finalize_bridged_delivery, order_id, message.from_user.id
+            )
+            if finalized.get("error"):
+                await answer_card(message,
+                    "⚠️ The Delivery Bot accepted the request, but the order status could not be finalized. "
+                    "Use Check / retry delivery to reconcile it.",
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                         InlineKeyboardButton(text="🔁 Check / retry delivery", callback_data=f"retry_api_delivery_{order_id}")
                     ]]),
@@ -1115,11 +1130,17 @@ async def deliver_order_finish(message: Message, state: FSMContext):
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
             )
+            finalized = await asyncio.to_thread(
+                _finalize_bridged_delivery, order_id, message.from_user.id
+            )
+            if finalized.get("error"):
+                await answer_card(message, "⚠️ Delivery was queued, but the order status needs reconciliation.")
+                return
     except Exception:
         logger.exception("Failed to notify delivery recipient %s", result.get("delivery_telegram_id") or result["buyer_id"])
         await answer_card(message,
-            "⚠️ Order marked delivered, but I couldn't message the "
-            "recipient directly. They must start the correct bot before delivery."
+            "⚠️ Delivery processing needs attention. The saved order is still available in the fulfillment queue; "
+            "open its details and use Check / retry delivery if it is waiting for confirmation."
         )
         return
 
@@ -1139,7 +1160,7 @@ async def retry_api_manual_delivery(callback: CallbackQuery):
     try:
         order = db.query(Order).filter(Order.id == order_id).first()
         is_api_order = bool(order and db.query(ApiOrder.id).filter(ApiOrder.order_id == order_id).first())
-        if not order or order.delivery_type not in {"manual", "hybrid"} or order.status != "completed" or order.refunded or not order.delivered_account:
+        if not order or order.delivery_type not in {"manual", "hybrid"} or order.status not in {"completed", "delivery_pending"} or order.refunded or not order.delivered_account:
             await callback.answer("This order is not eligible for delivery retry.", show_alert=True)
             return
         recipient_id = int(order.delivery_telegram_id or (callback.from_user.id if is_api_order else order.telegram_id))
@@ -1151,6 +1172,25 @@ async def retry_api_manual_delivery(callback: CallbackQuery):
     except DeliveryBridgeError as exc:
         await callback.answer(str(exc)[:180], show_alert=True)
         return
+    try:
+        finalized = await asyncio.to_thread(
+            _finalize_bridged_delivery, order_id, callback.from_user.id
+        )
+    except Exception:
+        logger.exception("Delivery accepted but could not reconcile order %s", order_id)
+        await callback.answer("Delivery was accepted, but the database status needs retrying.", show_alert=True)
+        return
+    if finalized.get("error"):
+        await callback.answer(finalized["error"][:180], show_alert=True)
+        return
+    if not is_api_order:
+        try:
+            await queue_message(
+                callback.bot, f"order-delivery-reconciled:{order_id}", recipient_id,
+                "Your order delivery is confirmed. Open My Orders to view its status.",
+            )
+        except Exception:
+            logger.info("Could not queue delivery retry notice for order %s", order_id, exc_info=True)
     await callback.answer(
         "Already sent; no duplicate was sent." if result.get("status") == "already_sent" else
         "Queued. It will be sent after the recipient starts the Delivery Bot." if result.get("status") == "waiting_for_start" else

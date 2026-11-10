@@ -6,7 +6,7 @@ from utils.uploads import text_from_message
 import json
 import logging
 import asyncio
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from html import escape as html_escape
 
 from aiogram import Router, F
@@ -23,7 +23,11 @@ from aiogram.exceptions import TelegramBadRequest
 from config import ADMIN_IDS
 from database import SessionLocal
 from models.product import Product
-from services.fulfillment_policy import manual_allowed, manual_fallback_only, effective_delivery_type
+from models.order import Order
+from services.fulfillment_policy import (
+    account_identity, account_lines, automatic_inventory,
+    manual_allowed, manual_fallback_only, effective_delivery_type,
+)
 from services.warranty import policy_label
 from models.admin_audit_log import AdminAuditLog
 from states.product_states import AddAccounts, EditAccounts, EditBulkPricing, EditProduct, ReusableStock
@@ -34,6 +38,7 @@ from handlers.products import (
     _send_stock_channel_message,
     _notify_restock_subscribers,
     invalidate_products_cache,
+    _purchase_configuration_errors,
 )
 
 router = Router()
@@ -358,15 +363,15 @@ def _parse_bulk_pricing(raw_text: str) -> dict | None:
                     "max": int(t["max"]) if t.get("max") else None,
                     "price": float(t.get("price", 0))
                 }
-            return result if result else None
+            return _validated_bulk_pricing(result)
         elif isinstance(tiers, dict):
             for k, v in tiers.items():
                 if not isinstance(v, dict):
                     return None
                 if "min" not in v or "price" not in v:
                     return None
-            return tiers
-    except (json.JSONDecodeError, ValueError, TypeError):
+            return _validated_bulk_pricing(tiers)
+    except (json.JSONDecodeError, ValueError, TypeError, AttributeError, OverflowError):
         pass
 
     for line in raw_text.splitlines():
@@ -384,22 +389,28 @@ def _parse_bulk_pricing(raw_text: str) -> dict | None:
             return None
         if price < 0:
             return None
-        if "+" in range_part:
-            min_qty = int(range_part.replace("+", "").strip())
-            tiers[str(min_qty)] = {"min": min_qty, "max": None, "price": price}
-        elif "-" in range_part:
-            parts = range_part.split("-")
-            if len(parts) != 2:
+        try:
+            if "+" in range_part:
+                min_qty = int(range_part.replace("+", "").strip())
+                tiers[str(min_qty)] = {"min": min_qty, "max": None, "price": price}
+            elif "-" in range_part:
+                parts = range_part.split("-")
+                if len(parts) != 2:
+                    return None
+                min_qty, max_qty = int(parts[0].strip()), int(parts[1].strip())
+                tiers[str(min_qty)] = {"min": min_qty, "max": max_qty, "price": price}
+            else:
                 return None
-            min_qty = int(parts[0].strip())
-            max_qty = int(parts[1].strip())
-            if min_qty >= max_qty:
-                return None
-            tiers[str(min_qty)] = {"min": min_qty, "max": max_qty, "price": price}
-        else:
+        except (TypeError, ValueError, OverflowError):
             return None
 
-    return tiers if tiers else None
+    return _validated_bulk_pricing(tiers)
+
+
+def _validated_bulk_pricing(tiers: dict | None) -> dict | None:
+    if not isinstance(tiers, dict) or not tiers:
+        return None
+    return tiers if not _purchase_configuration_errors(None, tiers) else None
 
 
 def _bulk_pricing_dict(bulk_pricing) -> dict | None:
@@ -475,6 +486,8 @@ async def _refresh_manage_panel(callback: CallbackQuery, pid: int):
 def _build_product_panel(product: Product):
     delivery_type = effective_delivery_type(product)
     available_stock = _real_stock(product)
+    automatic_stock = automatic_inventory(product)
+    manual_capacity = max(0, int(product.stock or 0)) if manual_allowed(product) else None
     threshold = product.low_stock_threshold if product.low_stock_threshold is not None else DEFAULT_LOW_STOCK_THRESHOLD
     api_on = getattr(product, "api_enabled", True)
     description = product.description or "No description"
@@ -484,6 +497,9 @@ def _build_product_panel(product: Product):
         f"🆔 #{product.id} · {'🟢 Enabled' if product.is_active else '🔴 Disabled'}\n"
         f"🏷 <b>Category:</b> {safe(product.category or 'General')}\n\n"
         f"💰 <b>Price:</b> ${float(product.price or 0):.2f} · 📊 <b>Sellable stock:</b> {available_stock}\n"
+        f"⚡ <b>Auto-ready:</b> {automatic_stock}"
+        + (f" · 👨‍💼 <b>Manual capacity:</b> {manual_capacity}" if manual_capacity is not None else "")
+        + "\n"
         f"🚚 <b>Delivery:</b> {DELIVERY_LABELS.get(delivery_type, delivery_type)}\n"
         f"📦 <b>Preorder:</b> {'ON' if product.preorder else 'OFF'} · 🌐 <b>API:</b> {'ON' if api_on else 'OFF'}\n"
         f"⚠️ <b>Low-stock alert:</b> {threshold}\n"
@@ -709,10 +725,19 @@ def _commit_reusable_stock(product_id: int, content: str, quantity: int, admin_i
         existing_units = max(0, int(getattr(product, "reusable_stock", 0) or 0))
         if existing_units and existing_content != content:
             return {"error": "A different shared account still has units in stock. Add the same content, or wait until its shared stock reaches zero before replacing it."}
+        if existing_content and existing_content != content:
+            open_shared_order = db.query(Order.id).filter(
+                Order.product_id == product_id,
+                Order.reusable_delivery_account == existing_content,
+                Order.refunded.is_(False),
+                Order.status.in_(('pending_info', 'pending_manual', 'preorder', 'processing', 'delivery_pending')),
+            ).limit(1).first()
+            if open_shared_order:
+                return {"error": "This shared credential is still attached to an open order. Finish or resolve that order before replacing it."}
         next_units = existing_units + quantity if existing_content == content else quantity
         product.reusable_delivery = content
         product.reusable_stock = next_units
-        regular_units = len([x for x in (product.file_content or "").splitlines() if x.strip()])
+        regular_units = len(account_lines(product.file_content))
         inventory_total = regular_units + next_units
         product.stock = max(int(product.stock or 0), inventory_total) if manual_allowed(product) else inventory_total
         db.add(AdminAuditLog(
@@ -810,7 +835,7 @@ async def save_accounts(message: Message, state: FSMContext):
     raw_lines = [line.strip() for line in account_text.splitlines()]
     blank_count = sum(1 for line in raw_lines if not line)
     submitted = [line for line in raw_lines if line]
-    deduplicated = list(dict.fromkeys(submitted))
+    deduplicated = account_lines("\n".join(submitted))
     duplicate_input_count = len(submitted) - len(deduplicated)
 
     preview = await asyncio.to_thread(_preview_account_import, pid, deduplicated)
@@ -858,8 +883,14 @@ def _preview_account_import(product_id: int, lines: list[str]) -> dict | None:
         product = db.query(Product).filter(Product.id == product_id).first()
         if not product:
             return None
-        existing = {line.strip() for line in (product.file_content or "").splitlines() if line.strip()}
-        new_lines = [line for line in lines if line not in existing]
+        existing_lines = account_lines(product.file_content)
+        seen = {account_identity(line) for line in existing_lines}
+        new_lines = []
+        for line in account_lines("\n".join(lines)):
+            identity = account_identity(line)
+            if identity and identity not in seen:
+                seen.add(identity)
+                new_lines.append(line)
         return {
             "product_name": product.name,
             "current_stock": int(product.stock or 0),
@@ -876,9 +907,14 @@ def _commit_account_import(product_id: int, lines: list[str], admin_id: int) -> 
         product = db.query(Product).filter(Product.id == product_id).with_for_update().first()
         if not product:
             return {"error": "Product not found."}
-        existing_lines = [line.strip() for line in (product.file_content or "").splitlines() if line.strip()]
-        existing = set(existing_lines)
-        fresh = [line for line in lines if line and line not in existing]
+        existing_lines = account_lines(product.file_content)
+        seen = {account_identity(line) for line in existing_lines}
+        fresh = []
+        for line in account_lines("\n".join(lines)):
+            identity = account_identity(line)
+            if identity and identity not in seen:
+                seen.add(identity)
+                fresh.append(line)
         product.file_content = "\n".join(existing_lines + fresh)
         inventory_total = len(existing_lines) + len(fresh) + max(0, int(getattr(product, "reusable_stock", 0) or 0))
         product.stock = max(product.stock or 0, inventory_total) if manual_allowed(product) else inventory_total
@@ -969,7 +1005,7 @@ async def edit_accounts(callback: CallbackQuery, state: FSMContext):
         return
 
     accounts = product.file_content or ""
-    line_count = len([l for l in accounts.splitlines() if l.strip()])
+    line_count = len(account_lines(accounts))
     preview = accounts[:500] + ("..." if len(accounts) > 500 else "")
 
     text = f"📋 <b>Accounts for {safe(product.name)}</b>\n\n"
@@ -1026,7 +1062,8 @@ async def replace_accounts_start(callback: CallbackQuery, state: FSMContext):
         "One account per line.\n\n"
         "Example:\n"
         "email1@gmail.com:pass1\n"
-        "email2@gmail.com:pass2",
+        "email2@gmail.com:pass2\n\n"
+        "To intentionally replace the pool with zero accounts, send <code>CLEAR</code>.",
         parse_mode="HTML"
     )
     await callback.answer()
@@ -1051,7 +1088,11 @@ async def replace_accounts_save(message: Message, state: FSMContext):
     raw_lines = [line.strip() for line in account_text.splitlines()]
     blank_count = sum(1 for line in raw_lines if not line)
     submitted = [line for line in raw_lines if line]
-    unique_lines = list(dict.fromkeys(submitted))
+    clear_requested = account_text.strip().casefold() == "clear"
+    unique_lines = [] if clear_requested else account_lines("\n".join(submitted))
+    if not unique_lines and not clear_requested:
+        await answer_card(message, "❌ No account lines found. Send account lines, or send CLEAR to intentionally empty this inventory.")
+        return
     preview = await asyncio.to_thread(_preview_account_import, pid, unique_lines)
     if preview is None:
         await state.clear()
@@ -1065,6 +1106,7 @@ async def replace_accounts_save(message: Message, state: FSMContext):
         pending_replace_blank_count=blank_count,
         pending_replace_duplicate_count=len(submitted) - len(unique_lines),
         pending_replace_old_stock=preview["current_stock"],
+        pending_replace_clear=clear_requested,
     )
     await state.set_state(EditAccounts.confirm_replace)
     await answer_card(
@@ -1075,7 +1117,9 @@ async def replace_accounts_save(message: Message, state: FSMContext):
         f"New unique accounts: <b>{len(unique_lines)}</b>\n"
         f"Blank rows ignored: <b>{blank_count}</b>\n"
         f"Duplicate rows skipped: <b>{len(submitted) - len(unique_lines)}</b>\n\n"
-        "This replaces the current account pool. Account contents are hidden from this preview. Confirm to continue.",
+        ("This clears the current account pool. Account contents are hidden from this preview. Confirm to continue."
+         if clear_requested else
+         "This replaces the current account pool. Account contents are hidden from this preview. Confirm to continue."),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=f"⚠️ Replace with {len(unique_lines)} accounts", callback_data="accounts_apply_replace")],
@@ -1092,7 +1136,8 @@ async def accounts_apply_replace(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     pid = int(data.get("pending_replace_product_id") or 0)
     lines = data.get("pending_replace_lines") or []
-    if not pid or not lines:
+    clear_requested = bool(data.get("pending_replace_clear"))
+    if not pid or (not lines and not clear_requested):
         await callback.answer("Replacement data expired or empty.", show_alert=True)
         return
     try:
@@ -1126,7 +1171,8 @@ def _commit_account_replacement(product_id: int, lines: list[str], admin_id: int
         product = db.query(Product).filter(Product.id == product_id).with_for_update().first()
         if not product:
             return {"error": "Product not found."}
-        previous_count = len([line for line in (product.file_content or "").splitlines() if line.strip()])
+        lines = account_lines("\n".join(lines))
+        previous_count = len(account_lines(product.file_content))
         product.file_content = "\n".join(lines)
         reusable_content = str(getattr(product, "reusable_delivery", "") or "").strip()
         reusable_units = max(0, int(getattr(product, "reusable_stock", 0) or 0)) if reusable_content else 0
@@ -1243,7 +1289,7 @@ async def toggle_product(callback: CallbackQuery):
 
     db = SessionLocal()
     try:
-        product = db.query(Product).filter(Product.id == pid).first()
+        product = db.query(Product).filter(Product.id == pid).with_for_update().first()
         if product:
             product.is_active = not product.is_active
             db.commit()
@@ -1806,9 +1852,16 @@ async def save_required_info_edit(message: Message, state: FSMContext):
             if kind not in allowed:
                 await answer_card(message, "❌ Allowed types: email, phone, photo, contact, text. Example: <code>email:Email address</code>", parse_mode="HTML")
                 return
-            requirements.append({"type": kind, "label": (label.strip() if sep and label.strip() else kind.title())[:100]})
+            field_label = (label.strip() if sep and label.strip() else kind.title())[:100]
+            if any(item["label"].casefold() == field_label.casefold() for item in requirements):
+                await answer_card(message, "❌ Buyer-information labels must be unique.", parse_mode="HTML")
+                return
+            requirements.append({"type": kind, "label": field_label})
     if len(requirements) > 8:
         await answer_card(message, "❌ Maximum 8 fields.")
+        return
+    if _purchase_configuration_errors(requirements or None, None):
+        await answer_card(message, "❌ Buyer-information configuration is invalid; nothing was saved.")
         return
     db = SessionLocal()
     try:
@@ -1895,12 +1948,11 @@ async def set_price(message: Message):
         await answer_card(message, "❌ Product ID must be a number.")
         return
     try:
-        price = float(price_raw)
-    except ValueError:
+        price = Decimal(price_raw)
+        if not price.is_finite() or price < 0 or price > Decimal("999999999999.99999999"):
+            raise ValueError("Price outside supported range")
+    except (InvalidOperation, TypeError, ValueError, OverflowError):
         await answer_card(message, "❌ Price must be a number, e.g. 9.99")
-        return
-    if price < 0:
-        await answer_card(message, "❌ Price can't be negative.")
         return
     db = SessionLocal()
     try:
@@ -1909,7 +1961,7 @@ async def set_price(message: Message):
             await answer_card(message, "❌ Product not found.")
             return
         previous_price = str(product.price)
-        product.price = Decimal(str(price))
+        product.price = price
         db.add(AdminAuditLog(
             admin_telegram_id=int(message.from_user.id), action="set_product_price",
             entity_type="product", entity_id=str(product.id),
@@ -1947,7 +1999,7 @@ async def set_stock(message: Message):
         return
     db = SessionLocal()
     try:
-        product = db.query(Product).filter(Product.id == pid).first()
+        product = db.query(Product).filter(Product.id == pid).with_for_update().first()
         if not product:
             await answer_card(message, "❌ Product not found.")
             return

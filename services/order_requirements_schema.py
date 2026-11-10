@@ -9,7 +9,7 @@ from models.admin_audit_log import AdminAuditLog
 from models.bot_resume_session import BotResumeSession
 from models.order_workflow import CheckoutAttempt, OrderEvent, OrderWorkNote
 from models.bot_operations import WarrantyRequest, NotificationJob, ProviderHealth
-from models.api_key import ApiKey, ApiOrder
+from models.api_key import ApiKey, ApiOrder, ApiRateLimitBucket
 
 
 def _ensure_column(connection, table: str, column: str, definition: str) -> bool:
@@ -55,7 +55,7 @@ def ensure_order_requirements_schema() -> None:
             BotResumeSession.__table__,
             CheckoutAttempt.__table__, OrderEvent.__table__, OrderWorkNote.__table__,
             WarrantyRequest.__table__, NotificationJob.__table__, ProviderHealth.__table__,
-            ApiKey.__table__, ApiOrder.__table__,
+            ApiKey.__table__, ApiOrder.__table__, ApiRateLimitBucket.__table__,
             CartItem.__table__, CartCheckout.__table__, CustomerPreferences.__table__, CustomerJobCursor.__table__,
             ClaimMessage.__table__, CancellationRequest.__table__, WalletEntry.__table__,
         ],
